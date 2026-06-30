@@ -151,25 +151,24 @@ async def test_sacs_error_conexion():
 # --- Tests del endpoint HTTP ---
 
 
-async def test_sacs_endpoint_sin_token(live_client):
-    """Sin token → 401 antes de llegar al servicio."""
-    resp = await live_client.get(f"{PREFIX}/V-21369660")
-    assert resp.status_code == 401
+async def test_sacs_endpoint_publico_sin_token(live_client):
+    """Endpoint público: sin token debe responder 200, no 401."""
+    with _mock_httpx(_XML_MEDICO):
+        resp = await live_client.get(f"{PREFIX}/V-21369660")
+    assert resp.status_code == 200
+    assert resp.json()["encontrado"] is True
 
 
-async def test_sacs_endpoint_staff_puede_consultar(client):
-    """El client ya es admin (que es staff); la respuesta del SACS se mockea."""
+async def test_sacs_endpoint_con_token(client):
+    """Con token de admin también funciona."""
     with _mock_httpx(_XML_MEDICO):
         resp = await client.get(f"{PREFIX}/V-21369660")
-
     assert resp.status_code == 200
-    data = resp.json()
-    assert data["encontrado"] is True
-    assert data["es_medico"] is True
+    assert resp.json()["es_medico"] is True
 
 
-async def test_sacs_endpoint_formato_invalido_devuelve_200(client):
+async def test_sacs_endpoint_formato_invalido_devuelve_200(live_client):
     """Formato inválido → 200 con encontrado=false (el error es de negocio, no HTTP)."""
-    resp = await client.get(f"{PREFIX}/INVALIDO")
+    resp = await live_client.get(f"{PREFIX}/INVALIDO")
     assert resp.status_code == 200
     assert resp.json()["encontrado"] is False
