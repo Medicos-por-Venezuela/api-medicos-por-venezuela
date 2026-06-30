@@ -13,6 +13,7 @@ dependencies = [
     "pydantic-settings>=2.7.0",
     "email-validator>=2.2.0",
     "pyjwt>=2.10.1",
+    "httpx>=0.28.1",
 ]
 
 [project.optional-dependencies]
@@ -20,7 +21,6 @@ dev = [
     "pytest>=8.3.4",
     "pytest-asyncio>=0.25.2",
     "pytest-cov>=6.0.0",
-    "httpx>=0.28.1",
     "ruff>=0.9.2",
 ]
 
@@ -49,6 +49,10 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
+# Los tests marcados con `live` llaman a servicios externos reales (FPV, etc.)
+# y se excluyen del run normal. Ejecutar con: pytest -m live -v
+addopts = "-m 'not live'"
+markers = ["live: tests de integración real contra servicios externos (requieren internet)"]
 
 [tool.coverage.run]
 source = ["src"]
