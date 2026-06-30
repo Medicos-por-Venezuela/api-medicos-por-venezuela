@@ -24,6 +24,12 @@ from src.schemas.profile import (
 from src.services import profiles as profiles_service
 
 router = APIRouter(prefix="/profiles", tags=["profiles"])
+tag_metadata = [
+    {
+        "name": "profiles",
+        "description": "Perfiles de cuentas (staff): lectura, presencia, revocación y rol.",
+    }
+]
 
 _NOT_FOUND = {404: {"description": "Perfil no encontrado."}}
 

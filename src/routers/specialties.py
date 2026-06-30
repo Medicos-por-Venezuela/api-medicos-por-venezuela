@@ -6,6 +6,12 @@ from src.schemas.specialty import SpecialtyCatalogResponse
 from src.services import specialties as specialties_service
 
 router = APIRouter(prefix="/specialties", tags=["specialties"])
+tag_metadata = [
+    {
+        "name": "specialties",
+        "description": "Catálogo de especialidades/necesidades y reglas de matching.",
+    }
+]
 
 
 @router.get(

@@ -32,6 +32,12 @@ from src.schemas.consultation_event import (
 from src.services import consultations as consultations_service
 
 router = APIRouter(prefix="/consultations", tags=["consultations"])
+tag_metadata = [
+    {
+        "name": "consultations",
+        "description": "Casos/consultas y su historial de eventos (auditoría).",
+    }
+]
 
 _NOT_FOUND = {404: {"description": "Consulta no encontrada."}}
 

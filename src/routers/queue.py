@@ -22,6 +22,15 @@ from src.schemas.consultation import ConsultationResponse, QueueReleaseResponse
 from src.services import queue as queue_service
 
 router = APIRouter(prefix="/queue", tags=["queue"])
+tag_metadata = [
+    {
+        "name": "queue",
+        "description": (
+            "Cola de pacientes (Board) en tiempo real. Incluye la **toma atómica** "
+            "anti-colisión de una consulta por un médico."
+        ),
+    }
+]
 
 _LOCK_DETAIL = (
     "Este paciente está siendo seleccionado por otro médico en este momento. Inténtalo de nuevo."

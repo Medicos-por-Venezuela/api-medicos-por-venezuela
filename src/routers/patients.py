@@ -15,6 +15,9 @@ from src.schemas.patient import PatientCreate, PatientResponse, PatientUpdate
 from src.services import patients as patients_service
 
 router = APIRouter(prefix="/patients", tags=["patients"])
+tag_metadata = [
+    {"name": "patients", "description": "Pacientes (alta con consentimiento, consulta, edición)."}
+]
 
 _NOT_FOUND = {404: {"description": "Paciente no encontrado."}}
 

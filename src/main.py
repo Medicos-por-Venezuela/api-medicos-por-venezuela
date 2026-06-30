@@ -21,7 +21,7 @@ from src.core.observability import (
     configure_logging,
 )
 from src.db.session import AsyncSessionLocal
-from src.routers import api_router
+from src.routers import api_router, tags_metadata
 
 configure_logging()
 logger = logging.getLogger("mpv.api")
@@ -63,33 +63,12 @@ El endpoint `POST /queue/{id}/take` usa bloqueo pesimista de fallo rápido
 """
 
 # Metadatos por grupo de endpoints (se ven como secciones en Swagger).
+# Solo `health` se define aquí (sus endpoints viven en este archivo); las demás
+# descripciones las aporta cada router vía `tag_metadata` y se auto-recolectan
+# en `src.routers` — así un endpoint nuevo no obliga a editar este archivo.
 OPENAPI_TAGS = [
     {"name": "health", "description": "Estado del servicio y de la base de datos."},
-    {
-        "name": "auth",
-        "description": "Sesión autenticada: la identidad sale del JWT de Supabase.",
-    },
-    {
-        "name": "queue",
-        "description": (
-            "Cola de pacientes (Board) en tiempo real. Incluye la **toma atómica** "
-            "anti-colisión de una consulta por un médico."
-        ),
-    },
-    {"name": "patients", "description": "Pacientes (alta con consentimiento, consulta, edición)."},
-    {
-        "name": "consultations",
-        "description": "Casos/consultas y su historial de eventos (auditoría).",
-    },
-    {"name": "doctors", "description": "Médicos voluntarios (directorio operativo)."},
-    {
-        "name": "profiles",
-        "description": "Perfiles de cuentas (staff): lectura, presencia, revocación y rol.",
-    },
-    {
-        "name": "specialties",
-        "description": "Catálogo de especialidades/necesidades y reglas de matching.",
-    },
+    *tags_metadata,
 ]
 
 app = FastAPI(

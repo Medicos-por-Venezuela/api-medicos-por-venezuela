@@ -9,6 +9,9 @@ from src.schemas.profile import ProfileResponse
 from src.services import profiles as profiles_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+tag_metadata = [
+    {"name": "auth", "description": "Sesión autenticada: la identidad sale del JWT de Supabase."}
+]
 
 
 @router.get(
