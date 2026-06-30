@@ -83,6 +83,22 @@ Luego:
 docker compose down -v && docker compose up -d
 ```
 
+## Migraciones de esquema
+
+Los scripts en `db/init/` preparan solo bases locales nuevas. Para una base existente
+(local ya restaurada o Supabase), aplica la migración explícita antes de desplegar el
+código que usa la tabla:
+
+```bash
+psql "$DATABASE_URL" -f db/migrations/20260630_create_professional_types.sql
+```
+
+Rollback/fix-forward si el despliegue debe revertirse antes de usar datos reales:
+
+```sql
+DROP TABLE IF EXISTS public.professional_types;
+```
+
 ## Ejecutar la API sin Docker (contra el Postgres local) — con `uv`
 
 ```bash
