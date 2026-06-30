@@ -167,8 +167,8 @@ async def test_sacs_endpoint_con_token(client):
     assert resp.json()["es_medico"] is True
 
 
-async def test_sacs_endpoint_formato_invalido_devuelve_200(live_client):
-    """Formato inválido → 200 con encontrado=false (el error es de negocio, no HTTP)."""
-    resp = await live_client.get(f"{PREFIX}/INVALIDO")
-    assert resp.status_code == 200
-    assert resp.json()["encontrado"] is False
+async def test_sacs_endpoint_formato_invalido_devuelve_422(live_client):
+    """Formato inválido → 422 rechazado por la validación del path antes del servicio."""
+    for cedula_mala in ["INVALIDO", "21369660", "P-21369660", "V21369660"]:
+        resp = await live_client.get(f"{PREFIX}/{cedula_mala}")
+        assert resp.status_code == 422, f"Se esperaba 422 para '{cedula_mala}'"
