@@ -12,6 +12,15 @@ from src.schemas.sacs import SacsVerificationResponse
 from src.services import sacs as sacs_service
 
 router = APIRouter(prefix="/verificacion-sacs", tags=["sacs"])
+tag_metadata = [
+    {
+        "name": "sacs",
+        "description": (
+            "Verificación de profesionales en el SACS "
+            "(registro nacional de salud de Venezuela, sacs.gob.ve)."
+        ),
+    }
+]
 
 
 @router.get(
