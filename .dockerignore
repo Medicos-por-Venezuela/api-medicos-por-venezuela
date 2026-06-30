@@ -8,13 +8,14 @@ __pycache__/
 .venv/
 venv/
 env/
+tests/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
 htmlcov/
+backups/
 .idea/
 .vscode/
 .claude/
 *.log
-README.md

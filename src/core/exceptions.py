@@ -1,0 +1,93 @@
+"""Manejadores globales de excepciones.
+
+Traducen las excepciones de dominio (capa de servicios) y las nativas de
+SQLAlchemy en respuestas HTTP semánticas, sin filtrar detalles internos al
+cliente y manteniendo los routers delgados (sin try/except repetidos).
+"""
+
+import logging
+
+from fastapi import FastAPI, Request, status
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
+
+from src.core.errors import (
+    BadRequestError,
+    ConflictError,
+    NotFoundError,
+    UnprocessableError,
+)
+
+logger = logging.getLogger("mpv.api")
+
+# SQLSTATE de "lock_not_available" (fallo de with_for_update(nowait=True)).
+LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
+
+
+def is_lock_not_available(exc: Exception) -> bool:
+    """Detecta el error de fila bloqueada, venga de psycopg2 (OperationalError)
+    o de asyncpg (DBAPIError con SQLSTATE 55P03)."""
+    for candidate in (exc, getattr(exc, "orig", None)):
+        sqlstate = getattr(candidate, "sqlstate", None) or getattr(candidate, "pgcode", None)
+        if sqlstate == LOCK_NOT_AVAILABLE_SQLSTATE:
+            return True
+    return False
+
+
+def _json(status_code: int, detail: str) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={"detail": detail})
+
+
+def register_exception_handlers(app: FastAPI) -> None:
+    # --- Excepciones de dominio (capa de servicios) ---
+    @app.exception_handler(NotFoundError)
+    async def _not_found(request: Request, exc: NotFoundError) -> JSONResponse:
+        return _json(status.HTTP_404_NOT_FOUND, str(exc) or "Recurso no encontrado.")
+
+    @app.exception_handler(ConflictError)
+    async def _conflict(request: Request, exc: ConflictError) -> JSONResponse:
+        return _json(status.HTTP_409_CONFLICT, str(exc) or "Conflicto de estado.")
+
+    @app.exception_handler(BadRequestError)
+    async def _bad_request(request: Request, exc: BadRequestError) -> JSONResponse:
+        return _json(status.HTTP_400_BAD_REQUEST, str(exc) or "Petición inválida.")
+
+    @app.exception_handler(UnprocessableError)
+    async def _unprocessable(request: Request, exc: UnprocessableError) -> JSONResponse:
+        return _json(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc) or "Datos inválidos.")
+
+    # --- Excepciones nativas de la base de datos ---
+    @app.exception_handler(OperationalError)
+    async def _operational(request: Request, exc: OperationalError) -> JSONResponse:
+        # Típicamente: fila bloqueada por otra transacción (with_for_update nowait).
+        logger.warning("OperationalError en %s: %s", request.url.path, exc)
+        return _json(
+            status.HTTP_409_CONFLICT,
+            "Conflicto de concurrencia: el recurso está siendo modificado por otra "
+            "operación. Inténtalo de nuevo.",
+        )
+
+    @app.exception_handler(IntegrityError)
+    async def _integrity(request: Request, exc: IntegrityError) -> JSONResponse:
+        # Típicamente: violación de UNIQUE o FOREIGN KEY.
+        logger.warning("IntegrityError en %s: %s", request.url.path, exc)
+        return _json(
+            status.HTTP_409_CONFLICT,
+            "Conflicto de integridad de datos (duplicado o referencia inexistente).",
+        )
+
+    @app.exception_handler(DBAPIError)
+    async def _dbapi(request: Request, exc: DBAPIError) -> JSONResponse:
+        # asyncpg mapea LockNotAvailableError (55P03) a DBAPIError, no a OperationalError.
+        if is_lock_not_available(exc):
+            logger.warning("Lock no disponible en %s: %s", request.url.path, exc)
+            return _json(
+                status.HTTP_409_CONFLICT,
+                "Conflicto de concurrencia: el recurso está bloqueado por otra "
+                "operación. Inténtalo de nuevo.",
+            )
+        logger.error("DBAPIError en %s: %s", request.url.path, exc)
+        return _json(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Error interno de base de datos.",
+        )
