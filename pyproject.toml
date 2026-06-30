@@ -49,6 +49,10 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
+# Los tests marcados con `live` llaman a servicios externos reales (SACS, etc.)
+# y se excluyen del run normal. Ejecutar con: pytest -m live -v
+addopts = "-m 'not live'"
+markers = ["live: tests de integración real contra servicios externos (requieren internet)"]
 
 [tool.coverage.run]
 source = ["src"]
