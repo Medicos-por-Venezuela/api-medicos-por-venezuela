@@ -39,6 +39,14 @@ Roles: `patient | doctor | specialist | admin | super_admin`. Equivalencias a re
 - Valida TODO input con Pydantic v2 (`EmailStr`, `Field(min_length=...)`, tipos `uuid.UUID`).
 - Usa esquemas `*Response` para no filtrar campos internos por accidente (no devuelvas el modelo
   ORM crudo).
+- **Mass assignment:** `model_config = ConfigDict(extra="forbid")` obligatorio en todos los
+  esquemas `*Create` y `*Update`.
+- **XSS:** aunque FastAPI sirve JSON, rechaza caracteres peligrosos (`<script>`) en campos de
+  texto libre (notas, observaciones) vía validadores Pydantic o `max_length`.
+- **SQL Injection:** prohibido usar `text()` con concatenación de strings. Usa siempre el ORM
+  o parámetros enlazados (`bindparam`). Si `text()` es necesario, el valor nunca viene del cliente.
+- **CSRF:** con JWT en `Authorization: Bearer` no hay riesgo de CSRF. Si se migra a cookies:
+  `HttpOnly`, `Secure` y `samesite="lax"` son obligatorios.
 
 ## 🔐 Secretos y errores
 - Secretos solo por variables de entorno (`.env` gitignored / gestor de secretos). Nunca hardcodear
@@ -46,3 +54,10 @@ Roles: `patient | doctor | specialist | admin | super_admin`. Equivalencias a re
 - Los manejadores globales (`src/core/exceptions.py`) traducen errores de BD a respuestas genéricas:
   **no** filtres SQL, stack traces ni nombres de constraints al cliente.
 - CORS restringido por entorno (`BACKEND_CORS_ORIGINS`): `*` solo en desarrollo.
+
+## 📦 Gestión de CVEs y auditoría
+- Antes de agregar cualquier dependencia nueva: `uv run pip-audit` (o `pip-audit` directo) para
+  verificar que no introduce vulnerabilidades conocidas.
+- Los accesos denegados (401, 403) y errores de validación repetitivos (422) se loguean con nivel
+  `WARNING` incluyendo el `user_id` (nunca PII) para integración con IDS externo (Fail2Ban/Datadog).
+- Rate limiting en endpoints públicos (pendiente infra: `slowapi` + Redis o API Gateway).
