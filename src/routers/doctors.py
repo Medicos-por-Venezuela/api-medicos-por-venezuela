@@ -14,6 +14,7 @@ from src.schemas.doctor import DoctorCreate, DoctorResponse, DoctorUpdate
 from src.services import doctors as doctors_service
 
 router = APIRouter(prefix="/doctors", tags=["doctors"])
+tag_metadata = [{"name": "doctors", "description": "Médicos voluntarios (directorio operativo)."}]
 
 _NOT_FOUND = {404: {"description": "Médico no encontrado."}}
 
