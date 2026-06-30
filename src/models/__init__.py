@@ -13,6 +13,7 @@ from src.models.consultation import Consultation
 from src.models.consultation_event import ConsultationEvent
 from src.models.doctor import Doctor
 from src.models.patient import Patient
+from src.models.professional_type import ProfessionalType
 from src.models.profile import Profile
 
 __all__ = [
@@ -28,4 +29,5 @@ __all__ = [
     "FollowUp",
     "Message",
     "AdminUser",
+    "ProfessionalType",
 ]

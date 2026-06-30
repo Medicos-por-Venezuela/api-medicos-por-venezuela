@@ -16,13 +16,25 @@ _EXPECTED_PREFIXES = {
     "/doctors",
     "/profiles",
     "/specialties",
+    "/professional-types",
 }
+
+
+def _route_paths() -> list[str]:
+    paths: list[str] = []
+    for route in api_router.routes:
+        path = getattr(route, "path", "")
+        if path:
+            paths.append(path)
+        original_router = getattr(route, "original_router", None)
+        if original_router is not None:
+            paths.extend(getattr(child, "path", "") for child in original_router.routes)
+    return paths
 
 
 def _registered_prefixes() -> set[str]:
     prefixes: set[str] = set()
-    for route in api_router.routes:
-        path = getattr(route, "path", "")
+    for path in _route_paths():
         # Toma el primer segmento del path como prefijo del recurso.
         parts = path.strip("/").split("/")
         if parts and parts[0]:
