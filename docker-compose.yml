@@ -1,0 +1,51 @@
+services:
+  db:
+    image: postgres:17
+    container_name: mpv-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-localdev}
+      POSTGRES_DB: ${POSTGRES_DB:-medicos}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Se ejecuta SOLO en la primera inicialización (volumen vacío):
+      #   00-...sql  -> crea stubs de Supabase (esquema auth, auth.uid(), roles)
+      #   01-...sh   -> restaura el backup más reciente de ./backups si existe
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - ./backups:/backups:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-medicos}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  api:
+    build: .
+    container_name: mpv-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      ENVIRONMENT: development
+      # La API se conecta al servicio "db" de esta red (no a Supabase).
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-medicos}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-localdev}
+      POSTGRES_SSLMODE: disable
+      BACKEND_CORS_ORIGINS: "*"
+    volumes:
+      # Hot-reload en desarrollo.
+      - ./app:/code/app:ro
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  pgdata:

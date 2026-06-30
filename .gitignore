@@ -1,0 +1,40 @@
+# Entorno / secretos
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+
+# Herramientas / cachés
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE / SO
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Backups de la base de datos (contienen PII real — NUNCA versionar)
+backups/
+*.dump
+*.sql.gz
+
+# Claude Code
+.claude/
+
+# Logs
+*.log
