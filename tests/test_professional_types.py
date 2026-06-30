@@ -13,6 +13,8 @@ from src.core.security import Principal, require_admin, require_staff
 from src.db.session import get_db
 from src.main import app
 from src.models.professional_type import ProfessionalType
+from src.models.profile import Profile
+from tests._helpers import auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -37,6 +39,20 @@ async def client(
     app.dependency_overrides[get_db] = _override_get_db
     app.dependency_overrides[require_admin] = lambda: principal
     app.dependency_overrides[require_staff] = lambda: principal
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+    app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def auth_client(
+    db_session: AsyncSession, _professional_types_table: None
+) -> AsyncGenerator[AsyncClient, None]:
+    async def _override_get_db() -> AsyncGenerator[AsyncSession, None]:
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_get_db
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
@@ -91,24 +107,6 @@ async def test_professional_type_crud_flow(client: AsyncClient, db_session: Asyn
     assert row.deleted_at is not None
 
 
-async def test_professional_type_patch_deleted_sets_deleted_at(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
-    created = await client.post(f"{PREFIX}/professional-types", json={"name": "Nurse"})
-    professional_type_id = created.json()["id"]
-
-    patched = await client.patch(
-        f"{PREFIX}/professional-types/{professional_type_id}", json={"status": "deleted"}
-    )
-    assert patched.status_code == 200
-    assert patched.json()["status"] == "deleted"
-    assert patched.json()["deleted_at"] is not None
-
-    row = await db_session.get(ProfessionalType, uuid.UUID(professional_type_id))
-    assert row is not None
-    assert row.deleted_at is not None
-
-
 async def test_professional_type_not_found(client: AsyncClient) -> None:
     missing = "00000000-0000-0000-0000-000000000000"
     assert (await client.get(f"{PREFIX}/professional-types/{missing}")).status_code == 404
@@ -124,15 +122,18 @@ async def test_professional_type_validation_error(client: AsyncClient) -> None:
     ).status_code == 422
     assert (
         await client.patch(
-            f"{PREFIX}/professional-types/{uuid.uuid4()}", json={"status": "archived"}
+            f"{PREFIX}/professional-types/{uuid.uuid4()}", json={"status": "deleted"}
         )
+    ).status_code == 422
+    assert (
+        await client.patch(f"{PREFIX}/professional-types/{uuid.uuid4()}", json={"name": None})
     ).status_code == 422
 
 
 async def test_professional_type_list_order_is_deterministic(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    created_at = datetime(2099, 1, 1, tzinfo=UTC)
     low_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
     high_id = uuid.UUID("00000000-0000-0000-0000-000000000002")
     db_session.add_all(
@@ -143,9 +144,37 @@ async def test_professional_type_list_order_is_deterministic(
     )
     await db_session.commit()
 
-    listed = await client.get(f"{PREFIX}/professional-types")
+    listed = await client.get(f"{PREFIX}/professional-types", params={"limit": 2})
     assert listed.status_code == 200
     assert [item["id"] for item in listed.json()] == [str(high_id), str(low_id)]
+
+
+async def test_professional_type_rbac(
+    auth_client: AsyncClient, db_session: AsyncSession, admin_identity: Profile
+) -> None:
+    patient = make_profile(role="patient")
+    doctor = make_profile(role="doctor", specialty="Cardiología")
+    db_session.add_all([patient, doctor])
+    await db_session.flush()
+
+    assert (await auth_client.get(f"{PREFIX}/professional-types", headers={})).status_code == 401
+    assert (
+        await auth_client.get(f"{PREFIX}/professional-types", headers=auth_headers(patient.id))
+    ).status_code == 403
+    assert (
+        await auth_client.post(
+            f"{PREFIX}/professional-types",
+            json={"name": "Unauthorized"},
+            headers=auth_headers(doctor.id),
+        )
+    ).status_code == 403
+    assert (
+        await auth_client.post(
+            f"{PREFIX}/professional-types",
+            json={"name": "Authorized"},
+            headers=auth_headers(admin_identity.id),
+        )
+    ).status_code == 201
 
 
 async def test_professional_type_soft_deleted_is_hidden(

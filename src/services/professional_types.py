@@ -55,8 +55,6 @@ async def update_professional_type(
     professional_type = await get_professional_type(session, professional_type_id)
     for field, value in data.model_dump(exclude_unset=True).items():
         setattr(professional_type, field, value)
-    if professional_type.status == "deleted":
-        professional_type.deleted_at = datetime.now(UTC)
     await session.commit()
     await session.refresh(professional_type)
     return professional_type

@@ -6,3 +6,5 @@ CREATE TABLE IF NOT EXISTS public.professional_types (
     updated_at timestamptz NOT NULL DEFAULT now(),
     deleted_at timestamptz
 );
+
+ALTER TABLE public.professional_types ENABLE ROW LEVEL SECURITY;
