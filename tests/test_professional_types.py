@@ -157,10 +157,10 @@ async def test_professional_type_rbac(
     db_session.add_all([patient, doctor])
     await db_session.flush()
 
-    assert (await auth_client.get(f"{PREFIX}/professional-types", headers={})).status_code == 401
+    assert (await auth_client.get(f"{PREFIX}/professional-types", headers={})).status_code == 200
     assert (
         await auth_client.get(f"{PREFIX}/professional-types", headers=auth_headers(patient.id))
-    ).status_code == 403
+    ).status_code == 200
     assert (
         await auth_client.post(
             f"{PREFIX}/professional-types",

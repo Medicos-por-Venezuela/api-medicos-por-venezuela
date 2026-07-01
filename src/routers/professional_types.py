@@ -28,15 +28,14 @@ _NOT_FOUND = {404: {"description": "Professional type not found."}}
 @router.get(
     "",
     response_model=list[ProfessionalTypeResponse],
-    summary="List professional types (staff)",
+    summary="List professional types",
 )
 async def list_professional_types(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_staff),
 ) -> list[ProfessionalTypeResponse]:
-    """List non-deleted professional types."""
+    """List non-deleted professional types; no Bearer token required."""
     return await professional_types_service.list_professional_types(db, skip=skip, limit=limit)
 
 
