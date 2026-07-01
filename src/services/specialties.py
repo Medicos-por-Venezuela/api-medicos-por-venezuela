@@ -1,8 +1,14 @@
-"""Catálogos y reglas de matching de especialidades.
+"""Specialty catalog, matching rules, and CRUD."""
 
-Portado EXACTO desde `lib/utils.ts` de la app Next.js para que el backend tome las
-mismas decisiones de elegibilidad que hoy toma el frontend.
-"""
+import uuid
+from datetime import UTC, datetime
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.core.errors import ConflictError, NotFoundError
+from src.models.specialty import Specialty
+from src.schemas.specialty import SpecialtyCreate, SpecialtyUpdate
 
 # Catálogo de especialidades de los médicos (lib/utils.ts: SPECIALTIES).
 SPECIALTIES: list[str] = [
@@ -99,7 +105,6 @@ def can_attend(specialty: str | None, category: str | None, needs_tags: list[str
     """Elegibilidad dura (separación bidireccional psicología <-> salud física)."""
     values = _values(category, needs_tags)
 
-    # 1) Las necesidades reservadas solo van a su especialidad permitida.
     reserved_ok = all(
         (v not in RESERVED_NEEDS) or (bool(specialty) and specialty in RESERVED_NEEDS[v])
         for v in values
@@ -107,7 +112,6 @@ def can_attend(specialty: str | None, category: str | None, needs_tags: list[str
     if not reserved_ok:
         return False
 
-    # 2) Psicología solo atiende casos de psicología (con alguna necesidad reservada).
     if specialty == "Psicología":
         is_psych_case = any(v in RESERVED_NEEDS for v in values)
         if not is_psych_case:
@@ -120,3 +124,67 @@ def compute_priority(needs_tags: list[str] | None) -> str:
     if needs_tags and _PRIORITY_REVIEW_TAGS.intersection(needs_tags):
         return "review"
     return "normal"
+
+
+async def _ensure_unique_specialty_name(
+    session: AsyncSession, name: str, specialty_id: uuid.UUID | None = None
+) -> None:
+    stmt = select(Specialty.id).where(
+        func.lower(Specialty.name) == name.lower(), Specialty.deleted_at.is_(None)
+    )
+    if specialty_id is not None:
+        stmt = stmt.where(Specialty.id != specialty_id)
+    if (await session.execute(stmt)).first():
+        raise ConflictError("Ya existe una especialidad con ese nombre.")
+
+
+async def list_specialties(
+    session: AsyncSession, skip: int = 0, limit: int = 100, status: str | None = None
+) -> list[Specialty]:
+    stmt = select(Specialty).where(Specialty.deleted_at.is_(None))
+    if status:
+        stmt = stmt.where(Specialty.status == status)
+    stmt = (
+        stmt.order_by(Specialty.sort_order.asc(), Specialty.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def get_specialty(session: AsyncSession, specialty_id: uuid.UUID) -> Specialty:
+    specialty = await session.get(Specialty, specialty_id)
+    if specialty is None or specialty.deleted_at is not None:
+        raise NotFoundError("Especialidad no encontrada.")
+    return specialty
+
+
+async def create_specialty(session: AsyncSession, data: SpecialtyCreate) -> Specialty:
+    await _ensure_unique_specialty_name(session, data.name)
+    specialty = Specialty(**data.model_dump())
+    session.add(specialty)
+    await session.commit()
+    await session.refresh(specialty)
+    return specialty
+
+
+async def update_specialty(
+    session: AsyncSession, specialty_id: uuid.UUID, data: SpecialtyUpdate
+) -> Specialty:
+    specialty = await get_specialty(session, specialty_id)
+    changes = data.model_dump(exclude_unset=True)
+    if "name" in changes:
+        await _ensure_unique_specialty_name(session, changes["name"], specialty_id)
+    for field, value in changes.items():
+        setattr(specialty, field, value)
+    await session.commit()
+    await session.refresh(specialty)
+    return specialty
+
+
+async def delete_specialty(session: AsyncSession, specialty_id: uuid.UUID) -> None:
+    specialty = await get_specialty(session, specialty_id)
+    specialty.status = "inactive"
+    specialty.deleted_at = datetime.now(UTC)
+    await session.commit()

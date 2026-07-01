@@ -14,6 +14,7 @@ from src.models.consultation_event import ConsultationEvent
 from src.models.doctor import Doctor
 from src.models.patient import Patient
 from src.models.profile import Profile
+from src.models.specialty import Specialty
 
 __all__ = [
     "Profile",
@@ -28,4 +29,5 @@ __all__ = [
     "FollowUp",
     "Message",
     "AdminUser",
+    "Specialty",
 ]

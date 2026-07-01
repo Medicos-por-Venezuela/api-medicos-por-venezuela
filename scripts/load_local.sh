@@ -30,4 +30,10 @@ docker exec -i "${CONTAINER}" pg_restore \
   --no-owner --no-privileges --disable-triggers \
   -U "${USER}" -d "${DB}" < "${DUMP}" || true
 
+for MIGRATION in db/migrations/*.sql; do
+  [ -e "${MIGRATION}" ] || continue
+  echo "[migrate] Aplicando ${MIGRATION}..."
+  docker exec -i "${CONTAINER}" psql -v ON_ERROR_STOP=1 -U "${USER}" -d "${DB}" < "${MIGRATION}"
+done
+
 echo "[load] Listo."

@@ -29,3 +29,9 @@ else
     "${DUMP}" || true
   echo "[restore] Restauración finalizada."
 fi
+
+for MIGRATION in /migrations/*.sql; do
+  [ -e "${MIGRATION}" ] || continue
+  echo "[migrate] Aplicando ${MIGRATION}..."
+  psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -f "${MIGRATION}"
+done

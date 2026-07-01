@@ -137,9 +137,9 @@ El login sigue en **Supabase Auth**; el frontend manda el JWT como
 
 | Grupo  | Roles | Puede |
 | ------ | ----- | ----- |
-| público | (sin token) | crear paciente/consulta, heartbeat, sala de video, `GET /specialties` |
+| público | (sin token) | crear paciente/consulta, heartbeat, sala de video, `GET /specialties`, `GET /specialties/catalog` |
 | **staff** | doctor, specialist, admin, super_admin | cola, tomar/atender, leer/editar consultas, cerrar, eventos, listar pacientes/médicos |
-| **admin** | admin, super_admin | listar perfiles, revocar médico, CRUD médicos, editar/borrar paciente, liberar estancadas |
+| **admin** | admin, super_admin | listar perfiles, revocar médico, CRUD médicos/especialidades, editar/borrar paciente, liberar estancadas |
 | self | el titular del JWT | `GET /auth/me`, `POST /profiles/me/online`, `POST /profiles/me/finalize-role` |
 
 - El **actor** de las acciones (médico que toma/cierra) se toma del JWT, **no** de ids del cliente (anti-IDOR).
@@ -154,7 +154,9 @@ El login sigue en **Supabase Auth**; el frontend manda el JWT como
 | `POST`  | `/queue/{id}/take`                  | Toma atómica de una consulta (200/409/404) |
 | `POST`  | `/queue/attend-next`                | "Atender al siguiente" (selección + toma atómica) |
 | `POST`  | `/queue/release-stale`              | Liberar consultas estancadas (admin/CRON) |
-| `GET`   | `/specialties`                      | Catálogo de especialidades/necesidades + matching |
+| `GET`   | `/specialties`                      | Lista pública de especialidades activas |
+| `GET`   | `/specialties/catalog`              | Catálogo de necesidades + reglas de matching |
+| `POST/PATCH/DELETE` | `/specialties` / `/specialties/{id}` | CRUD de especialidades (admin/super_admin) |
 | `POST`  | `/consultations/{id}/close`         | Cerrar / no-show (+ evento de auditoría) |
 | `POST`  | `/consultations/{id}/heartbeat`     | Presencia del paciente (sala de espera) |
 | `POST`  | `/consultations/{id}/video-room`    | Sala Jitsi idempotente               |
@@ -223,7 +225,7 @@ pero llamando a esta API. Equivalencias de las operaciones de datos:
 | `/api/videoconsulta` (sala Jitsi idempotente)                | `POST /consultations/{id}/video-room` |
 | `getSession` + cargar profile                                | `GET /auth/me` |
 | `select` (cola, detalle, mi-caso, dashboard)                 | `GET /queue`, `GET /consultations`, `GET /consultations/{id}`, `GET /profiles` |
-| `SPECIALTY_NEEDS` / `canAttend` (lib/utils.ts)               | `GET /specialties` + ya aplicado server-side en `attend-next` |
+| `SPECIALTY_NEEDS` / `canAttend` (lib/utils.ts)               | `GET /specialties/catalog` + ya aplicado server-side en `attend-next` |
 
 > **Autenticación:** el login sigue en **Supabase Auth** (email/password + Google OAuth); el
 > frontend manda el **JWT de Supabase** y la API lo valida + aplica RBAC (ver sección de arriba y

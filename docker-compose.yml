@@ -15,6 +15,7 @@ services:
       #   00-...sql  -> crea stubs de Supabase (esquema auth, auth.uid(), roles)
       #   01-...sh   -> restaura el backup más reciente de ./backups si existe
       - ./db/init:/docker-entrypoint-initdb.d:ro
+      - ./db/migrations:/migrations:ro
       - ./backups:/backups:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-medicos}"]
