@@ -36,9 +36,9 @@ src/
 ├── services/          # Capa de negocio: lógica + queries + bloqueos (async)
 └── routers/           # Capa HTTP: routers DELGADOS que delegan en services
 db/init/               # Init del Postgres local: stubs de Supabase + restore del backup
-db/migrations/         # Migraciones de esquema (.sql), aplicadas por scripts/migrate.sh
+db/migrations/         # Migraciones de esquema (.sql), aplicadas por scripts/migrate.py
 backups/               # Backups de Supabase (.dump/.sql) — IGNORADO por git (PII)
-scripts/               # backup_supabase.sh / load_local.sh / migrate.sh (runner con tracking)
+scripts/               # backup_supabase.sh / load_local.sh / migrate.py (CLI de migraciones)
 tests/                 # Suite async (CRUD aislado por savepoints + concurrencia)
 ```
 
@@ -86,15 +86,27 @@ docker compose down -v && docker compose up -d
 
 ## Migraciones de esquema
 
-Los cambios de esquema viven como archivos `.sql` en **`db/migrations/`** y se aplican con
-**`scripts/migrate.sh`**, que lleva un registro de lo aplicado en la tabla `schema_migrations`
-(`filename`, `applied_at`). El runner aplica **solo lo que falta**, en orden, cada migración en una
-transacción — da igual cuántas ramas metan migraciones o cuántas veces lo ejecutes.
+Los cambios de esquema viven como archivos `.sql` en **`db/migrations/`** y se gestionan con el CLI
+**`scripts/migrate.py`** (Python, **multiplataforma** Windows/macOS/Linux — usa `asyncpg` y conecta
+por TCP, sin depender de bash ni de `docker exec`). Lleva registro de lo aplicado en la tabla
+`schema_migrations` (`filename`, `applied_at`) y aplica **solo lo que falta**, en orden, cada
+migración en una transacción — da igual cuántas ramas metan migraciones o cuántas veces lo ejecutes.
 
-### Crear una migración (CLI estilo Laravel)
+Se invoca con el intérprete del entorno:
 
 ```bash
-scripts/migrate.sh new "add phone to doctors"
+uv run python scripts/migrate.py <comando>
+# sin uv:  .venv/bin/python scripts/migrate.py <comando>
+#          Windows:  .venv\Scripts\python.exe scripts\migrate.py <comando>
+```
+
+La conexión sale de la misma config que la app (`DATABASE_URL` o las piezas `POSTGRES_*` del entorno
+/ `.env`). Para producción, exporta `DATABASE_URL` de Supabase antes de correr `up`.
+
+### Crear una migración (estilo Laravel)
+
+```bash
+uv run python scripts/migrate.py new "add phone to doctors"
 # -> Crea db/migrations/20260702_115540_add_phone_to_doctors.sql y te muestra la ruta a editar
 ```
 
@@ -106,26 +118,26 @@ Abres el archivo generado y escribes el SQL, **idempotente** (`if not exists`, `
 alter table public.doctors add column if not exists phone text;
 ```
 
-Para ver qué está aplicado y qué falta (por eso sabes cuáles editar / faltan por correr):
+Para ver qué está aplicado y qué falta:
 
 ```bash
-scripts/migrate.sh status
-#   [✓ aplicada]  001_create_specialties.sql
-#   [· pendiente] 20260702_115540_add_phone_to_doctors.sql
+uv run python scripts/migrate.py status
+#   [aplicada]  001_create_specialties.sql
+#   [pendiente] 20260702_115540_add_phone_to_doctors.sql
 #   Total: 2 aplicadas, 1 pendientes.
 ```
 
 Commit + PR normal. **No** ejecutas nada contra ninguna base al escribirla: solo versionas el `.sql`.
 
-### Aplicarlas en tu Postgres local (tras cada `git pull`)
+### Aplicarlas en tu Postgres local (tras cada `git pull` o `docker compose up`)
 
 ```bash
-scripts/migrate.sh            # aplica solo las migraciones que te falten
+uv run python scripts/migrate.py up      # aplica solo las que te falten
 ```
 
-Si ya las tenías, imprime `aplicadas: 0`. Este es el comando que corres tras un pull que traiga
-migraciones nuevas. Para empezar de cero, `docker compose down -v && docker compose up -d` restaura
-el backup y corre el runner solo (vía `db/init/01-restore-from-backup.sh`).
+Si ya las tenías, imprime `aplicadas: 0`. En una base recién levantada (`docker compose up`) el init
+restaura el **backup** con el esquema vigente de Supabase; `up` aplica el delta pendiente. El
+contenedor de Postgres no aplica migraciones por sí solo (no tiene Python).
 
 ### Aplicarlas en un entorno compartido / producción (Supabase)
 
@@ -133,7 +145,7 @@ Contra la base de dev o prod (idealmente desde el pipeline al mergear a `dev`):
 
 ```bash
 DATABASE_URL="postgresql://postgres.<ref>:<pass>@aws-1-...pooler.supabase.com:5432/postgres" \
-  scripts/migrate.sh --remote
+  uv run python scripts/migrate.py up
 ```
 
 Aplica solo lo pendiente en **esa** base y lo registra en su propia `schema_migrations`.
@@ -145,8 +157,8 @@ dev escribe 003_x.sql ──PR──► merge a dev
                                   │
         ┌─────────────────────────┼──────────────────────────┐
    cada dev hace pull        deploy corre                (prod cuando toque)
-   scripts/migrate.sh        migrate.sh --remote          migrate.sh --remote
-   (su docker local)         (base dev Supabase)          (base prod)
+   migrate.py up             DATABASE_URL=... migrate.py up  (mismo, base prod)
+   (su docker local)         (base dev Supabase)
 ```
 
 ### Baseline (una sola vez, si una base ya tenía migraciones aplicadas a mano)

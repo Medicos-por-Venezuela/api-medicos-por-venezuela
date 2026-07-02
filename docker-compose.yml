@@ -16,7 +16,6 @@ services:
       #   01-...sh   -> restaura el backup más reciente de ./backups si existe
       - ./db/init:/docker-entrypoint-initdb.d:ro
       - ./db/migrations:/migrations:ro
-      - ./scripts:/scripts:ro
       - ./backups:/backups:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-medicos}"]

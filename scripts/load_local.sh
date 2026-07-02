@@ -30,7 +30,11 @@ docker exec -i "${CONTAINER}" pg_restore \
   --no-owner --no-privileges --disable-triggers \
   -U "${USER}" -d "${DB}" < "${DUMP}" || true
 
-echo "[load] Aplicando migraciones pendientes..."
-POSTGRES_USER="${USER}" POSTGRES_DB="${DB}" DB_CONTAINER="${CONTAINER}" "$(dirname "$0")/migrate.sh"
+echo "[load] Aplicando migraciones pendientes con el CLI..."
+# Python del venv (Unix o Windows/Git-Bash); si no, el python del PATH.
+PY=".venv/bin/python"
+[ -x "${PY}" ] || PY=".venv/Scripts/python.exe"
+[ -x "${PY}" ] || PY="python"
+POSTGRES_USER="${USER}" POSTGRES_DB="${DB}" "${PY}" scripts/migrate.py up
 
 echo "[load] Listo."

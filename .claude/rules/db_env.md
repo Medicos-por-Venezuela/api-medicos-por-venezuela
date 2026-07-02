@@ -57,13 +57,18 @@ El patrón de arriba es la guía; así está **realmente** implementado (respeta
 ## 🧬 Migraciones de esquema (con tracking)
 
 Los cambios de esquema son archivos `.sql` en **`db/migrations/`**, gestionados por el CLI
-**`scripts/migrate.sh`** (estilo Laravel), que registra lo aplicado en la tabla `schema_migrations`
-(`filename` PK, `applied_at`). Aplica **solo lo pendiente**, en orden alfabético por nombre, cada
-migración en una transacción.
+**`scripts/migrate.py`** (Python, multiplataforma; usa `asyncpg` y la misma config que la app).
+Registra lo aplicado en la tabla `schema_migrations` (`filename` PK, `applied_at`) y aplica **solo
+lo pendiente**, en orden alfabético por nombre, cada migración en una transacción.
 
+- **Invocación:** `uv run python scripts/migrate.py <cmd>` (o el python del venv).
 - **Subcomandos:** `new "<descripción>"` (crea el stub `AAAAMMDD_HHMMSS_<slug>.sql` y muestra la
-  ruta) · `status` (lista aplicadas vs pendientes) · `up` (aplica pendientes; es el default sin
-  comando). Para crear una migración usa `new`, no escribas el archivo a mano.
+  ruta) · `status` (lista aplicadas vs pendientes) · `up` (aplica pendientes; default sin comando).
+  Para crear una migración usa `new`, no escribas el archivo a mano.
+- **Conexión:** de `DATABASE_URL` o las piezas `POSTGRES_*` (igual que la app). Para prod, exporta
+  `DATABASE_URL` de Supabase antes de `up`.
+- El contenedor de Postgres **no** aplica migraciones (no tiene Python): tras `docker compose up`
+  se corre `migrate.py up` desde el host/CI. No reintroduzcas loops de migración en `db/init/`.
 
 - **Convención obligatoria de cada migración:** transaccional (nada de `CREATE INDEX
   CONCURRENTLY`) e **idempotente** (`IF NOT EXISTS` / `ON CONFLICT`), para que aplicarla

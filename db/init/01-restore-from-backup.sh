@@ -30,7 +30,8 @@ else
   echo "[restore] Restauración finalizada."
 fi
 
-# Migraciones con tracking. Mismo runner que usan devs (host) y producción; aquí
-# en modo --local porque ya corremos dentro del contenedor. Registra cada una en
-# schema_migrations para que no se reapliquen luego.
-MIGRATIONS_DIR=/migrations bash /scripts/migrate.sh --local
+# Las migraciones NO se aplican aquí: el contenedor de Postgres no tiene Python.
+# El backup restaurado ya trae el esquema vigente de Supabase; el delta pendiente
+# lo aplica el CLI desde el host/CI tras el arranque:
+#   uv run python scripts/migrate.py up
+# (ver README -> "Migraciones de esquema").
