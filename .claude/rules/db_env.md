@@ -54,6 +54,25 @@ El patrón de arriba es la guía; así está **realmente** implementado (respeta
   globales en `src/core/exceptions.py` para `OperationalError`, `IntegrityError` y el lock
   `55P03` -> `409`.
 
+## 🧬 Migraciones de esquema (con tracking)
+
+Los cambios de esquema son archivos `.sql` en **`db/migrations/`**, aplicados por
+**`scripts/migrate.sh`**, que registra lo aplicado en la tabla `schema_migrations`
+(`filename` PK, `applied_at`). El runner aplica **solo lo pendiente**, en orden alfabético
+por nombre, cada migración en una transacción.
+
+- **Convención obligatoria de cada migración:** transaccional (nada de `CREATE INDEX
+  CONCURRENTLY`) e **idempotente** (`IF NOT EXISTS` / `ON CONFLICT`), para que aplicarla
+  sobre una base restaurada de backup que ya la contenga sea un no-op seguro.
+- **Nombres:** prefijo ordenable (`NNN_` o fecha `AAAAMMDD_`); el orden de aplicación es el
+  del nombre. Coordinar la numeración entre ramas para no colisionar.
+- **Modos de `migrate.sh`:** `docker` (por defecto, `docker exec` a `mpv-db`, para devs) ·
+  `--local` (`psql` directo, lo usa `db/init/01-restore-from-backup.sh` dentro del contenedor) ·
+  `--remote` (`psql "$DATABASE_URL"`, para Supabase/producción).
+- **Nunca** apliques migraciones a mano con `psql -f` suelto: rompe el tracking. Usa el runner.
+- `scripts/load_local.sh` y `db/init/01-restore-from-backup.sh` ya delegan en el runner; no
+  reintroduzcas loops ad-hoc sobre `db/migrations/` o `db/init/`.
+
 ## 🔌 Driver async y pooler de Supabase
 
 - Driver: **asyncpg** (`postgresql+asyncpg://`). asyncpg **no** entiende `?sslmode=` en la URL;

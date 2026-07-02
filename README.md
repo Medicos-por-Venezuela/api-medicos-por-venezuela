@@ -36,8 +36,9 @@ src/
 ├── services/          # Capa de negocio: lógica + queries + bloqueos (async)
 └── routers/           # Capa HTTP: routers DELGADOS que delegan en services
 db/init/               # Init del Postgres local: stubs de Supabase + restore del backup
+db/migrations/         # Migraciones de esquema (.sql), aplicadas por scripts/migrate.sh
 backups/               # Backups de Supabase (.dump/.sql) — IGNORADO por git (PII)
-scripts/               # backup_supabase.sh / load_local.sh
+scripts/               # backup_supabase.sh / load_local.sh / migrate.sh (runner con tracking)
 tests/                 # Suite async (CRUD aislado por savepoints + concurrencia)
 ```
 
@@ -85,19 +86,72 @@ docker compose down -v && docker compose up -d
 
 ## Migraciones de esquema
 
-Los scripts en `db/init/` preparan solo bases locales nuevas. Para una base existente
-(local ya restaurada o Supabase), aplica la migración explícita antes de desplegar el
-código que usa la tabla:
+Los cambios de esquema viven como archivos `.sql` en **`db/migrations/`** y se aplican con
+**`scripts/migrate.sh`**, que lleva un registro de lo aplicado en la tabla `schema_migrations`
+(`filename`, `applied_at`). El runner aplica **solo lo que falta**, en orden, cada migración en una
+transacción — da igual cuántas ramas metan migraciones o cuántas veces lo ejecutes.
 
-```bash
-psql "$DATABASE_URL" -f db/migrations/20260630_create_professional_types.sql
-```
+### Crear una migración
 
-Rollback/fix-forward si el despliegue debe revertirse antes de usar datos reales:
+Agrega un archivo con prefijo ordenable (`NNN_` o fecha `AAAAMMDD_`) y escríbelo **idempotente**
+(`if not exists`, `on conflict`), para que aplicarlo sobre una base ya restaurada de backup sea un
+no-op seguro. Debe ser **transaccional** (nada de `CREATE INDEX CONCURRENTLY`).
 
 ```sql
-DROP TABLE IF EXISTS public.professional_types;
+-- db/migrations/002_add_phone_to_doctors.sql
+alter table public.doctors add column if not exists phone text;
 ```
+
+Commit + PR normal. **No** ejecutas nada contra ninguna base al escribirla: solo versionas el `.sql`.
+
+### Aplicarlas en tu Postgres local (tras cada `git pull`)
+
+```bash
+scripts/migrate.sh            # aplica solo las migraciones que te falten
+```
+
+Si ya las tenías, imprime `aplicadas: 0`. Este es el comando que corres tras un pull que traiga
+migraciones nuevas. Para empezar de cero, `docker compose down -v && docker compose up -d` restaura
+el backup y corre el runner solo (vía `db/init/01-restore-from-backup.sh`).
+
+### Aplicarlas en un entorno compartido / producción (Supabase)
+
+Contra la base de dev o prod (idealmente desde el pipeline al mergear a `dev`):
+
+```bash
+DATABASE_URL="postgresql://postgres.<ref>:<pass>@aws-1-...pooler.supabase.com:5432/postgres" \
+  scripts/migrate.sh --remote
+```
+
+Aplica solo lo pendiente en **esa** base y lo registra en su propia `schema_migrations`.
+
+### Flujo completo
+
+```
+dev escribe 003_x.sql ──PR──► merge a dev
+                                  │
+        ┌─────────────────────────┼──────────────────────────┐
+   cada dev hace pull        deploy corre                (prod cuando toque)
+   scripts/migrate.sh        migrate.sh --remote          migrate.sh --remote
+   (su docker local)         (base dev Supabase)          (base prod)
+```
+
+### Baseline (una sola vez, si una base ya tenía migraciones aplicadas a mano)
+
+Márcalas como aplicadas para que el runner no las reintente (al ser idempotentes tampoco romperían,
+pero es higiene):
+
+```sql
+INSERT INTO schema_migrations (filename) VALUES
+  ('001_create_specialties.sql'),
+  ('20260630_create_professional_types.sql')
+ON CONFLICT DO NOTHING;
+```
+
+> **Modos de `migrate.sh`:** por defecto usa `docker exec` al contenedor `mpv-db` (devs);
+> `--local` corre `psql` directo (lo usa el init dentro del contenedor); `--remote` usa `DATABASE_URL`
+> (producción). El orden de aplicación es alfabético por nombre de archivo, así que numera/fecha los
+> prefijos de forma consistente entre el equipo.
 
 ## Ejecutar la API sin Docker (contra el Postgres local) — con `uv`
 
