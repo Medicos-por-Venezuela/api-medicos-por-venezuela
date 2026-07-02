@@ -30,8 +30,8 @@ else
   echo "[restore] Restauración finalizada."
 fi
 
-for MIGRATION in /migrations/*.sql; do
-  [ -e "${MIGRATION}" ] || continue
-  echo "[migrate] Aplicando ${MIGRATION}..."
-  psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -f "${MIGRATION}"
-done
+# Las migraciones NO se aplican aquí: el contenedor de Postgres no tiene Python.
+# El backup restaurado ya trae el esquema vigente de Supabase; el delta pendiente
+# lo aplica el CLI desde el host/CI tras el arranque:
+#   uv run python scripts/migrate.py up
+# (ver README -> "Migraciones de esquema").

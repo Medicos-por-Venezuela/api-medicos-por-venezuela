@@ -1,0 +1,13 @@
+# Normaliza los finales de línea a LF en el repo (evita CRLF de Windows).
+* text=auto eol=lf
+
+# Scripts con shebang: DEBEN conservar LF o el intérprete falla en Linux/macOS
+# (p. ej. `/usr/bin/env python\r` -> "bad interpreter"). Forzado explícito.
+artisan text eol=lf
+*.sh text eol=lf
+
+# Binarios y dumps: nunca tocar los finales de línea.
+*.dump binary
+*.png binary
+*.jpg binary
+*.svg -text

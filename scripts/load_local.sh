@@ -30,11 +30,11 @@ docker exec -i "${CONTAINER}" pg_restore \
   --no-owner --no-privileges --disable-triggers \
   -U "${USER}" -d "${DB}" < "${DUMP}" || true
 
-echo "[load] Aplicando SQL local adicional..."
-for SQL in db/init/[0-9][0-9]-*.sql; do
-  [ -e "${SQL}" ] || continue
-  [ "$(basename "${SQL}")" = "00-supabase-stubs.sql" ] && continue
-  docker exec -i "${CONTAINER}" psql -U "${USER}" -d "${DB}" < "${SQL}"
-done
+echo "[load] Aplicando migraciones pendientes con el CLI..."
+# Python del venv (Unix o Windows/Git-Bash); si no, el python del PATH.
+PY=".venv/bin/python"
+[ -x "${PY}" ] || PY=".venv/Scripts/python.exe"
+[ -x "${PY}" ] || PY="python"
+POSTGRES_USER="${USER}" POSTGRES_DB="${DB}" "${PY}" scripts/migrate.py up
 
 echo "[load] Listo."
