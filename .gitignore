@@ -39,3 +39,8 @@ backups/
 
 # Logs
 *.log
+# Local Pi runtime state
+.atl/
+
+# Local uv lockfile
+uv.lock
