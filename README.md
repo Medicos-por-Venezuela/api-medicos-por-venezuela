@@ -91,15 +91,28 @@ Los cambios de esquema viven como archivos `.sql` en **`db/migrations/`** y se a
 (`filename`, `applied_at`). El runner aplica **solo lo que falta**, en orden, cada migración en una
 transacción — da igual cuántas ramas metan migraciones o cuántas veces lo ejecutes.
 
-### Crear una migración
+### Crear una migración (CLI estilo Laravel)
 
-Agrega un archivo con prefijo ordenable (`NNN_` o fecha `AAAAMMDD_`) y escríbelo **idempotente**
-(`if not exists`, `on conflict`), para que aplicarlo sobre una base ya restaurada de backup sea un
-no-op seguro. Debe ser **transaccional** (nada de `CREATE INDEX CONCURRENTLY`).
+```bash
+scripts/migrate.sh new "add phone to doctors"
+# -> Crea db/migrations/20260702_115540_add_phone_to_doctors.sql y te muestra la ruta a editar
+```
+
+Abres el archivo generado y escribes el SQL, **idempotente** (`if not exists`, `on conflict`) y
+**transaccional** (nada de `CREATE INDEX CONCURRENTLY`):
 
 ```sql
--- db/migrations/002_add_phone_to_doctors.sql
+-- db/migrations/20260702_115540_add_phone_to_doctors.sql
 alter table public.doctors add column if not exists phone text;
+```
+
+Para ver qué está aplicado y qué falta (por eso sabes cuáles editar / faltan por correr):
+
+```bash
+scripts/migrate.sh status
+#   [✓ aplicada]  001_create_specialties.sql
+#   [· pendiente] 20260702_115540_add_phone_to_doctors.sql
+#   Total: 2 aplicadas, 1 pendientes.
 ```
 
 Commit + PR normal. **No** ejecutas nada contra ninguna base al escribirla: solo versionas el `.sql`.
