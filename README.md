@@ -24,6 +24,7 @@ Los modelos reflejan el esquema **real y actual** de Supabase (12 tablas: `profi
 ## Arquitectura (capa de servicios, 3-tier)
 
 ```
+artisan                # CLI del proyecto (estilo Laravel): python artisan migrate / make:migration
 src/
 ├── main.py            # App FastAPI, CORS, registro de manejadores globales
 ├── core/
@@ -92,21 +93,24 @@ por TCP, sin depender de bash ni de `docker exec`). Lleva registro de lo aplicad
 `schema_migrations` (`filename`, `applied_at`) y aplica **solo lo que falta**, en orden, cada
 migración en una transacción — da igual cuántas ramas metan migraciones o cuántas veces lo ejecutes.
 
-Se invoca con el intérprete del entorno:
+Se maneja con el CLI `artisan` de la raíz (estilo Laravel). Se auto-ejecuta con el python del
+`.venv`, así que no necesitas activar el entorno:
 
 ```bash
-uv run python scripts/migrate.py <comando>
-# sin uv:  .venv/bin/python scripts/migrate.py <comando>
-#          Windows:  .venv\Scripts\python.exe scripts\migrate.py <comando>
+python artisan migrate           # aplica las pendientes
+python artisan migrate:status    # qué está aplicado / pendiente
+python artisan "make:migration" "add phone to doctors"   # crea la migración
+# Unix/macOS:  ./artisan migrate     ·     con uv:  uv run python artisan migrate
 ```
 
 La conexión sale de la misma config que la app (`DATABASE_URL` o las piezas `POSTGRES_*` del entorno
-/ `.env`). Para producción, exporta `DATABASE_URL` de Supabase antes de correr `up`.
+/ `.env`). Para producción, exporta `DATABASE_URL` de Supabase antes de correr `migrate`.
+(`artisan` es un frente delgado sobre `scripts/migrate.py`, que puedes invocar directo si prefieres.)
 
-### Crear una migración (estilo Laravel)
+### Crear una migración
 
 ```bash
-uv run python scripts/migrate.py new "add phone to doctors"
+python artisan "make:migration" "add phone to doctors"
 # -> Crea db/migrations/20260702_115540_add_phone_to_doctors.sql y te muestra la ruta a editar
 ```
 
@@ -121,7 +125,7 @@ alter table public.doctors add column if not exists phone text;
 Para ver qué está aplicado y qué falta:
 
 ```bash
-uv run python scripts/migrate.py status
+python artisan migrate:status
 #   [aplicada]  001_create_specialties.sql
 #   [pendiente] 20260702_115540_add_phone_to_doctors.sql
 #   Total: 2 aplicadas, 1 pendientes.
@@ -132,11 +136,11 @@ Commit + PR normal. **No** ejecutas nada contra ninguna base al escribirla: solo
 ### Aplicarlas en tu Postgres local (tras cada `git pull` o `docker compose up`)
 
 ```bash
-uv run python scripts/migrate.py up      # aplica solo las que te falten
+python artisan migrate      # aplica solo las que te falten
 ```
 
 Si ya las tenías, imprime `aplicadas: 0`. En una base recién levantada (`docker compose up`) el init
-restaura el **backup** con el esquema vigente de Supabase; `up` aplica el delta pendiente. El
+restaura el **backup** con el esquema vigente de Supabase; `migrate` aplica el delta pendiente. El
 contenedor de Postgres no aplica migraciones por sí solo (no tiene Python).
 
 ### Aplicarlas en un entorno compartido / producción (Supabase)
@@ -145,7 +149,7 @@ Contra la base de dev o prod (idealmente desde el pipeline al mergear a `dev`):
 
 ```bash
 DATABASE_URL="postgresql://postgres.<ref>:<pass>@aws-1-...pooler.supabase.com:5432/postgres" \
-  uv run python scripts/migrate.py up
+  python artisan migrate
 ```
 
 Aplica solo lo pendiente en **esa** base y lo registra en su propia `schema_migrations`.
@@ -156,8 +160,8 @@ Aplica solo lo pendiente en **esa** base y lo registra en su propia `schema_migr
 dev escribe 003_x.sql ──PR──► merge a dev
                                   │
         ┌─────────────────────────┼──────────────────────────┐
-   cada dev hace pull        deploy corre                (prod cuando toque)
-   migrate.py up             DATABASE_URL=... migrate.py up  (mismo, base prod)
+   cada dev hace pull        deploy corre                    (prod cuando toque)
+   artisan migrate          DATABASE_URL=... artisan migrate  (mismo, base prod)
    (su docker local)         (base dev Supabase)
 ```
 

@@ -166,8 +166,8 @@ async def cmd_up() -> int:
     return 0
 
 
-def main() -> int:
-    argv = sys.argv[1:]
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
     cmd = argv[0] if argv else "up"
     if cmd == "new":
         return cmd_new(argv[1:])

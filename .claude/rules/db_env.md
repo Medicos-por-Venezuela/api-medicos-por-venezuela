@@ -61,10 +61,10 @@ Los cambios de esquema son archivos `.sql` en **`db/migrations/`**, gestionados 
 Registra lo aplicado en la tabla `schema_migrations` (`filename` PK, `applied_at`) y aplica **solo
 lo pendiente**, en orden alfabético por nombre, cada migración en una transacción.
 
-- **Invocación:** `uv run python scripts/migrate.py <cmd>` (o el python del venv).
-- **Subcomandos:** `new "<descripción>"` (crea el stub `AAAAMMDD_HHMMSS_<slug>.sql` y muestra la
-  ruta) · `status` (lista aplicadas vs pendientes) · `up` (aplica pendientes; default sin comando).
-  Para crear una migración usa `new`, no escribas el archivo a mano.
+- **Invocación:** el CLI `artisan` de la raíz (estilo Laravel) es el frente recomendado y se
+  auto-ejecuta con el python del `.venv`: `python artisan migrate` / `migrate:status` /
+  `"make:migration" "<desc>"`. Equivale a `scripts/migrate.py up|status|new` (invocable directo).
+- Para crear una migración usa `make:migration` (o `migrate.py new`), no escribas el archivo a mano.
 - **Conexión:** de `DATABASE_URL` o las piezas `POSTGRES_*` (igual que la app). Para prod, exporta
   `DATABASE_URL` de Supabase antes de `up`.
 - El contenedor de Postgres **no** aplica migraciones (no tiene Python): tras `docker compose up`
