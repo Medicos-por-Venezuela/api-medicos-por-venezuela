@@ -30,8 +30,7 @@ else
   echo "[restore] Restauración finalizada."
 fi
 
-for MIGRATION in /migrations/*.sql; do
-  [ -e "${MIGRATION}" ] || continue
-  echo "[migrate] Aplicando ${MIGRATION}..."
-  psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -f "${MIGRATION}"
-done
+# Migraciones con tracking. Mismo runner que usan devs (host) y producción; aquí
+# en modo --local porque ya corremos dentro del contenedor. Registra cada una en
+# schema_migrations para que no se reapliquen luego.
+MIGRATIONS_DIR=/migrations bash /scripts/migrate.sh --local

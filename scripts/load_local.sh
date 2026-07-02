@@ -30,11 +30,7 @@ docker exec -i "${CONTAINER}" pg_restore \
   --no-owner --no-privileges --disable-triggers \
   -U "${USER}" -d "${DB}" < "${DUMP}" || true
 
-echo "[load] Aplicando SQL local adicional..."
-for SQL in db/init/[0-9][0-9]-*.sql; do
-  [ -e "${SQL}" ] || continue
-  [ "$(basename "${SQL}")" = "00-supabase-stubs.sql" ] && continue
-  docker exec -i "${CONTAINER}" psql -U "${USER}" -d "${DB}" < "${SQL}"
-done
+echo "[load] Aplicando migraciones pendientes..."
+POSTGRES_USER="${USER}" POSTGRES_DB="${DB}" DB_CONTAINER="${CONTAINER}" "$(dirname "$0")/migrate.sh"
 
 echo "[load] Listo."
