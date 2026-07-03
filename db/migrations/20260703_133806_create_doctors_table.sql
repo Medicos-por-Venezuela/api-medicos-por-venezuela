@@ -37,3 +37,8 @@ create unique index if not exists uq_doctors_email_not_deleted
 create index if not exists idx_doctors_professional_type on public.doctors (professional_type_id);
 create index if not exists idx_doctors_specialty on public.doctors (specialty_id);
 create index if not exists idx_doctors_deleted_at on public.doctors (deleted_at);
+
+-- RLS: Supabase expone las tablas public vía PostgREST (anon key). Se activa
+-- (sin policies = deny-all a anon/authenticated); la API accede como owner y la
+-- omite. Añadir policies solo si el frontend necesita acceso directo a Supabase.
+alter table public.doctors enable row level security;
