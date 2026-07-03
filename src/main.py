@@ -11,6 +11,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
 
 from src.core.config import settings
@@ -20,6 +22,7 @@ from src.core.observability import (
     SecurityHeadersMiddleware,
     configure_logging,
 )
+from src.core.ratelimit import limiter
 from src.db.session import AsyncSessionLocal
 from src.routers import api_router, tags_metadata
 
@@ -99,6 +102,11 @@ app.add_middleware(
 )
 
 register_exception_handlers(app)
+
+# Rate limiting (slowapi): expone el limiter y traduce el exceso a HTTP 429.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 app.include_router(api_router, prefix=settings.API_V1_PREFIX)
 
 

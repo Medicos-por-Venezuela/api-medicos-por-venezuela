@@ -66,6 +66,11 @@ class Settings(BaseSettings):
     # --- CORS ---
     BACKEND_CORS_ORIGINS: str = "*"
 
+    # --- Anti-abuso (rate limiting) ---
+    # Storage en memoria por proceso; para varias instancias, usar Redis.
+    RATE_LIMIT_ENABLED: bool = True
+    DOCTOR_REGISTER_RATE_LIMIT: str = "5/minute"
+
     def _normalize_async_scheme(self, url: str) -> str:
         """Garantiza el driver async (postgresql+asyncpg://)."""
         if url.startswith("postgresql+asyncpg://"):

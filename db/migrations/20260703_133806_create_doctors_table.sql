@@ -12,9 +12,10 @@ create table if not exists public.doctors (
     phone                text not null,
     email                text not null,
     country_of_residence text,
-    -- El médico quiere seguir en la plataforma (self-service). 1/true por defecto.
-    status               boolean not null default true,
-    -- Credenciales verificadas -> puede trabajar. 1/true por defecto.
+    -- Estado del médico: 0 = se dio de baja, 1 = activo, 2 = expulsado por admin.
+    status               smallint not null default 1 check (status in (0, 1, 2)),
+    -- Credenciales verificadas -> puede trabajar. Lo fija el backend al registrar
+    -- (true si la cédula es válida en el SACS/FPV; false si no). Ver servicio.
     verified             boolean not null default true,
     created_at           timestamptz not null default now(),
     updated_at           timestamptz not null default now(),
