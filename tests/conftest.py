@@ -15,10 +15,15 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.ratelimit import limiter
 from src.db.session import engine, get_db
 from src.main import app
 from src.models.profile import Profile
 from tests._helpers import auth_headers
+
+# El rate limiting se desactiva en las pruebas: varias hacen múltiples requests al
+# mismo endpoint y dispararían el 429.
+limiter.enabled = False
 
 
 @pytest_asyncio.fixture
