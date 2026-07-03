@@ -8,6 +8,7 @@ queda en True solo si la cédula es válida en ese registro; en cualquier otro c
 
 import unicodedata
 import uuid
+from collections.abc import Awaitable, Callable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,24 +28,41 @@ def _normalize(text: str) -> str:
     return "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
 
 
+async def _verified_in_sacs(cedula: str) -> bool:
+    """El SACS confirma que la cédula corresponde a un médico registrado."""
+    result = await sacs_service.verificar_sacs(cedula)
+    return bool(result.encontrado and result.es_medico)
+
+
+async def _verified_in_fpv(cedula: str) -> bool:
+    """La FPV confirma que la cédula corresponde a un psicólogo colegiado."""
+    result = await psicologo_service.verificar_psicologo(cedula)
+    return bool(result.encontrado)
+
+
+# Tipo profesional (normalizado, sin acentos) -> registro oficial que lo valida.
+# Añadir un tipo verificable = una entrada más, sin tocar la lógica de ruteo.
+_CREDENTIAL_VERIFIERS: dict[str, Callable[[str], Awaitable[bool]]] = {
+    "medico": _verified_in_sacs,
+    "psicologo": _verified_in_fpv,
+}
+
+
 async def _verify_credential(
     session: AsyncSession, professional_type_id: uuid.UUID | None, cedula: str
 ) -> bool:
-    """True si la cédula está en el registro oficial del tipo profesional."""
+    """True si la cédula está en el registro oficial de su tipo profesional.
+
+    Fail-closed: sin tipo, tipo inexistente o tipo sin registro verificable
+    (p. ej. nutricionista) -> False.
+    """
     if professional_type_id is None:
         return False
     ptype = await session.get(ProfessionalType, professional_type_id)
     if ptype is None:
         return False
-
-    kind = _normalize(ptype.name)
-    if kind == "medico":
-        result = await sacs_service.verificar_sacs(cedula)
-        return bool(result.encontrado and result.es_medico)
-    if kind == "psicologo":
-        result = await psicologo_service.verificar_psicologo(cedula)
-        return bool(result.encontrado)
-    return False
+    verify = _CREDENTIAL_VERIFIERS.get(_normalize(ptype.name))
+    return await verify(cedula) if verify else False
 
 
 async def list_doctors(
