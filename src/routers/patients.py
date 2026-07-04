@@ -9,7 +9,7 @@ import uuid
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.security import Principal, require_admin, require_staff
+from src.core.security import Principal, require_permission
 from src.db.session import get_db
 from src.schemas.patient import PatientCreate, PatientResponse, PatientUpdate
 from src.services import patients as patients_service
@@ -27,7 +27,7 @@ async def list_patients(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_staff),
+    _: Principal = Depends(require_permission("patients.read")),
 ) -> list[PatientResponse]:
     """Lista paginada de pacientes (más recientes primero)."""
     return await patients_service.list_patients(db, skip=skip, limit=limit)
@@ -56,7 +56,7 @@ async def create_patient(
 async def get_patient(
     patient_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_staff),
+    _: Principal = Depends(require_permission("patients.read")),
 ) -> PatientResponse:
     return await patients_service.get_patient(db, patient_id)
 
@@ -71,7 +71,7 @@ async def update_patient(
     patient_id: uuid.UUID,
     payload: PatientUpdate,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_admin),
+    _: Principal = Depends(require_permission("patients.write")),
 ) -> PatientResponse:
     return await patients_service.update_patient(db, patient_id, payload)
 
@@ -85,6 +85,6 @@ async def update_patient(
 async def delete_patient(
     patient_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_admin),
+    _: Principal = Depends(require_permission("patients.delete")),
 ) -> None:
     await patients_service.delete_patient(db, patient_id)

@@ -30,7 +30,9 @@ async def _type_id(db_session: AsyncSession, kind: str) -> str:
 def _payload(type_id: str, **over: object) -> dict:
     base = {
         "professional_type_id": type_id,
-        "cedula": "V-21369660",
+        # Cédula sintética (los tests mockean SACS/FPV, el valor no se consulta);
+        # evita colisión con datos reales/mock sembrados en la BD local.
+        "cedula": "V-90000001",
         "full_name": "Dr Prueba",
         "phone": "+5804145200715",
         "email": "dr.prueba@test.com",
@@ -85,7 +87,7 @@ async def test_register_psicologo_valido_queda_verificado(
 ) -> None:
     type_id = await _type_id(db_session, "psicologo")
     with _mock_fpv(encontrado=True):
-        resp = await client.post(f"{PREFIX}/doctors", json=_payload(type_id, cedula="V-21560752"))
+        resp = await client.post(f"{PREFIX}/doctors", json=_payload(type_id, cedula="V-90000002"))
     assert resp.status_code == 201
     assert resp.json()["verified"] is True
 

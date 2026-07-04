@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
 from src.core.exceptions import is_lock_not_available
-from src.core.security import Principal, require_admin, require_staff
+from src.core.security import Principal, require_permission
 from src.db.session import get_db
 from src.schemas.consultation import ConsultationResponse, QueueReleaseResponse
 from src.services import queue as queue_service
@@ -45,7 +45,7 @@ _LOCK_DETAIL = (
 async def list_queue(
     limit: int = Query(100, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_staff),
+    _: Principal = Depends(require_permission("queue.read")),
 ) -> list[ConsultationResponse]:
     """Lista las consultas en estado `waiting`, las más antiguas primero (FIFO)."""
     return await queue_service.list_queue(db, limit=limit)
@@ -64,7 +64,7 @@ async def list_queue(
 async def take_consultation(
     consultation_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_staff),
+    principal: Principal = Depends(require_permission("queue.take")),
 ) -> ConsultationResponse:
     """Asignación **atómica anti-colisión** de una consulta en espera al médico
     autenticado. El ganador recibe `200`, el perdedor `409` (o `404`), sin colgarse.
@@ -90,7 +90,7 @@ async def take_consultation(
 )
 async def attend_next(
     db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_staff),
+    principal: Principal = Depends(require_permission("queue.take")),
 ) -> ConsultationResponse:
     """Réplica de **"Atender al siguiente"**: el backend elige el caso según
     elegibilidad (`can_attend`), presencia (heartbeat < 5 min), match de la
@@ -119,7 +119,7 @@ async def attend_next(
 async def release_stale(
     minutes: int = Query(None, ge=1, description="Umbral en minutos (def. configurado)"),
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_admin),
+    _: Principal = Depends(require_permission("queue.manage")),
 ) -> QueueReleaseResponse:
     """Devuelve a la cola (`waiting`) las consultas `in_progress` abiertas hace más del
     umbral, liberándolas para otro médico. Pensado para invocarse desde un CRON/worker."""

@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.security import (
     Principal,
     get_current_principal,
-    require_admin,
+    require_permission,
     require_staff,
 )
 from src.db.session import get_db
@@ -40,7 +40,7 @@ async def list_profiles(
     limit: int = Query(100, ge=1, le=100),
     role: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_admin),
+    _: Principal = Depends(require_permission("profiles.read")),
 ) -> list[ProfileResponse]:
     """Lista de perfiles de cuentas; filtrable por `role` (doctor, admin, ...)."""
     return await profiles_service.list_profiles(db, skip=skip, limit=limit, role=role)
@@ -106,7 +106,7 @@ async def set_active(
     profile_id: uuid.UUID,
     payload: ProfileActiveRequest,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_admin),
+    _: Principal = Depends(require_permission("profiles.manage")),
 ) -> ProfileResponse:
     """Revoca (`active=false`) o reactiva (`active=true`) el acceso de un médico."""
     return await profiles_service.set_active(db, profile_id, payload.active)
