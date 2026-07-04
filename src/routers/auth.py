@@ -7,7 +7,7 @@ from src.core.config import settings
 from src.core.errors import NotFoundError
 from src.core.security import Principal, get_current_principal, issue_access_token
 from src.db.session import get_db
-from src.schemas.auth_dev import DevAuthResponse, DevRegisterRequest
+from src.schemas.auth_dev import DevAuthResponse, DevLoginRequest, DevRegisterRequest
 from src.schemas.profile import ProfileResponse
 from src.services import auth_dev as auth_dev_service
 from src.services import profiles as profiles_service
@@ -63,4 +63,29 @@ async def dev_register(
         user_id=profile.id,
         role=profile.role,
         created=created,
+    )
+
+
+@router.post(
+    "/dev/login",
+    response_model=DevAuthResponse,
+    summary="Login de DEV (solo local; token por email, sin password)",
+    responses={404: {"description": "No disponible en producción / usuario inexistente."}},
+)
+async def dev_login(
+    payload: DevLoginRequest,
+    db: AsyncSession = Depends(get_db),
+) -> DevAuthResponse:
+    """Emite un JWT para una cuenta existente (por email), **sin** Supabase Auth ni password.
+    Solo local; en producción responde 404. Para re-loguear en pruebas del frontend."""
+    if settings.ENVIRONMENT == "production":
+        raise NotFoundError("Endpoint no disponible.")
+    profile = await auth_dev_service.get_by_email(db, payload.email)
+    if profile is None:
+        raise NotFoundError("No existe una cuenta con ese email.")
+    return DevAuthResponse(
+        access_token=issue_access_token(profile.id),
+        user_id=profile.id,
+        role=profile.role,
+        created=False,
     )

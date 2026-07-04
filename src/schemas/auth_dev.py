@@ -19,6 +19,14 @@ class DevRegisterRequest(BaseModel):
     medical_license: str | None = Field(default=None, max_length=100)
 
 
+class DevLoginRequest(BaseModel):
+    """Login de prueba en local: token por email (sin password; solo local)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr
+
+
 class DevAuthResponse(BaseModel):
     """JWT de sesión (firmado con el secret local) + datos básicos del usuario."""
 

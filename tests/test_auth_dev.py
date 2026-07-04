@@ -68,3 +68,24 @@ async def test_dev_register_404_en_produccion(client: AsyncClient, monkeypatch) 
         json={"email": "prod@example.com", "full_name": "No Prod", "role": "doctor"},
     )
     assert resp.status_code == 404
+
+
+async def test_dev_login_devuelve_token_de_cuenta_existente(client: AsyncClient) -> None:
+    reg = await client.post(
+        f"{PREFIX}/auth/dev/register",
+        json={"email": "login@example.com", "full_name": "Login User", "role": "doctor"},
+    )
+    resp = await client.post(f"{PREFIX}/auth/dev/login", json={"email": "login@example.com"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["user_id"] == reg.json()["user_id"]
+
+
+async def test_dev_login_404_si_no_existe(client: AsyncClient) -> None:
+    resp = await client.post(f"{PREFIX}/auth/dev/login", json={"email": "nadie@example.com"})
+    assert resp.status_code == 404
+
+
+async def test_dev_login_404_en_produccion(client: AsyncClient, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+    resp = await client.post(f"{PREFIX}/auth/dev/login", json={"email": "x@example.com"})
+    assert resp.status_code == 404

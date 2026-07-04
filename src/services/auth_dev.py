@@ -50,6 +50,13 @@ async def register_or_get(
         role_chosen=True,
     )
     session.add(profile)
-    await session.commit()  # dispara los triggers de user_roles y doctors
+    await session.commit()  # dispara el trigger de user_roles
     await session.refresh(profile)
     return profile, True
+
+
+async def get_by_email(session: AsyncSession, email: str) -> Profile | None:
+    """Busca la cuenta por email (para el login de DEV)."""
+    return (
+        await session.execute(select(Profile).where(Profile.email == email))
+    ).scalar_one_or_none()
