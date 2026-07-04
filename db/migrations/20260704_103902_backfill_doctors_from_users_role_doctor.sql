@@ -1,8 +1,8 @@
 -- Migración: backfill doctors from users role doctor
 -- Creada:    2026-07-04 10:39:02
 --
--- Puebla public.doctors con los usuarios role='doctor' de public.users (antes 'profiles')
--- y deja un trigger para que los nuevos médicos entren en users Y doctors automáticamente.
+-- Puebla public.doctors con los usuarios role='doctor' EXISTENTES de public.users (antes
+-- 'profiles'). Los médicos NUEVOS los crea el frontend vía POST /api/v1/doctors (NO hay trigger).
 --
 -- Corre DESPUÉS del rename profiles->users (la FK doctors.user_id necesita la tabla users;
 -- no se puede FK a la vista de compat). El origen de datos es el mismo.
@@ -82,48 +82,11 @@ where u.role = 'doctor'
     select 1 from public.doctors d where d.user_id = u.id and d.deleted_at is null
   );
 
--- === 4) Trigger: nuevos médicos entran en doctors automáticamente ===
--- Se dispara cuando un usuario pasa a/registra como role='doctor' (signup de Auth o set_my_role).
--- Convive con trg_sync_user_roles_from_profile (ambos sobre users).
-create or replace function public.sync_doctor_from_user()
-returns trigger
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-    v_ptype uuid;
-    v_spec  uuid;
-begin
-    if new.role <> 'doctor' then
-        return new;
-    end if;
-    -- ya tiene un doctor activo? (idempotente / no duplica)
-    if exists (select 1 from public.doctors d where d.user_id = new.id and d.deleted_at is null) then
-        return new;
-    end if;
-
-    select pt.id into v_ptype from public.professional_types pt
-      where pt.name = case when new.specialty ilike 'psicolog%' then 'Psicólogo' else 'Médico' end
-      limit 1;
-    -- specialty por match exacto; si no está en el catálogo queda null (el backfill sí las crea).
-    select s.id into v_spec from public.specialties s
-      where lower(s.name) = lower(trim(new.specialty)) and s.deleted_at is null
-      limit 1;
-
-    insert into public.doctors (
-        id, user_id, full_name, email, phone, professional_type_id, specialty_id,
-        license, country_of_residence, status, verified
-    )
-    values (
-        gen_random_uuid(), new.id, new.full_name, new.email, new.whatsapp_number, v_ptype, v_spec,
-        new.medical_license, new.country, 1, coalesce(new.verified, false)
-    );
-    return new;
-end;
-$$;
-
+-- === 4) Nuevos médicos: NO se auto-crean por trigger ===
+-- El registro de médico del frontend ya crea el doctor vía POST /api/v1/doctors (con cédula,
+-- teléfono y verificación SACS/FPV reales); ese endpoint liga la fila a la cuenta por email
+-- (resuelve user_id en el servicio). Un trigger duplicaría la fila y chocaría con el unique de
+-- email. Por eso aquí NO hay trigger; el backfill de arriba cubre solo a los médicos EXISTENTES.
+-- (Se elimina un trigger previo por si esta migración ya se aplicó en una versión anterior.)
 drop trigger if exists trg_sync_doctor_from_user on public.users;
-create trigger trg_sync_doctor_from_user
-    after insert or update of role, specialty on public.users
-    for each row execute function public.sync_doctor_from_user();
+drop function if exists public.sync_doctor_from_user();

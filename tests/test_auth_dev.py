@@ -12,7 +12,7 @@ from src.models.doctor import Doctor
 PREFIX = "/api/v1"
 
 
-async def test_dev_register_crea_doctor_y_emite_token(
+async def test_dev_register_crea_cuenta_y_emite_token(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     resp = await client.post(
@@ -35,13 +35,13 @@ async def test_dev_register_crea_doctor_y_emite_token(
     )
     assert me.status_code == 200
 
-    # el trigger creó el doctor
+    # dev/register crea SOLO la cuenta; el doctor lo crea el frontend vía POST /doctors.
     doc = (
         await db_session.execute(
             select(Doctor).where(Doctor.user_id == uuid.UUID(body["user_id"]))
         )
     ).scalar_one_or_none()
-    assert doc is not None
+    assert doc is None
 
 
 async def test_dev_register_idempotente_por_email(client: AsyncClient) -> None:
