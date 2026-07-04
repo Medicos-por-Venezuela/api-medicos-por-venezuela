@@ -10,8 +10,9 @@
 -- Mapeos (según decisión del proyecto):
 --   professional_type_id: specialty ILIKE 'psicolog%' -> 'Psicólogo', resto -> 'Médico'.
 --   specialty_id:         match exacto por nombre; si falta en el catálogo, se crea.
---   cedula/phone:         null (el formato +digits/V-E no aplica al dato legacy; el contacto
---                         vive en users). email: se copia de users (nullable).
+--   phone:                se copia de users.whatsapp_number TAL CUAL (los legacy no cumplen el
+--                         check +digits -> se quita el CHECK; el frontend obligará a corregirlo).
+--   email:                se copia de users. cedula: null (se completará por el frontend).
 --
 -- Idempotente: guardas + inserts con NOT EXISTS + create or replace.
 
@@ -49,6 +50,10 @@ alter table public.doctors alter column cedula drop not null;
 alter table public.doctors alter column phone  drop not null;
 alter table public.doctors alter column email  drop not null;
 
+-- Guardamos el whatsapp legacy tal cual (no cumple ^\+\d{7,15}$); la validación de
+-- formato pasa a la capa API (DoctorCreate/Update) y el frontend obliga a corregirlo.
+alter table public.doctors drop constraint if exists doctors_phone_format;
+
 -- === 3) Backfill: un doctor por cada usuario role='doctor' que aún no lo tenga ===
 insert into public.doctors (
     id, user_id, full_name, email, professional_type_id, specialty_id,
@@ -67,8 +72,8 @@ select
        limit 1),
     u.medical_license,
     u.country,
-    null,                          -- cedula: se completará luego
-    null,                          -- phone: el formato legacy no cumple el check; contacto en users
+    null,                          -- cedula: se completará por el frontend
+    u.whatsapp_number,             -- phone: whatsapp legacy tal cual (a corregir por el frontend)
     1,                             -- status: activo
     coalesce(u.verified, false)
 from public.users u
@@ -107,11 +112,11 @@ begin
       limit 1;
 
     insert into public.doctors (
-        id, user_id, full_name, email, professional_type_id, specialty_id,
+        id, user_id, full_name, email, phone, professional_type_id, specialty_id,
         license, country_of_residence, status, verified
     )
     values (
-        gen_random_uuid(), new.id, new.full_name, new.email, v_ptype, v_spec,
+        gen_random_uuid(), new.id, new.full_name, new.email, new.whatsapp_number, v_ptype, v_spec,
         new.medical_license, new.country, 1, coalesce(new.verified, false)
     );
     return new;

@@ -26,13 +26,15 @@ async def _ptype_name(db_session: AsyncSession, ptype_id) -> str:
 
 async def test_nuevo_doctor_crea_fila_en_doctors(db_session: AsyncSession) -> None:
     prof = make_profile(role="doctor", specialty="Cardiología")
+    prof.whatsapp_number = "+584140000000"
     db_session.add(prof)
     await db_session.flush()  # dispara el trigger AFTER INSERT
 
     doc = await _doctor_of(db_session, prof.id)
     assert doc is not None
     assert doc.user_id == prof.id
-    assert doc.cedula is None  # backfill/trigger dejan cédula null
+    assert doc.cedula is None  # cédula null (se completa por el frontend)
+    assert doc.phone == "+584140000000"  # whatsapp copiado tal cual
     assert await _ptype_name(db_session, doc.professional_type_id) == "Médico"
 
 
