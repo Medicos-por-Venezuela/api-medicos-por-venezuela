@@ -3,18 +3,54 @@
 Manejamos **PII médica** (pacientes, cédulas, teléfonos, motivos de consulta). La seguridad es
 obligatoria, no opcional. Estas reglas son de cumplimiento estricto.
 
-## 🔑 Autorización y RBAC (replicar las políticas RLS de Supabase)
-Hoy la app Next.js protege los datos con **RLS en Supabase**. Esta API se conecta como dueño de la
-base (RLS no aplica), por lo que **la autorización debe imponerse en la capa de servicios**,
-replicando exactamente esas políticas. Mientras no exista JWT, ningún endpoint que exponga PII debe
-publicarse a internet sin esta capa.
+## 🔑 Autorización y RBAC granular (modelo por permisos)
+Esta API se conecta como **dueño** de la base (RLS de Supabase **no** aplica), así que la
+autorización se impone en esta capa. El modelo es **RBAC granular multi-rol**: un usuario puede
+tener **varios roles** y su permiso efectivo es la **unión** de los permisos de todos ellos.
 
-Roles: `patient | doctor | specialist | admin | super_admin`. Equivalencias a respetar:
-- **is_staff** = `doctor | specialist | admin | super_admin` → puede leer pacientes y consultas.
-- **is_admin** = `admin | super_admin` → puede reasignar, cambiar estados, revocar médicos.
-- Un médico **revocado** (`active = false`) o no verificado (`verified = false`) pierde el acceso
-  de inmediato (equivalente a `current_user_role()` devolviendo NULL).
-- `set_my_role` solo permite `patient`/`doctor` (NUNCA escalar a admin/specialist desde el cliente).
+**Tablas** (todas RLS deny-all; el backend es el único que las lee, ver `db/migrations/*_rbac_*`):
+`users` (=`profiles`) → `user_roles` (N:M, con `revoked_at` soft-revoke) → `roles` →
+`role_permissions` (N:M) → `permissions`. Más `audit_log` (append-only, ver abajo).
+
+**Cómo se aplica en el código (NO reinventar):**
+- El JWT de Supabase da el `sub` = id del perfil. `get_current_principal` (en `src/core/security.py`)
+  llama a `authz.load_authz(db, user_id, fallback_role)` que devuelve `(roles, permissions)`
+  efectivos y los cuelga del `Principal`.
+- **Proteger un endpoint = una sola línea:** `_: Principal = Depends(require_permission("recurso.accion"))`.
+  El factory `require_permission(code)` (en `security.py`) exige ese permiso y devuelve 403 si falta.
+  **No** compares roles a mano en routers ni services; siempre por **permiso**.
+- `Principal.has_permission(code)` = `self.active and code in self.permissions` → un usuario
+  **revocado** (`active=false`) pierde **todos** los permisos al instante.
+- **Backfill/coexistencia:** si un usuario aún no tiene filas en `user_roles`, `load_authz` cae al
+  `profiles.role` (mapeando el legacy `specialist → doctor`). `specialist` **ya no es un rol**: todo
+  médico es `doctor`.
+
+**Roles sembrados** (`patient | doctor | admin | super_admin`) y sus permisos (18, ver el seed
+`db/migrations/*_seed_rbac_*`): `patient` = 0 permisos de staff (solo ve lo suyo por pertenencia);
+`doctor` = consultas (read/write/close) + cola (read/take) + patients.read + doctors.read;
+`admin` = todo lo operativo + `catalogs.manage` + `roles.assign` + `audit.read`;
+`super_admin` = **todos** los permisos (cross-join en el seed).
+
+**Nuevos permisos → sembrarlos en una migración**, nunca a mano. Añade la fila en `permissions`,
+mapéala a los roles en `role_permissions`, y protege el endpoint con `require_permission("...")`.
+
+**Catálogos** (`specialties`, `affected_zones`, `professional_types`): el **listado es público**
+(lo usa el registro de médicos/pacientes del sitio); todo el resto del CRUD exige `catalogs.manage`
+(solo admin/super_admin).
+
+**`is_staff`/`is_admin` son residuo legacy:** `is_staff` = rol staff + `active` + `verified`;
+`is_admin` = admin/super_admin + `active`. Solo quedan en 2 endpoints de `profiles` (presencia y
+detalle). Para código nuevo usa **siempre** `require_permission`, no estos flags.
+
+- `set_my_role` solo permite `patient`/`doctor` (NUNCA escalar a admin desde el cliente).
+
+## 🧾 Auditoría inmutable (no repudio)
+Toda acción sensible (asignar/revocar rol, y las que se agreguen) se registra en `audit_log` vía
+`src/services/audit.py::log_action` — **append-only y sin commit propio**: la entrada se persiste en
+la misma transacción del caller (si la acción hace rollback, no queda audit huérfano). La tabla es
+**inmutable a nivel de BD**: un trigger `before update or delete` lanza excepción. Se lee con
+`GET /audit-log` (permiso `audit.read`). Cuando escribas una acción auditable, llama a `log_action`
+dentro de la misma transacción; **no** hagas UPDATE/DELETE sobre `audit_log`.
 
 ## 🛡️ IDOR (Insecure Direct Object Reference) — OWASP A01
 - **Nunca** confíes en un ID de la URL/payload para devolver o mutar un recurso sin verificar que el
