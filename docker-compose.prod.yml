@@ -1,0 +1,18 @@
+# Compose de PRODUCCIÓN (EC2). Solo la API — la base de datos es Supabase, NO
+# se corre Postgres aquí. Las variables salen de .env.production (no versionado).
+#
+# Uso en la EC2:
+#   docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build
+services:
+  api:
+    build: .
+    image: api-medicos-por-venezuela
+    container_name: mpv-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    # Inyecta las variables de entorno (Supabase, JWT, CORS...) desde el archivo.
+    env_file:
+      - .env.production
+    # Sin volumen de ./src ni --reload: corre el código horneado en la imagen.
+    # El CMD del Dockerfile ya es: uvicorn src.main:app --host 0.0.0.0 --port 8000

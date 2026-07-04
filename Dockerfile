@@ -15,6 +15,14 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 RUN uv pip install --system --no-cache .
 
+# Runner de migraciones + CLI, para correr `python artisan migrate` dentro del
+# contenedor en el EC2 (asyncpg + config ya vienen con la app; no hay .venv, así
+# que artisan usa el python del sistema). Se copian después del install para no
+# invalidar la capa de dependencias al cambiar una migración.
+COPY db ./db
+COPY scripts ./scripts
+COPY artisan ./artisan
+
 # Usuario sin privilegios.
 RUN useradd --create-home appuser
 USER appuser

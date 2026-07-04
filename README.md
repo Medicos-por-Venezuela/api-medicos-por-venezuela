@@ -227,22 +227,46 @@ uv run uvicorn src.main:app --reload      # http://localhost:8000
   ⚠️ `SUPABASE_JWT_SECRET` es **obligatorio** en producción (Supabase → Settings → API → JWT Secret);
   el valor por defecto del código es solo para desarrollo/pruebas.
 
-## Autenticación y autorización (RBAC)
+## Autenticación y autorización (RBAC granular)
 
 El login sigue en **Supabase Auth**; el frontend manda el JWT como
 `Authorization: Bearer <token>`. La API valida firma/exp/audiencia, saca el `sub`
-(= id del perfil) y carga el rol desde `profiles`. Roles (valores reales en BD):
-`patient | doctor | specialist | admin | super_admin` (medico=`doctor`, paciente=`patient`).
+(= id del perfil) y **calcula los permisos efectivos** del usuario.
 
-| Grupo  | Roles | Puede |
-| ------ | ----- | ----- |
-| público | (sin token) | crear paciente/consulta, heartbeat, sala de video, `GET /specialties`, `GET /specialties/catalog` |
-| **staff** | doctor, specialist, admin, super_admin | cola, tomar/atender, leer/editar consultas, cerrar, eventos, listar pacientes/médicos |
-| **admin** | admin, super_admin | listar perfiles, revocar médico, CRUD médicos/especialidades, editar/borrar paciente, liberar estancadas |
-| self | el titular del JWT | `GET /auth/me`, `POST /profiles/me/online`, `POST /profiles/me/finalize-role` |
+**Modelo:** RBAC granular **multi-rol**. Un usuario tiene uno o varios **roles**; cada rol agrupa
+**permisos** (`recurso.accion`, p. ej. `consultations.close`). El permiso efectivo del usuario es la
+**unión** de los permisos de todos sus roles activos. Así un mismo usuario accede a varias
+capacidades sin duplicar cuentas.
 
-- El **actor** de las acciones (médico que toma/cierra) se toma del JWT, **no** de ids del cliente (anti-IDOR).
-- Un paciente autenticado solo ve **sus** consultas; un médico **revocado** (`active=false`) pierde acceso al instante.
+```
+users (profiles) ──< user_roles >── roles ──< role_permissions >── permissions
+                      (revoked_at)                                  audit_log (inmutable)
+```
+
+**Roles** (`patient | doctor | admin | super_admin`) → permisos:
+
+| Rol | Permisos |
+| --- | --- |
+| `patient` | ninguno de staff (solo ve **lo suyo** por pertenencia) |
+| `doctor` | `consultations.read/write/close`, `queue.read/take`, `patients.read`, `doctors.read` |
+| `admin` | todo lo de doctor + `patients.write/delete`, `consultations.delete`, `queue.manage`, `doctors.write/verify`, `profiles.read/manage`, `catalogs.manage`, `roles.assign`, `audit.read` |
+| `super_admin` | **todos** los permisos |
+
+**Cómo se protege un endpoint** (una línea): `Depends(require_permission("recurso.accion"))` → 403 si
+falta el permiso. Se autoriza por **permiso**, no por rol.
+
+- El **actor** de las acciones (médico que toma/cierra, quien asigna un rol) se toma del JWT, **no**
+  de ids del cliente (anti-IDOR).
+- Un usuario **revocado** (`active=false`) pierde **todos** sus permisos al instante.
+- **Coexistencia:** si un usuario aún no tiene filas en `user_roles`, se usa su `profiles.role` como
+  fallback (`specialist` legacy → `doctor`). El backfill inicial ya migró todos los perfiles.
+- **Catálogos** (`specialties`, `affected_zones`, `professional-types`): **listar es público** (lo usa
+  el registro del sitio); el resto del CRUD exige `catalogs.manage` (admin/super_admin).
+- **Auditoría:** las acciones sensibles se registran en `audit_log` (append-only, **inmutable** por
+  trigger). Se leen con `GET /audit-log` (permiso `audit.read`).
+
+**Agregar un permiso nuevo:** siémbralo en una migración (`permissions` + `role_permissions`) y
+protege el endpoint con `require_permission("...")`. Nunca lo insertes a mano.
 
 ## Endpoints (prefijo `/api/v1`)
 
@@ -278,6 +302,11 @@ El login sigue en **Supabase Auth**; el frontend manda el JWT como
 | `GET`   | `/doctors/{id}` · `PATCH` · `DELETE`| Detalle / actualizar / eliminar      |
 | `GET`   | `/profiles?role=`                   | Lista perfiles (solo lectura)        |
 | `GET`   | `/profiles/{id}`                    | Detalle de perfil                    |
+| `GET`   | `/roles`                            | Catálogo de roles (`roles.assign`)   |
+| `GET`   | `/users/{id}/roles`                 | Roles activos de un usuario (`roles.assign`) |
+| `POST`  | `/users/{id}/roles`                 | Asignar rol (auditado; `roles.assign`) |
+| `DELETE`| `/users/{id}/roles/{role_id}`       | Revocar rol (soft, auditado; `roles.assign`) |
+| `GET`   | `/audit-log?action=&actor_user_id=&resource=` | Registro de auditoría (`audit.read`) |
 
 ## Concurrencia: toma de cola anti-colisión
 

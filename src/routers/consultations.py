@@ -14,8 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.security import (
     Principal,
     get_current_principal,
-    require_admin,
-    require_staff,
+    require_permission,
 )
 from src.db.session import get_db
 from src.schemas.consultation import (
@@ -119,7 +118,7 @@ async def update_consultation(
     consultation_id: uuid.UUID,
     payload: ConsultationUpdate,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_staff),
+    _: Principal = Depends(require_permission("consultations.write")),
 ) -> ConsultationResponse:
     return await consultations_service.update_consultation(db, consultation_id, payload)
 
@@ -133,7 +132,7 @@ async def update_consultation(
 async def delete_consultation(
     consultation_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_admin),
+    _: Principal = Depends(require_permission("consultations.delete")),
 ) -> None:
     await consultations_service.delete_consultation(db, consultation_id)
 
@@ -151,7 +150,7 @@ async def close_consultation(
     consultation_id: uuid.UUID,
     payload: ConsultationCloseRequest,
     db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_staff),
+    principal: Principal = Depends(require_permission("consultations.close")),
 ) -> ConsultationResponse:
     """Cierra (`closed`) o marca `patient_no_show`, guarda la nota y registra el evento.
     El autor del cierre es el médico autenticado."""
@@ -200,7 +199,7 @@ async def ensure_video_room(
 async def list_consultation_events(
     consultation_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_staff),
+    _: Principal = Depends(require_permission("consultations.read")),
 ) -> list[ConsultationEventResponse]:
     """Historial de auditoría de la consulta (cronológico)."""
     return await consultations_service.list_events(db, consultation_id)
@@ -220,7 +219,7 @@ async def create_consultation_event(
     consultation_id: uuid.UUID,
     payload: ConsultationEventCreate,
     db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_staff),
+    principal: Principal = Depends(require_permission("consultations.write")),
 ) -> ConsultationEventResponse:
     return await consultations_service.create_event(
         db, consultation_id, payload, created_by=principal.id

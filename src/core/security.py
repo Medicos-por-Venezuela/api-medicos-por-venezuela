@@ -18,11 +18,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.config import settings
 from src.db.session import get_db
 from src.models.profile import Profile
+from src.services import authz
 
 logger = logging.getLogger("mpv.api")
 
-# Mapeo de roles (valores reales en la BD): medico = doctor, paciente = patient.
-STAFF_ROLES = {"doctor", "specialist", "admin", "super_admin"}
+# Roles RBAC con acceso de staff / admin.
+STAFF_ROLES = {"doctor", "admin", "super_admin"}
 ADMIN_ROLES = {"admin", "super_admin"}
 
 # auto_error=False: gestionamos nosotros el 401 (mensaje uniforme).
@@ -30,22 +31,28 @@ _bearer = HTTPBearer(auto_error=False)
 
 
 class Principal(BaseModel):
-    """Identidad autenticada derivada del JWT + el perfil en BD."""
+    """Identidad autenticada: JWT + perfil + roles/permisos RBAC efectivos."""
 
     id: uuid.UUID
     email: str | None = None
-    role: str
+    role: str  # profiles.role (legado; se conserva por compatibilidad)
     active: bool
     verified: bool
     specialty: str | None = None
+    roles: frozenset[str] = frozenset()  # roles RBAC efectivos (user_roles o fallback)
+    permissions: frozenset[str] = frozenset()  # permisos efectivos (unión de sus roles)
 
     @property
     def is_staff(self) -> bool:
-        return self.role in STAFF_ROLES and self.active and self.verified
+        return bool(self.roles & STAFF_ROLES) and self.active and self.verified
 
     @property
     def is_admin(self) -> bool:
-        return self.role in ADMIN_ROLES and self.active
+        return bool(self.roles & ADMIN_ROLES) and self.active
+
+    def has_permission(self, code: str) -> bool:
+        # Un usuario revocado (active=false) pierde TODOS los permisos al instante.
+        return self.active and code in self.permissions
 
 
 def _unauthorized(detail: str) -> HTTPException:
@@ -93,6 +100,7 @@ async def get_current_principal(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="No existe un perfil para este usuario.",
         )
+    roles, permissions = await authz.load_authz(db, profile.id, profile.role)
     return Principal(
         id=profile.id,
         email=profile.email,
@@ -100,6 +108,8 @@ async def get_current_principal(
         active=profile.active,
         verified=profile.verified,
         specialty=profile.specialty,
+        roles=roles,
+        permissions=permissions,
     )
 
 
@@ -137,3 +147,21 @@ async def require_admin(
             detail="Requiere permisos de administrador.",
         )
     return principal
+
+
+def require_permission(code: str):
+    """Fábrica de dependencia RBAC granular: exige el permiso `code`.
+
+    Uso:  _: Principal = Depends(require_permission("doctors.verify"))
+    """
+
+    async def _require(principal: Principal = Depends(get_current_principal)) -> Principal:
+        if not principal.has_permission(code):
+            logger.warning("SEC:forbidden user_id=%s missing_perm=%s", principal.id, code)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No tienes permiso para esta acción.",
+            )
+        return principal
+
+    return _require

@@ -9,7 +9,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.security import Principal, require_admin, require_staff
+from src.core.security import Principal, get_current_principal
 from src.db.session import get_db
 from src.main import app
 from src.models.professional_type import ProfessionalType
@@ -35,10 +35,16 @@ async def client(
     async def _override_get_db() -> AsyncGenerator[AsyncSession, None]:
         yield db_session
 
-    principal = Principal(id=uuid.uuid4(), role="admin", active=True, verified=True)
+    principal = Principal(
+        id=uuid.uuid4(),
+        role="admin",
+        active=True,
+        verified=True,
+        roles=frozenset({"admin"}),
+        permissions=frozenset({"catalogs.manage"}),
+    )
     app.dependency_overrides[get_db] = _override_get_db
-    app.dependency_overrides[require_admin] = lambda: principal
-    app.dependency_overrides[require_staff] = lambda: principal
+    app.dependency_overrides[get_current_principal] = lambda: principal
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac

@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
 from src.core.ratelimit import limiter
-from src.core.security import Principal, require_admin, require_staff
+from src.core.security import Principal, require_permission
 from src.db.session import get_db
 from src.schemas.doctor import DoctorCreate, DoctorResponse, DoctorUpdate
 from src.services import doctors as doctors_service
@@ -32,7 +32,7 @@ async def list_doctors(
     limit: int = Query(100, ge=1, le=100),
     status_filter: int | None = Query(None, alias="status", ge=0, le=2),
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_staff),
+    _: Principal = Depends(require_permission("doctors.read")),
 ) -> list[DoctorResponse]:
     """Lista de médicos (no borrados); filtrable por `status` (0/1/2)."""
     return await doctors_service.list_doctors(db, skip=skip, limit=limit, status=status_filter)
@@ -69,7 +69,7 @@ async def register_doctor(
 async def get_doctor(
     doctor_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_staff),
+    _: Principal = Depends(require_permission("doctors.read")),
 ) -> DoctorResponse:
     return await doctors_service.get_doctor(db, doctor_id)
 
@@ -84,7 +84,7 @@ async def update_doctor(
     doctor_id: uuid.UUID,
     payload: DoctorUpdate,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_admin),
+    _: Principal = Depends(require_permission("doctors.write")),
 ) -> DoctorResponse:
     return await doctors_service.update_doctor(db, doctor_id, payload)
 
@@ -98,6 +98,6 @@ async def update_doctor(
 async def delete_doctor(
     doctor_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_admin),
+    _: Principal = Depends(require_permission("doctors.write")),
 ) -> None:
     await doctors_service.delete_doctor(db, doctor_id)
