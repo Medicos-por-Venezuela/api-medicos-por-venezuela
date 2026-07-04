@@ -8,6 +8,7 @@ El `audit_log` es inmutable a nivel de BD (un trigger rechaza UPDATE/DELETE).
 
 import uuid
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.audit_log import AuditLog
@@ -35,3 +36,24 @@ async def log_action(
     )
     session.add(entry)
     return entry
+
+
+async def list_audit_log(
+    session: AsyncSession,
+    *,
+    skip: int = 0,
+    limit: int = 100,
+    action: str | None = None,
+    actor_user_id: uuid.UUID | None = None,
+    resource: str | None = None,
+) -> list[AuditLog]:
+    """Entradas del audit_log, más recientes primero, con filtros opcionales."""
+    stmt = select(AuditLog)
+    if action is not None:
+        stmt = stmt.where(AuditLog.action == action)
+    if actor_user_id is not None:
+        stmt = stmt.where(AuditLog.actor_user_id == actor_user_id)
+    if resource is not None:
+        stmt = stmt.where(AuditLog.resource == resource)
+    stmt = stmt.order_by(AuditLog.created_at.desc()).offset(skip).limit(limit)
+    return list((await session.execute(stmt)).scalars().all())
