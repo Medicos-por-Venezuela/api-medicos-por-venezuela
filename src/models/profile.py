@@ -1,4 +1,4 @@
-"""Modelo ORM de la tabla public.profiles."""
+"""Modelo ORM de la tabla public.users (antes 'profiles')."""
 
 import uuid
 from datetime import datetime
@@ -15,7 +15,9 @@ PROFILE_ROLES = {"patient", "doctor", "specialist", "admin", "super_admin"}
 
 
 class Profile(Base):
-    __tablename__ = "profiles"
+    # Renombrada desde 'profiles'; una vista de compatibilidad mantiene el nombre viejo
+    # para el frontend directo, el trigger de Auth y las funciones RLS.
+    __tablename__ = "users"
 
     # En producción id referencia auth.users(id) (gestionado por Supabase Auth).
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)

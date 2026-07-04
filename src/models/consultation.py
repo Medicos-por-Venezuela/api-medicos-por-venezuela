@@ -37,7 +37,7 @@ class Consultation(Base):
         UUID(as_uuid=True), ForeignKey("doctors.id"), nullable=True
     )
     assigned_doctor_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=True
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
     status: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'waiting'"))
     priority: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'normal'"))
