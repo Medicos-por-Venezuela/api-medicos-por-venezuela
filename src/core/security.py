@@ -8,6 +8,7 @@ replican las políticas RLS (is_staff / is_admin).
 
 import logging
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import jwt
 from fastapi import Depends, HTTPException, status
@@ -75,6 +76,23 @@ def decode_token(token: str) -> dict:
     except jwt.PyJWTError as exc:
         logger.warning("SEC:token_invalid reason=%s", type(exc).__name__)
         raise _unauthorized("Token inválido o expirado.") from exc
+
+
+def issue_access_token(sub: uuid.UUID | str, ttl_hours: int = 8) -> str:
+    """Firma un JWT compatible con decode_token (mismo secret/alg/audiencia).
+
+    Solo para el registro de DEV en local (sustituye el signup de Supabase Auth).
+    En producción los JWT los emite Supabase, no la API.
+    """
+    return jwt.encode(
+        {
+            "sub": str(sub),
+            "aud": settings.SUPABASE_JWT_AUDIENCE,
+            "exp": datetime.now(UTC) + timedelta(hours=ttl_hours),
+        },
+        settings.SUPABASE_JWT_SECRET,
+        algorithm=settings.SUPABASE_JWT_ALGORITHM,
+    )
 
 
 async def get_current_principal(
