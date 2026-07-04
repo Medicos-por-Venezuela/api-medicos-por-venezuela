@@ -6,15 +6,22 @@ Producción: se define `DATABASE_URL` (o las piezas POSTGRES_*) apuntando a Supa
 El driver es asíncrono (asyncpg), así que la URL usa el esquema postgresql+asyncpg://.
 """
 
+import ssl
 from functools import lru_cache
 from typing import Any
 from urllib.parse import quote_plus
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Modos de SSL que exigen cifrado (asyncpg no entiende "sslmode" en la URL; el
-# cifrado se pasa por connect_args, ver db/session.py).
-_SSL_REQUIRED = {"require", "verify-ca", "verify-full"}
+# Modos de SSL (asyncpg no entiende "sslmode" en la URL; el cifrado va por
+# connect_args, ver db/session.py). Semántica de Postgres:
+#   - require            -> cifra pero NO verifica la CA (verify_mode=CERT_NONE).
+#   - verify-ca/-full    -> cifra Y verifica la CA (requiere la CA en el trust store).
+# Supabase usa una CA self-signed: con verify-full falla ("self-signed certificate
+# in certificate chain"); por eso 'require' debe cifrar sin verificar.
+_SSL_NO_VERIFY = {"require"}
+_SSL_VERIFY = {"verify-ca", "verify-full"}
+_SSL_REQUIRED = _SSL_NO_VERIFY | _SSL_VERIFY
 
 
 class Settings(BaseSettings):
@@ -105,10 +112,17 @@ class Settings(BaseSettings):
     def connect_args(self) -> dict[str, Any]:
         """Argumentos de conexión para asyncpg."""
         args: dict[str, Any] = {}
-        if self.ssl_required:
-            # asyncpg usa el contexto SSL por defecto; los certificados del pooler
-            # de Supabase son válidos públicamente.
+        mode = self.POSTGRES_SSLMODE.lower()
+        if mode in _SSL_VERIFY:
+            # Verifica la CA (necesita la CA en el trust store; p. ej. la de Supabase).
             args["ssl"] = True
+        elif mode in _SSL_NO_VERIFY:
+            # require: cifra pero NO verifica la CA (asyncpg ssl=True verificaría =
+            # verify-full, que rompe con la CA self-signed del pooler de Supabase).
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            args["ssl"] = ctx
         if self.DB_DISABLE_PREPARED_STATEMENTS:
             # Necesario detrás de PgBouncer en modo transaction (Supabase 6543).
             args["statement_cache_size"] = 0
