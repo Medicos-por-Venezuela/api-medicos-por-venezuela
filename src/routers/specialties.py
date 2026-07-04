@@ -5,7 +5,7 @@ import uuid
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.security import Principal, require_admin
+from src.core.security import Principal, require_permission
 from src.db.session import get_db
 from src.schemas.specialty import (
     SpecialtyCatalogResponse,
@@ -67,7 +67,7 @@ async def get_catalog() -> SpecialtyCatalogResponse:
 async def create_specialty(
     payload: SpecialtyCreate,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_admin),
+    _: Principal = Depends(require_permission("catalogs.manage")),
 ) -> SpecialtyResponse:
     """Crea una especialidad. Requiere rol admin o super_admin."""
     return await specialties_service.create_specialty(db, payload)
@@ -82,7 +82,7 @@ async def create_specialty(
 async def get_specialty(
     specialty_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_admin),
+    _: Principal = Depends(require_permission("catalogs.manage")),
 ) -> SpecialtyResponse:
     """Devuelve una especialidad no eliminada. Requiere rol admin o super_admin."""
     return await specialties_service.get_specialty(db, specialty_id)
@@ -98,7 +98,7 @@ async def update_specialty(
     specialty_id: uuid.UUID,
     payload: SpecialtyUpdate,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_admin),
+    _: Principal = Depends(require_permission("catalogs.manage")),
 ) -> SpecialtyResponse:
     """Modifica `name` y/o `status`. Requiere rol admin o super_admin."""
     return await specialties_service.update_specialty(db, specialty_id, payload)
@@ -113,7 +113,7 @@ async def update_specialty(
 async def delete_specialty(
     specialty_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_admin),
+    _: Principal = Depends(require_permission("catalogs.manage")),
 ) -> None:
     """Marca la especialidad como eliminada con `deleted_at`."""
     await specialties_service.delete_specialty(db, specialty_id)

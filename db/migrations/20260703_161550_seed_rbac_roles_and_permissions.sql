@@ -30,6 +30,7 @@ from (values
     ('doctors.verify',      'Verificar credencial de médicos'),
     ('profiles.read',       'Ver perfiles'),
     ('profiles.manage',     'Activar/revocar perfiles'),
+    ('catalogs.manage',     'Administrar catálogos (especialidades, zonas, tipos profesionales)'),
     ('roles.assign',        'Asignar/revocar roles a usuarios'),
     ('audit.read',          'Ver el registro de auditoría')
 ) as v (code, description)
@@ -47,7 +48,7 @@ from (values
     ('admin', 'consultations.close'), ('admin', 'consultations.delete'),
     ('admin', 'queue.read'), ('admin', 'queue.take'), ('admin', 'queue.manage'),
     ('admin', 'doctors.read'), ('admin', 'doctors.write'), ('admin', 'doctors.verify'),
-    ('admin', 'profiles.read'), ('admin', 'profiles.manage'),
+    ('admin', 'profiles.read'), ('admin', 'profiles.manage'), ('admin', 'catalogs.manage'),
     ('admin', 'roles.assign'), ('admin', 'audit.read')
 ) as m (role_code, perm_code)
 join public.roles r on r.code = m.role_code and r.deleted_at is null

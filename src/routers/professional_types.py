@@ -5,7 +5,7 @@ import uuid
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.security import Principal, require_admin, require_staff
+from src.core.security import Principal, require_permission
 from src.db.session import get_db
 from src.schemas.professional_type import (
     ProfessionalTypeCreate,
@@ -49,7 +49,7 @@ async def list_professional_types(
 async def create_professional_type(
     payload: ProfessionalTypeCreate,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_admin),
+    _: Principal = Depends(require_permission("catalogs.manage")),
 ) -> ProfessionalTypeResponse:
     """Create a professional type with `status=active` by default."""
     return await professional_types_service.create_professional_type(db, payload)
@@ -64,7 +64,7 @@ async def create_professional_type(
 async def get_professional_type(
     professional_type_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_staff),
+    _: Principal = Depends(require_permission("catalogs.manage")),
 ) -> ProfessionalTypeResponse:
     """Get a non-deleted professional type by ID."""
     return await professional_types_service.get_professional_type(db, professional_type_id)
@@ -80,7 +80,7 @@ async def update_professional_type(
     professional_type_id: uuid.UUID,
     payload: ProfessionalTypeUpdate,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_admin),
+    _: Principal = Depends(require_permission("catalogs.manage")),
 ) -> ProfessionalTypeResponse:
     """Update name/status for a non-deleted professional type."""
     return await professional_types_service.update_professional_type(
@@ -97,7 +97,7 @@ async def update_professional_type(
 async def delete_professional_type(
     professional_type_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_admin),
+    _: Principal = Depends(require_permission("catalogs.manage")),
 ) -> None:
     """Mark the professional type as `deleted`; the row remains in the table."""
     await professional_types_service.delete_professional_type(db, professional_type_id)
