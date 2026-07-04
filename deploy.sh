@@ -18,7 +18,10 @@ set -euo pipefail
 COMPOSE="docker-compose.prod.yml"
 ENV_FILE=".env.production"
 IMAGE="api-medicos-por-venezuela"
-HEALTH_URL="http://localhost:8000/api/v1/health"
+# localhost es lo robusto (el script corre en el propio EC2; no depende de la IP
+# pública ni del Security Group). Para chequear el acceso EXTERNO, sobreescribí:
+#   HEALTH_URL=http://100.31.160.0:8000/api/v1/health ./deploy.sh
+HEALTH_URL="${HEALTH_URL:-http://localhost:8000/api/v1/health}"
 
 BRANCH="dev"
 ASSUME_YES=0
