@@ -1,51 +1,28 @@
+# Prerequisito: Supabase local corriendo (`npx supabase start`, ver README). Este compose
+# YA NO levanta Postgres propio: la API se conecta al Postgres de Supabase local (Auth,
+# Realtime y PostgREST del frontend usan esa misma base). `host.docker.internal` es cómo
+# un contenedor llega al puerto publicado en el HOST por Supabase (Docker Desktop lo
+# soporta out-of-the-box en Windows/Mac).
 services:
-  db:
-    image: postgres:17
-    container_name: mpv-db
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-localdev}
-      POSTGRES_DB: ${POSTGRES_DB:-medicos}
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      # Se ejecuta SOLO en la primera inicialización (volumen vacío):
-      #   00-...sql  -> crea stubs de Supabase (esquema auth, auth.uid(), roles)
-      #   01-...sh   -> restaura el backup más reciente de ./backups si existe
-      - ./db/init:/docker-entrypoint-initdb.d:ro
-      - ./backups:/backups:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-medicos}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-
   api:
     build: .
     container_name: mpv-api
     restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
     ports:
       - "8000:8000"
     environment:
       ENVIRONMENT: development
-      # La API se conecta al servicio "db" de esta red (no a Supabase).
-      POSTGRES_HOST: db
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-medicos}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-localdev}
+      POSTGRES_HOST: host.docker.internal
+      POSTGRES_PORT: "54322"
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
       POSTGRES_SSLMODE: disable
+      SUPABASE_JWT_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+      SUPABASE_JWT_AUDIENCE: authenticated
+      SUPABASE_JWKS_URL: http://host.docker.internal:54321/auth/v1/.well-known/jwks.json
       BACKEND_CORS_ORIGINS: "*"
     volumes:
       # Hot-reload en desarrollo.
       - ./src:/code/src:ro
     command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
-
-volumes:
-  pgdata:

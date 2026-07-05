@@ -33,7 +33,7 @@ src/
 ├── services/            # ⭐ Lógica de negocio + queries + bloqueos (el lock vive en queue.py)
 └── routers/             # HTTP delgado (Depends -> service -> mapeo de excepción)
 tests/                   # pytest async: conftest (savepoints) + test_queue_concurrency
-db/init/                 # Bootstrap Postgres local: stubs Supabase + restore del backup
+supabase/                # Config del CLI de Supabase LOCAL (npx supabase start) — ver README
 scripts/                 # backup_supabase.sh / load_local.sh
 ```
 - El **bloqueo de la cola** (`with_for_update(nowait=True)`) está en `src/services/queue.py`.
@@ -47,6 +47,8 @@ Antes de dar por terminado: tests verdes, cobertura ≥95%, `uv run ruff check .
 `responses`). Ver `@.claude/rules/commands.md`.
 
 ## 🗄️ Nota sobre datos y entorno
-La base local (Docker) tiene **datos reales restaurados desde Supabase** (PII). Producción es
-Supabase. **No** hagas inserts/escrituras de prueba contra Supabase. El `code` de las consultas lo
-genera SIEMPRE un trigger en la base (`generate_consultation_code`), no la API.
+El local es **Supabase local real** (`npx supabase start`, ver README -> "Supabase local"),
+no un Postgres propio ni datos mockeados: mismo esquema y mismo Auth que producción. Puede
+tener datos reales si se restauró un backup con `scripts/load_local.sh` (PII). Producción es
+Supabase. **No** hagas inserts/escrituras de prueba contra Supabase (producción). El `code`
+de las consultas lo genera SIEMPRE un trigger en la base (`generate_consultation_code`), no la API.

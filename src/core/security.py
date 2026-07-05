@@ -8,6 +8,7 @@ replican las políticas RLS (is_staff / is_admin).
 
 import logging
 import uuid
+from functools import lru_cache
 
 import jwt
 from fastapi import Depends, HTTPException, status
@@ -63,9 +64,40 @@ def _unauthorized(detail: str) -> HTTPException:
     )
 
 
+# Algoritmos asimétricos de las "JWT signing keys" de Supabase (rotables, vía JWKS).
+# HS256 (secreto compartido) sigue siendo el esquema legacy de la mayoría de proyectos.
+_ASYMMETRIC_ALGORITHMS = ("ES256", "RS256", "PS256")
+
+
+@lru_cache(maxsize=4)
+def _jwks_client(jwks_url: str) -> jwt.PyJWKClient:
+    """Cliente JWKS cacheado por URL (PyJWKClient ya cachea las claves por `kid`)."""
+    return jwt.PyJWKClient(jwks_url)
+
+
 def decode_token(token: str) -> dict:
-    """Valida y decodifica el JWT de Supabase. Lanza 401 si es inválido/expirado."""
+    """Valida y decodifica el JWT de Supabase. Lanza 401 si es inválido/expirado.
+
+    Soporta dos esquemas de firma (Supabase los usa según el proyecto):
+      - HS256 con secreto compartido (SUPABASE_JWT_SECRET) — el legacy, la mayoría hoy.
+      - Asimétrico vía JWKS (SUPABASE_JWKS_URL) — las "JWT signing keys" nuevas de
+        Supabase (rotables); el CLI de Supabase LOCAL las usa por defecto.
+    """
     try:
+        header = jwt.get_unverified_header(token)
+    except jwt.PyJWTError as exc:
+        logger.warning("SEC:token_invalid reason=%s", type(exc).__name__)
+        raise _unauthorized("Token inválido o expirado.") from exc
+
+    try:
+        if header.get("alg") in _ASYMMETRIC_ALGORITHMS and settings.SUPABASE_JWKS_URL:
+            signing_key = _jwks_client(settings.SUPABASE_JWKS_URL).get_signing_key_from_jwt(token)
+            return jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=list(_ASYMMETRIC_ALGORITHMS),
+                audience=settings.SUPABASE_JWT_AUDIENCE,
+            )
         return jwt.decode(
             token,
             settings.SUPABASE_JWT_SECRET,

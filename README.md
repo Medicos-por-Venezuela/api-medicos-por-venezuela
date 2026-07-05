@@ -2,8 +2,10 @@
 
 API REST construida con **FastAPI + SQLAlchemy + Pydantic**.
 
-- **Desarrollo local:** Postgres en Docker, con los **modelos y datos reales** traídos
-  desde Supabase mediante un backup.
+- **Desarrollo local:** [Supabase local](#supabase-local-desarrollo) (CLI de Supabase,
+  Docker por debajo) — el **mismo** Postgres/Auth/Realtime que usa el frontend, no un
+  Postgres propio. Local y producción usan el mismo esquema y el mismo Supabase Auth;
+  no hay una versión "de mentira" del entorno.
 - **Producción:** se conecta a **Supabase** (Postgres) vía variables de entorno.
 
 Los modelos reflejan el esquema **real y actual** de Supabase (12 tablas: `profiles`,
@@ -15,11 +17,12 @@ Los modelos reflejan el esquema **real y actual** de Supabase (12 tablas: `profi
 - **FastAPI (async)** — framework web + OpenAPI automático; todas las rutas son `async def`.
 - **SQLAlchemy 2.0 async** — ORM con driver **asyncpg** (`AsyncSession`).
 - **Pydantic v2** + **pydantic-settings** — validación (`EmailStr`, `Field`) y configuración.
-- **PostgreSQL 17** — local en Docker (dev) / Supabase (prod).
+- **PostgreSQL 17** — Supabase local (CLI) en dev / Supabase en prod (mismo motor).
 - **uv** (Astral) — gestor de paquetes y entornos.
 - **pytest + pytest-asyncio** — suite async con cobertura (objetivo ≥95%).
 - **Ruff** — lint + formato.
-- **Docker / Docker Compose** — `db` (Postgres) + `api`.
+- **Docker / Docker Compose** — solo el servicio `api` (Postgres/Auth/Realtime los da
+  Supabase local, que también corre en Docker por debajo del CLI).
 
 ## Arquitectura (capa de servicios, 3-tier)
 
@@ -36,8 +39,11 @@ src/
 ├── schemas/           # Capa de validación: Pydantic (Create/Update/Response)
 ├── services/          # Capa de negocio: lógica + queries + bloqueos (async)
 └── routers/           # Capa HTTP: routers DELGADOS que delegan en services
-db/init/               # Init del Postgres local: stubs de Supabase + restore del backup
 db/migrations/         # Migraciones de esquema (.sql), aplicadas por scripts/migrate.py
+                       # 000_core_schema.sql = espejo de supabase_schema.sql del frontend
+                       # (profiles/patients/consultations/RLS/RPCs); el resto es de este repo.
+supabase/              # Config del CLI de Supabase LOCAL (`npx supabase start`). Sin
+                       # migraciones propias: el schema completo lo aplica scripts/migrate.py.
 backups/               # Backups de Supabase (.dump/.sql) — IGNORADO por git (PII)
 scripts/               # backup_supabase.sh / load_local.sh / migrate.py (CLI de migraciones)
 tests/                 # Suite async (CRUD aislado por savepoints + concurrencia)
@@ -50,56 +56,189 @@ tests/                 # Suite async (CRUD aislado por savepoints + concurrencia
 - Los **manejadores globales** (`core/exceptions.py`) traducen las excepciones de dominio
   y las nativas de SQLAlchemy (`OperationalError`, `IntegrityError`, lock `55P03`) a HTTP.
 
-## Inicio rápido (desarrollo local con Docker)
+## Supabase local (desarrollo)
+
+Local y producción usan **el mismo** Supabase: mismo esquema, mismo Supabase Auth, mismo
+Realtime. No hay una versión "de mentira" del backend para local — el único cambio entre
+entornos es a qué **proyecto** de Supabase apuntás (local vs. el de producción).
+
+### 1. Prerequisitos (una sola vez)
+
+- **Docker Desktop** corriendo (Supabase local corre en Docker por debajo del CLI).
+- **Node.js** (para invocar el CLI de Supabase vía `npx`; no hace falta instalarlo global).
+
+### 2. Instalar el CLI de Supabase (pinneado en este repo)
+
+Este repo es Python, pero el CLI de Supabase se distribuye vía npm — se pinnea la versión
+en un `package.json` mínimo (dev-only) para que todos los devs usen la misma:
 
 ```bash
-cp .env.example .env          # valores local por defecto (Postgres local)
-docker compose up --build     # levanta Postgres + API
+npm install        # instala el CLI de Supabase pinneado en package.json (solo para esto)
 ```
 
-En el **primer arranque**, el contenedor de Postgres:
+A partir de acá, todo comando del CLI se invoca como `npx supabase <comando>`.
 
-1. ejecuta `db/init/00-supabase-stubs.sql` (crea el esquema `auth`, `auth.uid()` y los
-   roles `anon`/`authenticated` que el dump de Supabase necesita para restaurarse), y
-2. ejecuta `db/init/01-restore-from-backup.sh`, que restaura el backup más reciente de
-   `./backups/*.dump` **con datos** (usa `--disable-triggers` para que las FKs a
-   `auth.users` y el trigger de códigos no interfieran).
+### 3. Levantar Supabase local
 
-Luego:
+```bash
+npx supabase start
+```
 
-- API: http://localhost:8000
-- Swagger UI: http://localhost:8000/docs
-- Health: http://localhost:8000/health
-- Postgres local: `localhost:5432` (db `medicos`, user `postgres`, pass `localdev`)
+La **primera vez** descarga varias imágenes Docker (unos minutos); las siguientes tarda
+~30s. Al terminar imprime las URLs/keys locales (`ANON_KEY`, `API_URL`, `DB_URL`, `JWT_SECRET`,
+`STUDIO_URL`...) — son **valores fijos de desarrollo local**, no secretos reales, y ya están
+precargados en `.env`/`.env.example` de este repo.
 
-> Sin backup en `./backups`, la base se crea solo con los stubs (vacía); puedes cargar
-> datos después con `scripts/load_local.sh`.
+Queda corriendo (todo en Docker, nombres `supabase_*_api-medicos-por-venezuela`):
+
+| Servicio | URL |
+| -------- | --- |
+| API (Auth/REST/Realtime, vía Kong) | http://localhost:54321 |
+| Postgres | `localhost:54322` (user/pass/db: `postgres`) |
+| Studio (UI para explorar la BD) | http://localhost:54323 |
+| Inbucket (atrapa los emails de Auth) | http://localhost:54324 |
+
+> Deshabilitados a propósito (ver `supabase/config.toml`): Storage, Edge Functions y
+> Analytics — este proyecto solo usa **Auth** y **Realtime** de Supabase; menos
+> contenedores = arranque más liviano. Se pueden reactivar ahí si hicieran falta.
+
+Para apagarlo: `npx supabase stop`. Para un reinicio total (borra los datos locales):
+`npx supabase stop --no-backup && npx supabase start`.
+
+### 4. Aplicar el schema completo (una sola vez por BD nueva)
+
+El schema **no** vive en `supabase/migrations/` — sigue viviendo en `db/migrations/` de este
+repo (el runner de siempre, `artisan`/`scripts/migrate.py`), incluyendo el schema "core"
+(profiles/patients/consultations/RLS/RPCs) copiado 1:1 del frontend como
+`db/migrations/000_core_schema.sql` (ordena primero). Supabase local ya trae su propio
+esquema `auth` real (Auth/GoTrue), así que no hace falta ningún stub.
+
+```bash
+cp .env.example .env      # ya apunta a Supabase local (puerto 54322 + JWKS de Auth)
+python artisan migrate    # aplica las 12+ migraciones (schema core + catálogos + RBAC + ...)
+```
+
+### 5. Levantar la API
+
+```bash
+# Nativo (más simple, sin Docker para la API):
+uv run uvicorn src.main:app --reload
+
+# O en Docker (requiere Supabase local ya corriendo -> se conecta por host.docker.internal):
+docker compose up --build
+```
+
+- API: http://localhost:8000 · Swagger: http://localhost:8000/docs · Health: `/api/v1/health`
 
 ### Un comando (para el frontend / sin saber Python)
 
-Para levantar el backend en local y testear el frontend contra `http://localhost:8000`, **no hace
-falta Python**: las migraciones corren dentro del contenedor. Único requisito: **Docker Desktop**.
+`dev.sh`/`dev.ps1` hacen los pasos 3–5 en un solo comando (arrancan Supabase local si hace
+falta, levantan la API en Docker, y migran):
 
 ```bash
 # Mac / Linux / Git-Bash:
-./dev.sh                 # levanta db + api y aplica migraciones   ·   ./dev.sh down para apagar
+./dev.sh                 # levanta Supabase local + api y migra   ·   ./dev.sh down para apagar la api
 
 # Windows (PowerShell):
-.\dev.ps1                # idem   ·   .\dev.ps1 down para apagar
+.\dev.ps1                # idem   ·   .\dev.ps1 down para apagar la api
 ```
 
-Deja la API en `http://localhost:8000` (Swagger en `/docs`). El deploy a producción (EC2) usa
-`deploy.sh`, no estos.
+**La primera vez** que se corren (base recién creada, sin `schema_migrations` todavía), si
+existe un dump en `./backups/*.dump` **y** `.env.supabase` (credenciales de prod), restauran
+automáticamente esos datos **reales** antes de migrar — así todos los devs arrancan con el
+mismo espejo de producción, no una base vacía. En corridas siguientes **no vuelven a tocar
+los datos** (solo aplican migraciones nuevas si las hay).
 
-### Recargar / reiniciar la base local
+El deploy a producción (EC2) usa `deploy.sh`, no estos.
+
+### Datos reales de producción en local
+
+> **Por qué:** construir el schema solo desde `db/migrations/` puede quedar desalineado de
+> lo que hay *realmente* en prod (columnas agregadas a mano, migraciones que a prod nunca
+> llegaron...). Restaurar un dump de prod elimina esa duda: local queda con el schema y los
+> datos **exactos** de producción, y encima se aplican las migraciones que prod todavía no
+> tiene.
 
 ```bash
-# Recargar el backup más reciente en la base que ya corre:
-./scripts/load_local.sh
-
-# Empezar de cero (borra el volumen y vuelve a restaurar en el arranque):
-docker compose down -v && docker compose up -d
+./scripts/backup_supabase.sh   # (requiere .env.supabase) genera un dump FRESCO de PRODUCCIÓN
+./scripts/load_local.sh        # lo restaura en el Postgres de Supabase LOCAL (solo esquema public)
+                                # + aplica migraciones pendientes encima (rename, RBAC, etc.)
 ```
+
+`dev.sh`/`dev.ps1` llaman a `load_local.sh` solos en el primer arranque (ver arriba) si ya
+tenés un dump en `./backups/` — no hace falta correr esto a mano salvo que quieras **refrescar**
+los datos a lo último de prod.
+
+- **`.env.supabase`** (credenciales de prod, no se versiona) hay que **distribuirlo al equipo
+  por un canal seguro** (gestor de secretos, no git/Slack) — es lo mismo que ya requería
+  `backup_supabase.sh` antes de este cambio.
+- El dump (`backups/*.dump`) tiene **PII real** y tampoco se versiona; para que "todos los
+  devs empiecen mañana" con el mismo dump, alguien con acceso a prod lo genera una vez y lo
+  comparte por un canal seguro (o cada dev genera el suyo con sus propias credenciales).
+- Solo se restaura `--schema=public` (no toca `auth`/`storage`/`realtime` de Supabase local).
+  Las FKs de `public` hacia `auth.users` (p. ej. `profiles.id`) no se recrean en la restauración
+  (`auth.users` está vacía en local) — es esperado, no un error a corregir.
+
+### JWT: por qué hay dos esquemas (HS256 y JWKS)
+
+El CLI de Supabase local firma los JWT de Auth con **claves asimétricas (ES256, rotables,
+"JWT signing keys")**, expuestas en `/auth/v1/.well-known/jwks.json` — no con el secreto
+HS256 compartido clásico. La mayoría de proyectos de prod hoy siguen en HS256, así que el
+backend soporta **ambos**: mira el `alg` del JWT y valida por JWKS (`SUPABASE_JWKS_URL`) si
+es asimétrico, o por secreto compartido (`SUPABASE_JWT_SECRET`) si es HS256 — sin que el
+código de negocio note la diferencia. En prod normalmente `SUPABASE_JWKS_URL` queda vacío.
+
+### Docker: cómo encaja todo (local vs. producción)
+
+El mismo `Dockerfile` produce la **misma imagen** de la API en los dos entornos — lo único
+que cambia es a qué Postgres/Auth se conecta esa imagen y cómo llega ahí. No hay dos
+versiones del código, solo configuración distinta por entorno.
+
+**Local:** son **dos Docker Compose separados, sin relación entre sí**:
+
+1. `docker-compose.yml` (este repo) — hoy tiene **solo el servicio `api`**. Ya no levanta
+   Postgres propio (se sacó el viejo servicio `db`).
+2. El stack que arma `npx supabase start` — es *su propio* Compose interno (Postgres,
+   Auth/GoTrue, Realtime, Kong, Studio, Inbucket...), gestionado por el CLI, no por vos
+   directo.
+
+```
+docker-compose.yml (repo)                    npx supabase start (stack propio)
+┌──────────────────────────┐                 ┌──────────────────────────────────┐
+│ mpv-api (FastAPI)        │─ host.docker. ─►│ Auth · Kong · Realtime · Studio   │
+│ POSTGRES_HOST=           │   internal      │ Postgres :54322                  │
+│   host.docker.internal   │                 └──────────────────────────────────┘
+└──────────────────────────┘
+```
+
+- **`host.docker.internal`**: `mpv-api` y los contenedores de Supabase **no comparten red**
+  de Compose (son proyectos distintos). Supabase publica su Postgres en el puerto `54322`
+  **del host**; `host.docker.internal` es el nombre que Docker Desktop resuelve a "la
+  máquina host" para que el contenedor llegue ahí. Funciona out-of-the-box en Windows/Mac
+  (en Linux nativo sin Docker Desktop hace falta `--add-host=host.docker.internal:host-gateway`).
+- **Sin ese truco:** corriendo la API **nativa** (`uv run uvicorn src.main:app --reload`,
+  sin Docker) `localhost:54322` funciona directo — más simple para iterar/debuggear.
+- **Orden de arranque** (lo que hacen `dev.sh`/`dev.ps1`): primero Supabase local tiene que
+  estar arriba, después `docker compose up` para `api`.
+- **¿Dónde lo veo en Docker Desktop?** Docker Desktop agrupa contenedores por **proyecto de
+  Compose** (el nombre de la carpeta, si no se especifica uno). Vas a ver **dos grupos**: uno
+  con ~8 contenedores de Supabase, y otro aparte llamado `api-medicos-por-venezuela` con
+  **un solo contenedor**, `mpv-api`. Si no lo ves, buscá ese segundo grupo (no está mezclado
+  con el de Supabase) o filtrá por "mpv-api".
+
+**Producción (EC2):** `docker-compose.prod.yml` — también **solo `api`**, esto **nunca
+cambió** (prod jamás tuvo un servicio `db` propio). Se conecta al pooler de Supabase
+**por internet** (`DATABASE_URL`/`POSTGRES_*` en `.env.production`, `sslmode=require`). No
+hay "stack de Supabase" que levantar ahí: en prod, Supabase es un servicio en la nube al que
+te conectás, no algo que corras vos — por eso tampoco hace falta `host.docker.internal`.
+
+| | Local | Producción |
+| --- | --- | --- |
+| Qué corre en Docker | `api` (repo) + stack completo de Supabase (CLI) | Solo `api` |
+| Dónde vive Postgres | Contenedor de Supabase local (`:54322`, en el host) | Supabase Cloud (remoto) |
+| Cómo llega `api` a Postgres | `host.docker.internal:54322` (o nativo, sin Docker) | Pooler por internet (`DATABASE_URL`) |
+| JWT | ES256 vía JWKS (`SUPABASE_JWKS_URL` seteado) | HS256 con secreto compartido (`SUPABASE_JWKS_URL` vacío) |
+| Config | `docker-compose.yml` (valores fijos de dev) | `docker-compose.prod.yml` + `.env.production` (secretos reales) |
 
 ## Migraciones de esquema
 
