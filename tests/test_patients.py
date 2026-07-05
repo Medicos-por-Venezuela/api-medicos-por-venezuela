@@ -207,3 +207,49 @@ async def test_parent_id_inexistente_falla_400(client: AsyncClient) -> None:
         },
     )
     assert resp.status_code == 400
+
+
+async def test_registro_completo_adulto_y_menor_primera_vez(client: AsyncClient) -> None:
+    """Flujo real de alta familiar por primera vez: 3 registros en la misma sesión —
+    patient del adulto, patient del menor (parent_id -> adulto) y la consulta del menor."""
+    adulto = await client.post(
+        f"{PREFIX}/patients", json=_adult_payload(phone_whatsapp="+58412000020")
+    )
+    assert adulto.status_code == 201, adulto.text
+    adulto_id = adulto.json()["id"]
+
+    menor = await client.post(
+        f"{PREFIX}/patients",
+        json={
+            "full_name": "Menor Primera Vez",
+            "phone_whatsapp": "+58412000020",
+            "affected_zone": "Caracas",
+            "age_range": "7",
+            "allergies": "Ninguna conocida",
+            "parent_id": adulto_id,
+            "parentesco": "Madre",
+            "consent": True,
+        },
+    )
+    assert menor.status_code == 201, menor.text
+    menor_body = menor.json()
+    assert menor_body["parent_id"] == adulto_id
+    assert menor_body["parentesco"] == "Madre"
+    assert menor_body["cedula"] == "243192841"  # cédula del adulto (24319284) + 1er menor
+    menor_id = menor_body["id"]
+
+    consulta = await client.post(
+        f"{PREFIX}/consultations",
+        json={"patient_id": menor_id, "chief_complaint": "Fiebre"},
+    )
+    assert consulta.status_code == 201, consulta.text
+    assert consulta.json()["patient_id"] == menor_id
+
+    # La consulta queda asociada al MENOR, no al adulto.
+    listado_menor = await client.get(f"{PREFIX}/consultations", params={"patient_id": menor_id})
+    assert listado_menor.status_code == 200
+    assert any(c["id"] == consulta.json()["id"] for c in listado_menor.json())
+
+    listado_adulto = await client.get(f"{PREFIX}/consultations", params={"patient_id": adulto_id})
+    assert listado_adulto.status_code == 200
+    assert listado_adulto.json() == []
