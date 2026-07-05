@@ -57,13 +57,15 @@ class DoctorResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
+    user_id: uuid.UUID | None = None
     professional_type_id: uuid.UUID | None = None
     specialty_id: uuid.UUID | None = None
-    cedula: str
+    # nullable: los médicos backfilleados/creados desde users no traen estos campos.
+    cedula: str | None = None
     full_name: str
     license: str | None = None
-    phone: str
-    email: str
+    phone: str | None = None
+    email: str | None = None
     country_of_residence: str | None = None
     status: int
     verified: bool
