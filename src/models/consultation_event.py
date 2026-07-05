@@ -24,7 +24,7 @@ class ConsultationEvent(Base):
     )
     event_type: Mapped[str] = mapped_column(String, nullable=False)
     created_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("profiles.id"), nullable=True
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

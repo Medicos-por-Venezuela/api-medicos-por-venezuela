@@ -74,10 +74,16 @@ def _connect_kwargs() -> dict:
             "password": settings.POSTGRES_PASSWORD,
             "database": settings.POSTGRES_DB,
         }
-    if settings.ssl_required:
-        kwargs["ssl"] = True
+    # Reusa la lógica SSL de la app (única fuente de verdad): 'require' devuelve un
+    # SSLContext que cifra sin verificar la CA (el pooler de Supabase es self-signed);
+    # 'verify-ca'/'verify-full' devuelven ssl=True. Antes usaba ssl=True siempre y
+    # fallaba con "self-signed certificate in certificate chain".
+    ssl_arg = settings.connect_args.get("ssl")
+    if ssl_arg is not None:
+        kwargs["ssl"] = ssl_arg
     if settings.DB_DISABLE_PREPARED_STATEMENTS:
         # Necesario tras el pooler transaction de Supabase (PgBouncer, 6543).
+        # (asyncpg crudo NO acepta prepared_statement_cache_size; eso es de SQLAlchemy.)
         kwargs["statement_cache_size"] = 0
     return kwargs
 

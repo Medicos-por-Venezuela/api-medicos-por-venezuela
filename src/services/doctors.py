@@ -17,6 +17,7 @@ from sqlalchemy.sql import func
 from src.core.errors import BadRequestError, NotFoundError
 from src.models.doctor import Doctor
 from src.models.professional_type import ProfessionalType
+from src.models.profile import Profile
 from src.schemas.doctor import DoctorCreate, DoctorUpdate
 from src.services import psicologo as psicologo_service
 from src.services import sacs as sacs_service
@@ -92,7 +93,13 @@ async def create_doctor(session: AsyncSession, data: DoctorCreate) -> Doctor:
     if data.website:
         raise BadRequestError("Solicitud inválida.")
     verified = await _verify_credential(session, data.professional_type_id, data.cedula)
-    doctor = Doctor(**data.model_dump(exclude={"website"}), verified=verified)
+    # Liga el doctor a su cuenta (users) por email, si ya existe. El signup crea la cuenta
+    # justo antes de este POST, así que normalmente la resuelve. Server-side (no lo manda el
+    # cliente) para evitar IDOR.
+    user_id = (
+        await session.execute(select(Profile.id).where(Profile.email == data.email))
+    ).scalar_one_or_none()
+    doctor = Doctor(**data.model_dump(exclude={"website"}), verified=verified, user_id=user_id)
     session.add(doctor)
     await session.commit()
     await session.refresh(doctor)
