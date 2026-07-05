@@ -75,6 +75,22 @@ Luego:
 > Sin backup en `./backups`, la base se crea solo con los stubs (vacía); puedes cargar
 > datos después con `scripts/load_local.sh`.
 
+### Un comando (para el frontend / sin saber Python)
+
+Para levantar el backend en local y testear el frontend contra `http://localhost:8000`, **no hace
+falta Python**: las migraciones corren dentro del contenedor. Único requisito: **Docker Desktop**.
+
+```bash
+# Mac / Linux / Git-Bash:
+./dev.sh                 # levanta db + api y aplica migraciones   ·   ./dev.sh down para apagar
+
+# Windows (PowerShell):
+.\dev.ps1                # idem   ·   .\dev.ps1 down para apagar
+```
+
+Deja la API en `http://localhost:8000` (Swagger en `/docs`). El deploy a producción (EC2) usa
+`deploy.sh`, no estos.
+
 ### Recargar / reiniciar la base local
 
 ```bash

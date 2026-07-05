@@ -14,6 +14,7 @@ from src.models.professional_type import ProfessionalType
 from src.schemas.psicologo import PsicologoVerificationResponse
 from src.schemas.sacs import SacsVerificationResponse
 from src.services.doctors import _normalize
+from tests._helpers import make_profile
 
 PREFIX = "/api/v1"
 
@@ -169,3 +170,38 @@ async def test_doctor_not_found(client: AsyncClient) -> None:
         await client.patch(f"{PREFIX}/doctors/{missing}", json={"status": 1})
     ).status_code == 404
     assert (await client.delete(f"{PREFIX}/doctors/{missing}")).status_code == 404
+
+
+# --- Vínculo doctor <-> cuenta (users) por email ---
+
+
+async def test_doctor_se_liga_a_cuenta_por_email(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """POST /doctors resuelve user_id por email si ya existe la cuenta (users)."""
+    user = make_profile(role="doctor")
+    user.email = "linked.doc@test.com"
+    db_session.add(user)
+    await db_session.flush()
+
+    type_id = await _type_id(db_session, "medico")
+    with _mock_sacs():
+        resp = await client.post(
+            f"{PREFIX}/doctors",
+            json=_payload(type_id, email="linked.doc@test.com", cedula="V-90000003"),
+        )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["user_id"] == str(user.id)
+
+
+async def test_doctor_sin_cuenta_queda_sin_user_id(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    type_id = await _type_id(db_session, "medico")
+    with _mock_sacs():
+        resp = await client.post(
+            f"{PREFIX}/doctors",
+            json=_payload(type_id, email="sincuenta@test.com", cedula="V-90000004"),
+        )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["user_id"] is None
