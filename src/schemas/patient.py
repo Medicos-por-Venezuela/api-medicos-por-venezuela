@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 
 class PatientBase(BaseModel):
@@ -19,6 +19,11 @@ class PatientBase(BaseModel):
     )
     description: str | None = Field(default=None, max_length=2000)
     user_id: uuid.UUID | None = None
+    allergies: str | None = Field(default=None, max_length=500)
+    # Carga familiar: si parent_id viene, este registro es un menor a cargo de otro
+    # patient (el adulto responsable); parentesco describe esa relación.
+    parent_id: uuid.UUID | None = None
+    parentesco: str | None = Field(default=None, max_length=50)
 
 
 class PatientCreate(PatientBase):
@@ -26,6 +31,12 @@ class PatientCreate(PatientBase):
 
     # El insert exige consentimiento (ver política RLS patients_insert_public).
     consent: bool = True
+
+    @model_validator(mode="after")
+    def _parentesco_requiere_parent_id(self) -> "PatientCreate":
+        if (self.parent_id is None) != (self.parentesco is None):
+            raise ValueError("parent_id y parentesco deben venir juntos, o ninguno de los dos.")
+        return self
 
 
 class PatientUpdate(BaseModel):
@@ -39,6 +50,9 @@ class PatientUpdate(BaseModel):
     email: EmailStr | None = None
     needs_tags: list[str] | None = None
     description: str | None = None
+    allergies: str | None = None
+    parent_id: uuid.UUID | None = None
+    parentesco: str | None = None
 
 
 class PatientResponse(PatientBase):

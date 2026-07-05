@@ -3,6 +3,10 @@
 import uuid
 
 from httpx import AsyncClient
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.models.specialty import Specialty
 
 PREFIX = "/api/v1"
 
@@ -124,3 +128,38 @@ async def test_consultation_events(client: AsyncClient) -> None:
     listed = await client.get(f"{PREFIX}/consultations/{cid}/events")
     assert listed.status_code == 200
     assert len(listed.json()) == 1
+
+
+# --- specialty_id (reemplaza needs_tags para el matching del panel, aparte) ---
+
+
+async def test_create_consultation_con_specialty_id(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    patient_id = await _create_patient(client)
+    specialty = (await db_session.execute(select(Specialty).limit(1))).scalar_one()
+
+    resp = await client.post(
+        f"{PREFIX}/consultations",
+        json={
+            "patient_id": patient_id,
+            "chief_complaint": "Control de rutina",
+            "specialty_id": str(specialty.id),
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["specialty_id"] == str(specialty.id)
+
+
+async def test_create_consultation_specialty_id_inexistente_falla_400(
+    client: AsyncClient,
+) -> None:
+    patient_id = await _create_patient(client)
+    resp = await client.post(
+        f"{PREFIX}/consultations",
+        json={
+            "patient_id": patient_id,
+            "specialty_id": "00000000-0000-0000-0000-000000000000",
+        },
+    )
+    assert resp.status_code == 400

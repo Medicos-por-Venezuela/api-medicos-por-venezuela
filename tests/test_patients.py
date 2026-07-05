@@ -86,3 +86,124 @@ async def test_update_missing_patient_404(client: AsyncClient) -> None:
         json={"age_range": "40-49"},
     )
     assert resp.status_code == 404
+
+
+# --- Alergias, carga familiar (menor + adulto responsable) ---
+
+
+def _adult_payload(**over: object) -> dict:
+    base = {
+        "full_name": "Adulto Responsable",
+        "phone_whatsapp": "+58412000010",
+        "affected_zone": "Caracas",
+        "cedula": "24319284",
+        "consent": True,
+    }
+    base.update(over)
+    return base
+
+
+async def test_create_patient_con_alergias(client: AsyncClient) -> None:
+    resp = await client.post(
+        f"{PREFIX}/patients",
+        json=_adult_payload(allergies="Penicilina", phone_whatsapp="+58412000011"),
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["allergies"] == "Penicilina"
+
+
+async def test_menor_sin_cedula_hereda_cedula_del_adulto_mas_correlativo(
+    client: AsyncClient,
+) -> None:
+    adulto = await client.post(f"{PREFIX}/patients", json=_adult_payload())
+    adulto_id = adulto.json()["id"]
+
+    primero = await client.post(
+        f"{PREFIX}/patients",
+        json={
+            "full_name": "Primer Menor",
+            "phone_whatsapp": "+58412000010",
+            "affected_zone": "Caracas",
+            "parent_id": adulto_id,
+            "parentesco": "Madre",
+            "consent": True,
+        },
+    )
+    assert primero.status_code == 201, primero.text
+    assert primero.json()["cedula"] == "243192841"
+
+    segundo = await client.post(
+        f"{PREFIX}/patients",
+        json={
+            "full_name": "Segundo Menor",
+            "phone_whatsapp": "+58412000010",
+            "affected_zone": "Caracas",
+            "parent_id": adulto_id,
+            "parentesco": "Madre",
+            "consent": True,
+        },
+    )
+    assert segundo.status_code == 201, segundo.text
+    assert segundo.json()["cedula"] == "243192842"
+
+
+async def test_menor_con_cedula_propia_no_se_sobreescribe(client: AsyncClient) -> None:
+    adulto = await client.post(
+        f"{PREFIX}/patients", json=_adult_payload(phone_whatsapp="+58412000012")
+    )
+    adulto_id = adulto.json()["id"]
+
+    menor = await client.post(
+        f"{PREFIX}/patients",
+        json={
+            "full_name": "Menor Con Cedula",
+            "phone_whatsapp": "+58412000012",
+            "affected_zone": "Caracas",
+            "cedula": "V-30000000",
+            "parent_id": adulto_id,
+            "parentesco": "Padre",
+            "consent": True,
+        },
+    )
+    assert menor.status_code == 201, menor.text
+    assert menor.json()["cedula"] == "V-30000000"
+
+
+async def test_parentesco_sin_parent_id_falla_422(client: AsyncClient) -> None:
+    resp = await client.post(
+        f"{PREFIX}/patients",
+        json=_adult_payload(parentesco="Madre", phone_whatsapp="+58412000013"),
+    )
+    assert resp.status_code == 422
+
+
+async def test_parent_id_sin_parentesco_falla_422(client: AsyncClient) -> None:
+    adulto = await client.post(
+        f"{PREFIX}/patients", json=_adult_payload(phone_whatsapp="+58412000014")
+    )
+    resp = await client.post(
+        f"{PREFIX}/patients",
+        json={
+            "full_name": "Menor Sin Parentesco",
+            "phone_whatsapp": "+58412000014",
+            "affected_zone": "Caracas",
+            "parent_id": adulto.json()["id"],
+            "consent": True,
+        },
+    )
+    assert resp.status_code == 422
+
+
+async def test_parent_id_inexistente_falla_400(client: AsyncClient) -> None:
+    resp = await client.post(
+        f"{PREFIX}/patients",
+        json={
+            "full_name": "Menor Huerfano",
+            "phone_whatsapp": "+58412000015",
+            "affected_zone": "Caracas",
+            "parent_id": "00000000-0000-0000-0000-000000000000",
+            "parentesco": "Madre",
+            "consent": True,
+        },
+    )
+    assert resp.status_code == 400

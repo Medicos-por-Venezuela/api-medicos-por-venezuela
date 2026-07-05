@@ -42,6 +42,11 @@ class Consultation(Base):
     status: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'waiting'"))
     priority: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'normal'"))
     category: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Especialidad solicitada por el paciente (catálogo specialties); reemplaza a
+    # needs_tags para el matching en el panel (el filtro del panel se actualiza aparte).
+    specialty_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("specialties.id"), nullable=True
+    )
     chief_complaint: Mapped[str | None] = mapped_column(Text, nullable=True)
     clinical_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     internal_note: Mapped[str | None] = mapped_column(Text, nullable=True)
