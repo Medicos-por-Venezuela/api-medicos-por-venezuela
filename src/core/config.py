@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     SUPABASE_JWT_SECRET: str = "dev-insecure-jwt-secret-change-me"
     SUPABASE_JWT_ALGORITHM: str = "HS256"
     SUPABASE_JWT_AUDIENCE: str = "authenticated"
+    # Opcional: URL de JWKS (claves asimétricas ES256/RS256 "JWT signing keys" de Supabase;
+    # el CLI de Supabase local las usa por defecto: {API_URL}/auth/v1/.well-known/jwks.json).
+    # Si no se define, solo se valida HS256 con SUPABASE_JWT_SECRET (comportamiento de siempre).
+    SUPABASE_JWKS_URL: str | None = None
 
     # --- Resiliencia de la cola ---
     # Minutos tras los cuales una consulta 'in_progress' sin cerrar se considera

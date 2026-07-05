@@ -18,6 +18,7 @@ from src.core.errors import BadRequestError, NotFoundError
 from src.models.doctor import Doctor
 from src.models.professional_type import ProfessionalType
 from src.models.profile import Profile
+from src.models.specialty import Specialty
 from src.schemas.doctor import DoctorCreate, DoctorUpdate
 from src.services import psicologo as psicologo_service
 from src.services import sacs as sacs_service
@@ -66,6 +67,33 @@ async def _verify_credential(
     return await verify(cedula) if verify else False
 
 
+async def _sync_user_from_doctor(session: AsyncSession, doctor: Doctor) -> None:
+    """Propaga specialty/country/medical_license/whatsapp_number de doctors a la
+    cuenta (users/profiles) ligada, si existe.
+
+    Decisión de producto: estos 4 campos siguen viviendo también en `users` (los
+    completa `set_my_role` para médicos que entran por Google/`/elegir-rol`, un
+    camino de registro distinto que no pasa por esta tabla). Para los médicos que
+    SÍ pasan por acá (registro con verificación SACS/FPV), `doctors` es la fuente
+    de verdad; sin este sync quedaban NULL en `users` y todo lo que lee
+    `profiles.specialty` (panel médico, matching de la cola, admin) no los veía.
+    """
+    if doctor.user_id is None:
+        return
+    user = await session.get(Profile, doctor.user_id)
+    if user is None:
+        return
+    specialty_name = None
+    if doctor.specialty_id:
+        specialty_name = await session.scalar(
+            select(Specialty.name).where(Specialty.id == doctor.specialty_id)
+        )
+    user.specialty = specialty_name
+    user.country = doctor.country_of_residence
+    user.medical_license = doctor.license
+    user.whatsapp_number = doctor.phone
+
+
 async def list_doctors(
     session: AsyncSession,
     skip: int = 0,
@@ -101,6 +129,8 @@ async def create_doctor(session: AsyncSession, data: DoctorCreate) -> Doctor:
     ).scalar_one_or_none()
     doctor = Doctor(**data.model_dump(exclude={"website"}), verified=verified, user_id=user_id)
     session.add(doctor)
+    await session.flush()
+    await _sync_user_from_doctor(session, doctor)
     await session.commit()
     await session.refresh(doctor)
     return doctor
@@ -110,6 +140,7 @@ async def update_doctor(session: AsyncSession, doctor_id: uuid.UUID, data: Docto
     doctor = await get_doctor(session, doctor_id)
     for field, value in data.model_dump(exclude_unset=True).items():
         setattr(doctor, field, value)
+    await _sync_user_from_doctor(session, doctor)
     await session.commit()
     await session.refresh(doctor)
     return doctor
