@@ -1,8 +1,14 @@
 # Reglas de Base de Datos y Concurrencia Avanzada
 
 ## 🌐 Gestión de Entornos
-- **Local:** PostgreSQL con extensión de replicación lógica habilitada para simular el comportamiento de Supabase Realtime localmente. Las credenciales se leen desde `.env` mediante `DATABASE_URL`.
+- **Local:** **Supabase local real** (CLI: `npx supabase start`), NO un Postgres propio —
+  mismo Postgres/Auth/Realtime que usa el frontend (puerto `54322`; API/Auth/REST en
+  `54321`). Ver README -> "Supabase local (desarrollo)" para el setup completo. Las
+  credenciales se leen desde `.env` mediante `POSTGRES_*`.
 - **Producción:** Supabase (Connection Pooler en puerto 5432/6543 según tipo de sesión). Las mutaciones en tablas críticas disparan eventos nativos por CDC (Change Data Capture) hacia el Board.
+- **JWT:** local firma con claves asimétricas (ES256 vía JWKS); prod hoy usa HS256 con
+  secreto compartido. `src/core/security.py::decode_token` soporta ambos (mira el `alg`
+  del token) — ver `SUPABASE_JWKS_URL`/`SUPABASE_JWT_SECRET` en `.env.example`.
 
 ## 🔒 Control de Concurrencia Crítica (Fallo Rápido / Nowait)
 - **Bloqueo Pesimista Obligatorio:** Para evitar condiciones de carrera cuando dos médicos hacen clic en el mismo paciente en el mismo milisegundo, **NUNCA** realices un `select` común seguido de un `update`.
@@ -75,12 +81,12 @@ lo pendiente**, en orden alfabético por nombre, cada migración en una transacc
   sobre una base restaurada de backup que ya la contenga sea un no-op seguro.
 - **Nombres:** prefijo ordenable (`NNN_` o fecha `AAAAMMDD_`); el orden de aplicación es el
   del nombre. Coordinar la numeración entre ramas para no colisionar.
-- **Modos de `migrate.sh`:** `docker` (por defecto, `docker exec` a `mpv-db`, para devs) ·
-  `--local` (`psql` directo, lo usa `db/init/01-restore-from-backup.sh` dentro del contenedor) ·
-  `--remote` (`psql "$DATABASE_URL"`, para Supabase/producción).
-- **Nunca** apliques migraciones a mano con `psql -f` suelto: rompe el tracking. Usa el runner.
-- `scripts/load_local.sh` y `db/init/01-restore-from-backup.sh` ya delegan en el runner; no
-  reintroduzcas loops ad-hoc sobre `db/migrations/` o `db/init/`.
+- **Nunca** apliques migraciones a mano con `psql -f` suelto: rompe el tracking. Usa el runner
+  (`python artisan migrate`), sea contra Supabase local (dev) o Supabase (prod).
+- `scripts/load_local.sh` (restaura un backup de prod en el Postgres de Supabase LOCAL) ya
+  delega en el runner para aplicar el delta pendiente después de restaurar; no reintroduzcas
+  loops ad-hoc sobre `db/migrations/`. `db/init/` (stubs del viejo Postgres propio) ya no existe:
+  Supabase local trae su propio esquema `auth` real.
 
 ## 🔌 Driver async y pooler de Supabase
 
