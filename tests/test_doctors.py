@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.professional_type import ProfessionalType
+from src.models.specialty import Specialty
 from src.schemas.psicologo import PsicologoVerificationResponse
 from src.schemas.sacs import SacsVerificationResponse
 from src.services.doctors import _normalize
@@ -202,6 +203,93 @@ async def test_doctor_sin_cuenta_queda_sin_user_id(
         resp = await client.post(
             f"{PREFIX}/doctors",
             json=_payload(type_id, email="sincuenta@test.com", cedula="V-90000004"),
+        )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["user_id"] is None
+
+
+# --- Propagación doctors -> users (specialty/country/license/whatsapp) ---
+
+
+async def test_create_doctor_propaga_datos_a_la_cuenta(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """POST /doctors, ligado a una cuenta, propaga specialty/country/license/phone
+    a users (fuente de verdad para médicos del flujo nuevo; ver _sync_user_from_doctor).
+    """
+    user = make_profile(role="doctor")
+    user.email = "sync.doc@test.com"
+    db_session.add(user)
+    await db_session.flush()
+
+    type_id = await _type_id(db_session, "medico")
+    specialty = (await db_session.execute(select(Specialty).limit(1))).scalar_one()
+
+    with _mock_sacs():
+        resp = await client.post(
+            f"{PREFIX}/doctors",
+            json=_payload(
+                type_id,
+                email="sync.doc@test.com",
+                cedula="V-90000005",
+                specialty_id=str(specialty.id),
+                license="MPPS-12345",
+                phone="+584140009999",
+                country_of_residence="Venezuela",
+            ),
+        )
+    assert resp.status_code == 201, resp.text
+
+    await db_session.refresh(user)
+    assert user.specialty == specialty.name
+    assert user.medical_license == "MPPS-12345"
+    assert user.whatsapp_number == "+584140009999"
+    assert user.country == "Venezuela"
+
+
+async def test_update_doctor_repropaga_datos_a_la_cuenta(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """PATCH /doctors/{id} también re-sincroniza users si cambia specialty/etc."""
+    user = make_profile(role="doctor")
+    user.email = "resync.doc@test.com"
+    db_session.add(user)
+    await db_session.flush()
+
+    type_id = await _type_id(db_session, "medico")
+    specialties = (await db_session.execute(select(Specialty).limit(2))).scalars().all()
+    assert len(specialties) == 2, "el catálogo necesita al menos 2 specialties para este test"
+
+    with _mock_sacs():
+        created = await client.post(
+            f"{PREFIX}/doctors",
+            json=_payload(
+                type_id,
+                email="resync.doc@test.com",
+                cedula="V-90000006",
+                specialty_id=str(specialties[0].id),
+            ),
+        )
+    doctor_id = created.json()["id"]
+
+    patched = await client.patch(
+        f"{PREFIX}/doctors/{doctor_id}", json={"specialty_id": str(specialties[1].id)}
+    )
+    assert patched.status_code == 200, patched.text
+
+    await db_session.refresh(user)
+    assert user.specialty == specialties[1].name
+
+
+async def test_doctor_sin_cuenta_no_falla_al_sincronizar(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Sin user_id (nadie con ese email), _sync_user_from_doctor no debe romper el alta."""
+    type_id = await _type_id(db_session, "medico")
+    with _mock_sacs():
+        resp = await client.post(
+            f"{PREFIX}/doctors",
+            json=_payload(type_id, email="huerfano.doc@test.com", cedula="V-90000007"),
         )
     assert resp.status_code == 201, resp.text
     assert resp.json()["user_id"] is None
