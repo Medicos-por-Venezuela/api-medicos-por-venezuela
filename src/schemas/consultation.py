@@ -24,6 +24,9 @@ class ConsultationBase(BaseModel):
     patient_id: uuid.UUID
     priority: str = Field("normal", max_length=20)
     category: str | None = Field(default=None, max_length=100)
+    # Especialidad solicitada por el paciente (catálogo specialties). Reemplaza a
+    # needs_tags para el registro nuevo; el filtro del panel se actualiza aparte.
+    specialty_id: uuid.UUID | None = None
     chief_complaint: str | None = Field(default=None, max_length=500)
     referred_specialty: str | None = Field(default=None, max_length=100)
     doctor_id: uuid.UUID | None = None
@@ -46,6 +49,7 @@ class ConsultationCreate(BaseModel):
     patient_id: uuid.UUID
     priority: str = Field("normal", max_length=20)
     category: str | None = Field(default=None, max_length=100)
+    specialty_id: uuid.UUID | None = None
     chief_complaint: str | None = Field(default=None, max_length=500)
     referred_specialty: str | None = Field(default=None, max_length=100)
     platform_used: str | None = Field(default=None, max_length=50)
@@ -59,6 +63,7 @@ class ConsultationUpdate(BaseModel):
     status: str | None = Field(default=None, max_length=30)
     priority: str | None = Field(default=None, max_length=20)
     category: str | None = Field(default=None, max_length=100)
+    specialty_id: uuid.UUID | None = None
     chief_complaint: str | None = Field(default=None, max_length=500)
     clinical_notes: str | None = Field(default=None, max_length=5000)
     internal_note: str | None = Field(default=None, max_length=2000)
@@ -135,6 +140,7 @@ class ConsultationPatientResponse(BaseModel):
     status: str
     priority: str
     category: str | None = None
+    specialty_id: uuid.UUID | None = None
     chief_complaint: str | None = None
     referred_specialty: str | None = None
     platform_used: str | None = None
