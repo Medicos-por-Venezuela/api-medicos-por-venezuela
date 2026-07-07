@@ -28,7 +28,7 @@ if (-not (Get-Command npx -ErrorAction SilentlyContinue)) {
 
 Write-Host "==> Verificando Supabase local..."
 npx supabase status *> $null
-if (-not $?) { npx supabase start }
+if ($LASTEXITCODE -ne 0) { npx supabase start }
 
 # Primera vez (BD recien creada, sin schema_migrations todavia): si hay un dump de prod
 # en .\backups y credenciales en .env.supabase, restaura datos REALES antes de migrar.
