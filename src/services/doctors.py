@@ -20,6 +20,7 @@ from src.models.professional_type import ProfessionalType
 from src.models.profile import Profile
 from src.models.specialty import Specialty
 from src.schemas.doctor import DoctorCreate, DoctorUpdate
+from src.services import audit
 from src.services import psicologo as psicologo_service
 from src.services import sacs as sacs_service
 
@@ -136,18 +137,41 @@ async def create_doctor(session: AsyncSession, data: DoctorCreate) -> Doctor:
     return doctor
 
 
-async def update_doctor(session: AsyncSession, doctor_id: uuid.UUID, data: DoctorUpdate) -> Doctor:
+async def update_doctor(
+    session: AsyncSession,
+    doctor_id: uuid.UUID,
+    data: DoctorUpdate,
+    actor_user_id: uuid.UUID | None = None,
+) -> Doctor:
     doctor = await get_doctor(session, doctor_id)
-    for field, value in data.model_dump(exclude_unset=True).items():
+    changes = data.model_dump(exclude_unset=True)
+    for field, value in changes.items():
         setattr(doctor, field, value)
     await _sync_user_from_doctor(session, doctor)
+    await audit.log_action(
+        session,
+        action="doctor.updated",
+        actor_user_id=actor_user_id,
+        resource="doctors",
+        resource_id=doctor.id,
+        metadata={"fields": sorted(changes)},
+    )
     await session.commit()
     await session.refresh(doctor)
     return doctor
 
 
-async def delete_doctor(session: AsyncSession, doctor_id: uuid.UUID) -> None:
+async def delete_doctor(
+    session: AsyncSession, doctor_id: uuid.UUID, actor_user_id: uuid.UUID | None = None
+) -> None:
     """Baja lógica (soft delete): marca deleted_at, no borra la fila."""
     doctor = await get_doctor(session, doctor_id)
     doctor.deleted_at = func.now()
+    await audit.log_action(
+        session,
+        action="doctor.deleted",
+        actor_user_id=actor_user_id,
+        resource="doctors",
+        resource_id=doctor.id,
+    )
     await session.commit()

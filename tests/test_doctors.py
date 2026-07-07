@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.professional_type import ProfessionalType
+from src.models.profile import Profile
 from src.models.specialty import Specialty
 from src.schemas.psicologo import PsicologoVerificationResponse
 from src.schemas.sacs import SacsVerificationResponse
@@ -142,7 +143,9 @@ async def test_telefono_formato_invalido_422(
 # --- CRUD (staff/admin) ---
 
 
-async def test_list_get_update_delete(client: AsyncClient, db_session: AsyncSession) -> None:
+async def test_list_get_update_delete(
+    client: AsyncClient, db_session: AsyncSession, admin_identity: Profile
+) -> None:
     type_id = await _type_id(db_session, "medico")
     with _mock_sacs():
         created = await client.post(f"{PREFIX}/doctors", json=_payload(type_id))
@@ -162,6 +165,11 @@ async def test_list_get_update_delete(client: AsyncClient, db_session: AsyncSess
     # baja lógica -> luego 404
     assert (await client.delete(f"{PREFIX}/doctors/{doctor_id}")).status_code == 204
     assert (await client.get(f"{PREFIX}/doctors/{doctor_id}")).status_code == 404
+
+    audit_resp = await client.get(f"{PREFIX}/audit-log", params={"resource": "doctors"})
+    entries = [e for e in audit_resp.json() if e["resource_id"] == doctor_id]
+    assert sorted(e["action"] for e in entries) == sorted(["doctor.updated", "doctor.deleted"])
+    assert all(e["actor_user_id"] == str(admin_identity.id) for e in entries)
 
 
 async def test_doctor_not_found(client: AsyncClient) -> None:

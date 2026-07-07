@@ -106,7 +106,9 @@ async def set_active(
     profile_id: uuid.UUID,
     payload: ProfileActiveRequest,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("profiles.manage")),
+    principal: Principal = Depends(require_permission("profiles.manage")),
 ) -> ProfileResponse:
     """Revoca (`active=false`) o reactiva (`active=true`) el acceso de un médico."""
-    return await profiles_service.set_active(db, profile_id, payload.active)
+    return await profiles_service.set_active(
+        db, profile_id, payload.active, actor_user_id=principal.id
+    )

@@ -9,6 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.errors import ConflictError, NotFoundError
 from src.models.affected_zone import AffectedZone
 from src.schemas.affected_zone import AffectedZoneCreate, AffectedZoneUpdate
+from src.services import audit
+
+_RESOURCE = "affected_zones"
 
 
 async def _ensure_unique_name_state(
@@ -61,17 +64,30 @@ async def get_active_affected_zone(session: AsyncSession, zone_id: uuid.UUID) ->
     return zone
 
 
-async def create_affected_zone(session: AsyncSession, data: AffectedZoneCreate) -> AffectedZone:
+async def create_affected_zone(
+    session: AsyncSession, data: AffectedZoneCreate, actor_user_id: uuid.UUID | None = None
+) -> AffectedZone:
     await _ensure_unique_name_state(session, data.name, data.state)
     zone = AffectedZone(**data.model_dump())
     session.add(zone)
+    await session.flush()
+    await audit.log_action(
+        session,
+        action="catalog.created",
+        actor_user_id=actor_user_id,
+        resource=_RESOURCE,
+        resource_id=zone.id,
+    )
     await session.commit()
     await session.refresh(zone)
     return zone
 
 
 async def update_affected_zone(
-    session: AsyncSession, zone_id: uuid.UUID, data: AffectedZoneUpdate
+    session: AsyncSession,
+    zone_id: uuid.UUID,
+    data: AffectedZoneUpdate,
+    actor_user_id: uuid.UUID | None = None,
 ) -> AffectedZone:
     zone = await get_affected_zone(session, zone_id)
     changes = data.model_dump(exclude_unset=True)
@@ -81,13 +97,30 @@ async def update_affected_zone(
         await _ensure_unique_name_state(session, new_name, new_state, zone_id)
     for field, value in changes.items():
         setattr(zone, field, value)
+    await audit.log_action(
+        session,
+        action="catalog.updated",
+        actor_user_id=actor_user_id,
+        resource=_RESOURCE,
+        resource_id=zone.id,
+        metadata={"fields": sorted(changes)},
+    )
     await session.commit()
     await session.refresh(zone)
     return zone
 
 
-async def delete_affected_zone(session: AsyncSession, zone_id: uuid.UUID) -> None:
+async def delete_affected_zone(
+    session: AsyncSession, zone_id: uuid.UUID, actor_user_id: uuid.UUID | None = None
+) -> None:
     zone = await get_affected_zone(session, zone_id)
     zone.status = "deleted"
     zone.deleted_at = datetime.now(UTC)
+    await audit.log_action(
+        session,
+        action="catalog.deleted",
+        actor_user_id=actor_user_id,
+        resource=_RESOURCE,
+        resource_id=zone.id,
+    )
     await session.commit()

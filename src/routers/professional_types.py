@@ -49,10 +49,12 @@ async def list_professional_types(
 async def create_professional_type(
     payload: ProfessionalTypeCreate,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("catalogs.manage")),
+    principal: Principal = Depends(require_permission("catalogs.manage")),
 ) -> ProfessionalTypeResponse:
     """Create a professional type with `status=active` by default."""
-    return await professional_types_service.create_professional_type(db, payload)
+    return await professional_types_service.create_professional_type(
+        db, payload, actor_user_id=principal.id
+    )
 
 
 @router.get(
@@ -80,11 +82,11 @@ async def update_professional_type(
     professional_type_id: uuid.UUID,
     payload: ProfessionalTypeUpdate,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("catalogs.manage")),
+    principal: Principal = Depends(require_permission("catalogs.manage")),
 ) -> ProfessionalTypeResponse:
     """Update name/status for a non-deleted professional type."""
     return await professional_types_service.update_professional_type(
-        db, professional_type_id, payload
+        db, professional_type_id, payload, actor_user_id=principal.id
     )
 
 
@@ -97,7 +99,9 @@ async def update_professional_type(
 async def delete_professional_type(
     professional_type_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("catalogs.manage")),
+    principal: Principal = Depends(require_permission("catalogs.manage")),
 ) -> None:
     """Mark the professional type as `deleted`; the row remains in the table."""
-    await professional_types_service.delete_professional_type(db, professional_type_id)
+    await professional_types_service.delete_professional_type(
+        db, professional_type_id, actor_user_id=principal.id
+    )
