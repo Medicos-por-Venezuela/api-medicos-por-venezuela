@@ -127,6 +127,11 @@ async def test_specialty_crud_flow(client: AsyncClient) -> None:
     listed_after_inactive = await client.get(f"{PREFIX}/specialties")
     assert all(item["id"] != inactive.json()["id"] for item in listed_after_inactive.json())
 
+    # /specialties/admin (catalogs.manage) SÍ ve las inactivas -- la pública nunca las muestra.
+    admin_listed = await client.get(f"{PREFIX}/specialties/admin")
+    assert admin_listed.status_code == 200
+    assert any(item["id"] == inactive.json()["id"] for item in admin_listed.json())
+
     duplicate = await client.post(f"{PREFIX}/specialties", json=payload)
     assert duplicate.status_code == 409
 
@@ -199,6 +204,7 @@ async def test_specialty_management_requires_admin(
             headers=headers,
         )
     ).status_code == 403
+    assert (await client.get(f"{PREFIX}/specialties/admin", headers=headers)).status_code == 403
     assert (
         await client.delete(
             f"{PREFIX}/specialties/00000000-0000-0000-0000-000000000000", headers=headers
