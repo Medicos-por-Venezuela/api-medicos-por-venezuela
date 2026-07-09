@@ -61,6 +61,7 @@ async def get_catalog() -> SpecialtyCatalogResponse:
     "/admin",
     response_model=list[SpecialtyResponse],
     summary="Listar especialidades, incluidas inactivas (admin)",
+    responses={403: {"description": "Requiere el permiso catalogs.manage."}},
 )
 async def list_specialties_admin(
     skip: int = Query(0, ge=0),

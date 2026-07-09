@@ -274,3 +274,95 @@ async def test_panel_requiere_permiso_queue_read(
 
     resp = await client.get(f"{PREFIX}/consultations/panel", headers=auth_headers(patient.id))
     assert resp.status_code == 403, resp.text
+
+
+# --- Anti-IDOR: pertenencia en update/close (security.md) ---
+
+
+async def _consultation_assigned_to(
+    client: AsyncClient, db_session: AsyncSession, doctor_id: str
+) -> str:
+    """Consulta asignada a `doctor_id` (asignada por el client admin del fixture)."""
+    patient_id = await _create_patient(client)
+    cid = (await client.post(f"{PREFIX}/consultations", json={"patient_id": patient_id})).json()[
+        "id"
+    ]
+    assigned = await client.patch(
+        f"{PREFIX}/consultations/{cid}",
+        json={"status": "in_progress", "assigned_doctor_id": doctor_id},
+    )
+    assert assigned.status_code == 200, assigned.text
+    return cid
+
+
+async def test_doctor_no_puede_editar_ni_cerrar_consulta_ajena(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    dr_a = make_profile(role="doctor")
+    dr_b = make_profile(role="doctor")
+    db_session.add_all([dr_a, dr_b])
+    await db_session.flush()
+    cid = await _consultation_assigned_to(client, db_session, str(dr_b.id))
+
+    headers_a = auth_headers(dr_a.id)
+    patched = await client.patch(
+        f"{PREFIX}/consultations/{cid}", json={"internal_note": "intruso"}, headers=headers_a
+    )
+    assert patched.status_code == 409
+
+    closed = await client.post(
+        f"{PREFIX}/consultations/{cid}/close", json={"outcome": "closed"}, headers=headers_a
+    )
+    assert closed.status_code == 409
+
+
+async def test_doctor_no_puede_reasignar_a_terceros(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    dr_a = make_profile(role="doctor")
+    dr_c = make_profile(role="doctor")
+    db_session.add_all([dr_a, dr_c])
+    await db_session.flush()
+    patient_id = await _create_patient(client)
+    cid = (await client.post(f"{PREFIX}/consultations", json={"patient_id": patient_id})).json()[
+        "id"
+    ]
+
+    # Sin asignar: A no puede asignársela a C...
+    resp = await client.patch(
+        f"{PREFIX}/consultations/{cid}",
+        json={"assigned_doctor_id": str(dr_c.id)},
+        headers=auth_headers(dr_a.id),
+    )
+    assert resp.status_code == 409
+
+    # ...pero sí tomarla para sí mismo y editarla.
+    mine = await client.patch(
+        f"{PREFIX}/consultations/{cid}",
+        json={"assigned_doctor_id": str(dr_a.id), "internal_note": "mía"},
+        headers=auth_headers(dr_a.id),
+    )
+    assert mine.status_code == 200, mine.text
+
+    # Y cerrarla como propia.
+    closed = await client.post(
+        f"{PREFIX}/consultations/{cid}/close",
+        json={"outcome": "closed"},
+        headers=auth_headers(dr_a.id),
+    )
+    assert closed.status_code == 200, closed.text
+
+
+async def test_admin_puede_gestionar_consulta_ajena(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    dr_b = make_profile(role="doctor")
+    db_session.add(dr_b)
+    await db_session.flush()
+    cid = await _consultation_assigned_to(client, db_session, str(dr_b.id))
+
+    # El client del fixture es admin: puede editar y cerrar consultas de otros.
+    patched = await client.patch(f"{PREFIX}/consultations/{cid}", json={"internal_note": "admin"})
+    assert patched.status_code == 200
+    closed = await client.post(f"{PREFIX}/consultations/{cid}/close", json={"outcome": "closed"})
+    assert closed.status_code == 200

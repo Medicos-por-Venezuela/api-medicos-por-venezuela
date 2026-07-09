@@ -1,7 +1,10 @@
 """Pruebas del endpoint de lectura del audit_log."""
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
+from sqlalchemy import update as sa_update
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.session import AsyncSessionLocal
@@ -105,3 +108,29 @@ async def test_audit_log_actor_se_pone_null_al_borrar_el_perfil() -> None:
     async with AsyncSessionLocal() as s:
         row = (await s.execute(select(AuditLog).where(AuditLog.id == entry_id))).scalar_one()
         assert row.actor_user_id is None
+
+
+async def test_audit_log_update_manual_de_actor_rechazado() -> None:
+    """Endurecimiento del trigger: un UPDATE manual que anonimice actor_user_id
+    (sin pasar por el ON DELETE SET NULL del FK) debe rechazarse — solo el trigger
+    RI interno (pg_trigger_depth > 1) puede ponerlo en NULL."""
+    async with AsyncSessionLocal() as s:
+        actor = make_profile(role="doctor")
+        s.add(actor)
+        await s.flush()
+        entry = await audit.log_action(
+            s, action="doctor.updated", actor_user_id=actor.id, resource="doctors"
+        )
+        await s.commit()
+        entry_id = entry.id
+
+    with pytest.raises(DBAPIError, match="inmutable"):
+        async with AsyncSessionLocal() as s:
+            await s.execute(
+                sa_update(AuditLog).where(AuditLog.id == entry_id).values(actor_user_id=None)
+            )
+            await s.commit()
+
+    async with AsyncSessionLocal() as s:
+        row = (await s.execute(select(AuditLog).where(AuditLog.id == entry_id))).scalar_one()
+        assert row.actor_user_id is not None  # sigue intacto

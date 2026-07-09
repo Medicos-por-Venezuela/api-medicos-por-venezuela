@@ -639,6 +639,9 @@ async def _pool_doctor(
 
 
 async def _pool(client: AsyncClient, **params: object) -> dict:
+    # limit=100 por defecto: blinda las aserciones de pertenencia contra el crecimiento
+    # de datos reales (con el limit=20 del endpoint, la fila sembrada podría caer fuera).
+    params.setdefault("limit", 100)
     resp = await client.get(f"{PREFIX}/doctors/pool", params=params)
     assert resp.status_code == 200, resp.text
     return resp.json()
@@ -772,3 +775,41 @@ async def test_reveal_contact_requires_doctors_read(
         f"{PREFIX}/doctors/{doc.id}/contact", headers=auth_headers(patient.id)
     )
     assert resp.status_code == 403
+
+
+async def test_reveal_contact_fallback_a_whatsapp_de_la_cuenta(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Si doctors.phone es NULL, el contacto revelado cae al whatsapp_number de la cuenta."""
+    nutri = await _type_id(db_session, "nutricionista")
+    prof = make_profile(role="doctor")
+    prof.whatsapp_number = "+584240001122"
+    db_session.add(prof)
+    await db_session.flush()
+    doc = await _pool_doctor(db_session, online=True, type_id=nutri, user_id=prof.id, phone=None)
+
+    resp = await client.post(f"{PREFIX}/doctors/{doc.id}/contact")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["phone"] == "+584240001122"
+
+
+async def test_pool_paginacion_disjunta_y_total(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Recorrer el pool con limit=2 no repite ni omite filas y la unión de páginas coincide
+    con `total`. Los 5 sembrados comparten nombre: ejercita el tiebreaker Doctor.id."""
+    nutri = await _type_id(db_session, "nutricionista")
+    seeded = {
+        str((await _pool_doctor(db_session, type_id=nutri, name="Dr Pag")).id) for _ in range(5)
+    }
+
+    total = (await _pool(client, professional_type_id=nutri, limit=1))["total"]
+    seen: list[str] = []
+    skip = 0
+    while skip < total:
+        page = await _pool(client, professional_type_id=nutri, skip=skip, limit=2)
+        seen.extend(i["id"] for i in page["items"])
+        skip += 2
+
+    assert len(seen) == len(set(seen)) == total  # sin duplicados ni omisiones
+    assert seeded <= set(seen)  # todos los sembrados aparecen

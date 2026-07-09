@@ -33,8 +33,13 @@ if ($LASTEXITCODE -ne 0) { npx supabase start }
 # Primera vez (BD recien creada, sin schema_migrations todavia): si hay un dump de prod
 # en .\backups y credenciales en .env.supabase, restaura datos REALES antes de migrar.
 # En corridas siguientes no toca nada (nunca pisa datos ya cargados).
-$hasSchema = docker exec supabase_db_api-medicos-por-venezuela psql -U postgres -d postgres `
-  -tAc "select to_regclass('public.schema_migrations') is not null" 2>$null
+# El contenedor se resuelve por patron (como en scripts/load_local.sh): el nombre incluye
+# el directorio del proyecto, y hardcodearlo fallaba en silencio si la carpeta se renombra.
+$dbContainer = docker ps --format '{{.Names}}' | Where-Object { $_ -like 'supabase_db_*' } | Select-Object -First 1
+$hasSchema = if ($dbContainer) {
+  docker exec $dbContainer psql -U postgres -d postgres `
+    -tAc "select to_regclass('public.schema_migrations') is not null" 2>$null
+} else { $null }
 if ($hasSchema -ne "t") {
   $dump = Get-ChildItem backups\*.dump -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
   if ($dump -and (Test-Path ".env.supabase") -and (Get-Command bash -ErrorAction SilentlyContinue)) {

@@ -124,6 +124,10 @@ async def update_my_doctor(
     "/pool",
     response_model=DoctorPoolPage,
     summary="Pool de médicos para referir/agendar (paginado, con estado online)",
+    responses={
+        401: {"description": "Sin token o token inválido."},
+        403: {"description": "Requiere el permiso doctors.read."},
+    },
 )
 async def doctor_pool(
     skip: int = Query(0, ge=0),

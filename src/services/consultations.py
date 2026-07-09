@@ -113,18 +113,32 @@ async def create_consultation(session: AsyncSession, data: ConsultationCreate) -
     return consultation
 
 
+def _ensure_can_manage(
+    consultation: Consultation, actor_user_id: uuid.UUID | None, actor_is_admin: bool
+) -> None:
+    """Anti-IDOR (security.md): un médico solo gestiona consultas sin asignar o
+    asignadas a sí mismo; los admin gestionan cualquiera. Va en el servicio, junto
+    a la mutación, no en el router."""
+    if actor_is_admin:
+        return
+    if consultation.assigned_doctor_id not in (None, actor_user_id):
+        raise ConflictError("La consulta está asignada a otro médico.")
+
+
 async def close_consultation(
     session: AsyncSession,
     consultation_id: uuid.UUID,
     outcome: str,
     closed_by: uuid.UUID | None = None,
     note: str | None = None,
+    actor_is_admin: bool = False,
 ) -> Consultation:
     """Cierra una consulta (`closed`) o la marca como ausencia (`patient_no_show`),
     guardando la nota y registrando el evento de auditoría (réplica de closeConsultation)."""
     if outcome not in _CLOSE_OUTCOMES:
         raise UnprocessableError(f"Resultado inválido. Permitidos: {sorted(_CLOSE_OUTCOMES)}")
     consultation = await get_consultation(session, consultation_id)
+    _ensure_can_manage(consultation, closed_by, actor_is_admin)
     consultation.status = outcome
     consultation.closed_at = datetime.now(UTC)
     if note is not None:
@@ -273,10 +287,16 @@ async def update_consultation(
     consultation_id: uuid.UUID,
     data: ConsultationUpdate,
     actor_user_id: uuid.UUID | None = None,
+    actor_is_admin: bool = False,
 ) -> Consultation:
     _validate_status(data.status)
     consultation = await get_consultation(session, consultation_id)
+    _ensure_can_manage(consultation, actor_user_id, actor_is_admin)
     changes = data.model_dump(exclude_unset=True)
+    # Un no-admin no puede reasignar la consulta a un tercero (tomarla para sí o
+    # liberarla sí; la toma con anti-colisión sigue siendo POST /queue/{id}/take).
+    if not actor_is_admin and changes.get("assigned_doctor_id") not in (None, actor_user_id):
+        raise ConflictError("No puedes asignar la consulta a otro médico.")
     for field, value in changes.items():
         setattr(consultation, field, value)
     await audit.log_action(

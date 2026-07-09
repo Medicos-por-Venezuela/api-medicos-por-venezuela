@@ -28,14 +28,35 @@ _NOT_FOUND = {404: {"description": "Professional type not found."}}
 @router.get(
     "",
     response_model=list[ProfessionalTypeResponse],
-    summary="List professional types",
+    summary="List active professional types (public)",
 )
 async def list_professional_types(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ) -> list[ProfessionalTypeResponse]:
-    """List non-deleted professional types; no Bearer token required."""
+    """Public list, **active only** (feeds the doctor registration form and the pool
+    filters — deactivating a type from the admin panel hides it here); no Bearer token."""
+    return await professional_types_service.list_professional_types(
+        db, skip=skip, limit=limit, status="active"
+    )
+
+
+# NOTE: declared BEFORE "/{professional_type_id}" so "admin" isn't parsed as a UUID (422).
+@router.get(
+    "/admin",
+    response_model=list[ProfessionalTypeResponse],
+    summary="List professional types incl. inactive (admin)",
+    responses={403: {"description": "Requires catalogs.manage."}},
+)
+async def list_professional_types_admin(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    _: Principal = Depends(require_permission("catalogs.manage")),
+) -> list[ProfessionalTypeResponse]:
+    """Full management list (active + inactive, never deleted). Same pattern as
+    /specialties/admin and /affected-zones/admin."""
     return await professional_types_service.list_professional_types(db, skip=skip, limit=limit)
 
 

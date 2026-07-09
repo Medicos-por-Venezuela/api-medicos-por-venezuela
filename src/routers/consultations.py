@@ -136,7 +136,11 @@ async def get_consultation(
     "/{consultation_id}",
     response_model=ConsultationResponse,
     summary="Actualizar consulta (estado / asignación / notas)",
-    responses={**_NOT_FOUND, 422: {"description": "`status` inválido."}},
+    responses={
+        **_NOT_FOUND,
+        409: {"description": "La consulta está asignada a otro médico."},
+        422: {"description": "`status` inválido."},
+    },
 )
 async def update_consultation(
     consultation_id: uuid.UUID,
@@ -145,7 +149,11 @@ async def update_consultation(
     principal: Principal = Depends(require_permission("consultations.write")),
 ) -> ConsultationResponse:
     return await consultations_service.update_consultation(
-        db, consultation_id, payload, actor_user_id=principal.id
+        db,
+        consultation_id,
+        payload,
+        actor_user_id=principal.id,
+        actor_is_admin=principal.is_admin,
     )
 
 
@@ -170,7 +178,7 @@ async def delete_consultation(
     "/{consultation_id}/close",
     response_model=ConsultationResponse,
     summary="Cerrar consulta o marcar ausencia (staff)",
-    responses=_NOT_FOUND,
+    responses={**_NOT_FOUND, 409: {"description": "La consulta está asignada a otro médico."}},
 )
 async def close_consultation(
     consultation_id: uuid.UUID,
@@ -181,7 +189,12 @@ async def close_consultation(
     """Cierra (`closed`) o marca `patient_no_show`, guarda la nota y registra el evento.
     El autor del cierre es el médico autenticado."""
     return await consultations_service.close_consultation(
-        db, consultation_id, payload.outcome, closed_by=principal.id, note=payload.note
+        db,
+        consultation_id,
+        payload.outcome,
+        closed_by=principal.id,
+        note=payload.note,
+        actor_is_admin=principal.is_admin,
     )
 
 
