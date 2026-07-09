@@ -4,18 +4,21 @@ Las llamadas al SACS/FPV se mockean (sin red). Los professional_types 'Médico' 
 'Psicólogo' vienen sembrados por la migración, así que se leen de la BD.
 """
 
+import uuid
 from unittest.mock import AsyncMock, patch
 
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.models.doctor import Doctor
 from src.models.professional_type import ProfessionalType
+from src.models.profile import Profile
 from src.models.specialty import Specialty
 from src.schemas.psicologo import PsicologoVerificationResponse
 from src.schemas.sacs import SacsVerificationResponse
 from src.services.doctors import _normalize
-from tests._helpers import make_profile
+from tests._helpers import auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -293,3 +296,174 @@ async def test_doctor_sin_cuenta_no_falla_al_sincronizar(
         )
     assert resp.status_code == 201, resp.text
     assert resp.json()["user_id"] is None
+
+
+# --- Perfil propio del médico (GET/PATCH /doctors/me) ---
+# IDOR: el recurso se resuelve del `user_id` del JWT; se autentica por-request con
+# auth_headers(user.id) para actuar como ese médico (el `client` es admin por defecto).
+
+
+async def _seed_doctor_with_account(
+    db_session: AsyncSession, *, cedula: str, specialty_id: uuid.UUID | None = None
+) -> tuple[uuid.UUID, Doctor]:
+    """Crea una cuenta (users) de médico + su fila en doctors ligada por user_id."""
+    user = make_profile(role="doctor")
+    db_session.add(user)
+    await db_session.flush()
+    type_id = uuid.UUID(await _type_id(db_session, "medico"))
+    doctor = Doctor(
+        user_id=user.id,
+        professional_type_id=type_id,
+        specialty_id=specialty_id,
+        cedula=cedula,
+        full_name="Dr Propio",
+        license="MPPS-0001",
+        verified=True,
+    )
+    db_session.add(doctor)
+    await db_session.flush()
+    return user.id, doctor
+
+
+async def test_get_me_desde_doctors(client: AsyncClient, db_session: AsyncSession) -> None:
+    specialty = (await db_session.execute(select(Specialty).limit(1))).scalar_one()
+    user_id, _ = await _seed_doctor_with_account(
+        db_session, cedula="V-90001001", specialty_id=specialty.id
+    )
+    resp = await client.get(f"{PREFIX}/doctors/me", headers=auth_headers(user_id))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["source"] == "doctor"
+    assert body["cedula"] == "V-90001001"
+    assert body["specialty_id"] == str(specialty.id)
+    assert body["specialty"] == specialty.name
+
+
+async def test_get_me_fallback_a_users(client: AsyncClient, db_session: AsyncSession) -> None:
+    """Médico sin fila en doctors -> el perfil sale de su cuenta en users."""
+    user = make_profile(role="doctor", specialty="Cardiología")
+    user.medical_license = "MPPS-USR-9"
+    db_session.add(user)
+    await db_session.flush()
+    resp = await client.get(f"{PREFIX}/doctors/me", headers=auth_headers(user.id))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["source"] == "user"
+    assert body["cedula"] is None
+    assert body["specialty_id"] is None
+    assert body["specialty"] == "Cardiología"
+    assert body["license"] == "MPPS-USR-9"
+
+
+async def test_get_me_paciente_404(client: AsyncClient, db_session: AsyncSession) -> None:
+    """Un no-médico sin fila en doctors no tiene 'perfil de médico'."""
+    patient = make_profile(role="patient")
+    db_session.add(patient)
+    await db_session.flush()
+    resp = await client.get(f"{PREFIX}/doctors/me", headers=auth_headers(patient.id))
+    assert resp.status_code == 404
+
+
+async def test_me_sin_token_401(client: AsyncClient) -> None:
+    resp = await client.get(f"{PREFIX}/doctors/me", headers={"Authorization": ""})
+    assert resp.status_code == 401
+
+
+async def test_patch_me_actualiza_y_propaga_a_users(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    specialties = (await db_session.execute(select(Specialty).limit(2))).scalars().all()
+    assert len(specialties) == 2
+    user_id, _ = await _seed_doctor_with_account(
+        db_session, cedula="V-90001002", specialty_id=specialties[0].id
+    )
+    resp = await client.patch(
+        f"{PREFIX}/doctors/me",
+        headers=auth_headers(user_id),
+        json={
+            "full_name": "Dra Actualizada",
+            "license": "MPPS-9999",
+            "specialty_id": str(specialties[1].id),
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["full_name"] == "Dra Actualizada"
+    assert body["specialty"] == specialties[1].name
+    assert body["verified"] is True  # no cambió la cédula -> no re-verifica
+
+    # la especialidad (nombre) se propagó a users vía _sync_user_from_doctor
+    user = await db_session.get(Profile, user_id)
+    assert user.specialty == specialties[1].name
+    assert user.medical_license == "MPPS-9999"
+
+
+async def test_patch_me_cambiar_cedula_reverifica(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Cambiar la cédula re-consulta SACS/FPV y recalcula verified (fail-closed)."""
+    user_id, _ = await _seed_doctor_with_account(db_session, cedula="V-90001003")
+    with _mock_sacs(encontrado=False, es_medico=False):
+        resp = await client.patch(
+            f"{PREFIX}/doctors/me",
+            headers=auth_headers(user_id),
+            json={"cedula": "V-90001099"},
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["cedula"] == "V-90001099"
+    assert body["verified"] is False
+
+
+async def test_patch_me_fallback_users_actualiza(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    specialty = (await db_session.execute(select(Specialty).limit(1))).scalar_one()
+    user = make_profile(role="doctor")
+    db_session.add(user)
+    await db_session.flush()
+    resp = await client.patch(
+        f"{PREFIX}/doctors/me",
+        headers=auth_headers(user.id),
+        json={
+            "full_name": "Dr Users",
+            "license": "MPPS-USR-77",
+            "specialty_id": str(specialty.id),
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["specialty"] == specialty.name
+    assert body["license"] == "MPPS-USR-77"
+    await db_session.refresh(user)
+    assert user.specialty == specialty.name
+    assert user.full_name == "Dr Users"
+    # 'license' del schema se mapea a users.medical_license
+    assert user.medical_license == "MPPS-USR-77"
+
+
+async def test_patch_me_fallback_users_cedula_400(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """En la fuente users no hay tipo/cédula que verificar: editarla es 400."""
+    user = make_profile(role="doctor")
+    db_session.add(user)
+    await db_session.flush()
+    resp = await client.patch(
+        f"{PREFIX}/doctors/me",
+        headers=auth_headers(user.id),
+        json={"cedula": "V-90001004"},
+    )
+    assert resp.status_code == 400
+
+
+async def test_patch_me_rechaza_campos_no_permitidos_422(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """status/verified/email/phone no son auto-editables (extra='forbid')."""
+    user_id, _ = await _seed_doctor_with_account(db_session, cedula="V-90001005")
+    for forbidden in ({"status": 0}, {"verified": True}, {"email": "x@y.com"}):
+        resp = await client.patch(
+            f"{PREFIX}/doctors/me", headers=auth_headers(user_id), json=forbidden
+        )
+        assert resp.status_code == 422, f"{forbidden} -> {resp.status_code}"
