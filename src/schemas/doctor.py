@@ -112,3 +112,25 @@ class DoctorResponse(BaseModel):
     verified: bool
     created_at: datetime
     updated_at: datetime
+
+
+class DoctorPoolItem(BaseModel):
+    """Fila del pool de médicos: datos mínimos para listar/referir + estado online.
+
+    `online` se deriva en el servicio de `users.last_seen_at` (ventana de 3 min); los
+    ids de especialidad/tipo los mapea el frontend a nombre con sus catálogos ya cargados.
+    """
+
+    id: uuid.UUID
+    full_name: str
+    specialty_id: uuid.UUID | None = None
+    professional_type_id: uuid.UUID | None = None
+    phone: str | None = None
+    online: bool
+
+
+class DoctorPoolPage(BaseModel):
+    """Página del pool: filas + total (para la paginación server-side del frontend)."""
+
+    items: list[DoctorPoolItem]
+    total: int

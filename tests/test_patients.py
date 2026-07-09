@@ -2,6 +2,8 @@
 
 from httpx import AsyncClient
 
+from src.models.profile import Profile
+
 PREFIX = "/api/v1"
 
 
@@ -53,7 +55,7 @@ async def test_get_missing_patient_404(client: AsyncClient) -> None:
     assert resp.status_code == 404
 
 
-async def test_list_update_delete_patient(client: AsyncClient) -> None:
+async def test_list_update_delete_patient(client: AsyncClient, admin_identity: Profile) -> None:
     created = await client.post(
         f"{PREFIX}/patients",
         json={
@@ -78,6 +80,11 @@ async def test_list_update_delete_patient(client: AsyncClient) -> None:
 
     assert (await client.delete(f"{PREFIX}/patients/{patient_id}")).status_code == 204
     assert (await client.get(f"{PREFIX}/patients/{patient_id}")).status_code == 404
+
+    audit_resp = await client.get(f"{PREFIX}/audit-log", params={"resource": "patients"})
+    entries = [e for e in audit_resp.json() if e["resource_id"] == patient_id]
+    assert sorted(e["action"] for e in entries) == sorted(["patient.updated", "patient.deleted"])
+    assert all(e["actor_user_id"] == str(admin_identity.id) for e in entries)
 
 
 async def test_update_missing_patient_404(client: AsyncClient) -> None:

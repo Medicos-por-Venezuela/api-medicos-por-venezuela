@@ -60,6 +60,12 @@ async def test_consultation_crud_and_code_autogeneration(client: AsyncClient) ->
     assert (await client.delete(f"{PREFIX}/consultations/{cid}")).status_code == 204
     assert (await client.get(f"{PREFIX}/consultations/{cid}")).status_code == 404
 
+    audit_resp = await client.get(f"{PREFIX}/audit-log", params={"resource": "consultations"})
+    entries = [e for e in audit_resp.json() if e["resource_id"] == cid]
+    assert sorted(e["action"] for e in entries) == sorted(
+        ["consultation.updated", "consultation.deleted"]
+    )
+
 
 async def test_consultation_invalid_patient(client: AsyncClient) -> None:
     resp = await client.post(

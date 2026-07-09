@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import BadRequestError, NotFoundError
 from src.models.profile import Profile
+from src.services import audit
 
 # set_my_role solo permite finalizar como paciente o médico (nunca escalar).
 _SELF_ROLES = {"patient", "doctor"}
@@ -40,10 +41,22 @@ async def mark_online(session: AsyncSession, profile_id: uuid.UUID) -> Profile:
     return profile
 
 
-async def set_active(session: AsyncSession, profile_id: uuid.UUID, active: bool) -> Profile:
+async def set_active(
+    session: AsyncSession,
+    profile_id: uuid.UUID,
+    active: bool,
+    actor_user_id: uuid.UUID | None = None,
+) -> Profile:
     """Revoca (`active=false`) o reactiva (`active=true`) un médico. Acción de admin."""
     profile = await get_profile(session, profile_id)
     profile.active = active
+    await audit.log_action(
+        session,
+        action="profile.activated" if active else "profile.deactivated",
+        actor_user_id=actor_user_id,
+        resource="users",
+        resource_id=profile_id,
+    )
     await session.commit()
     await session.refresh(profile)
     return profile
@@ -75,6 +88,14 @@ async def finalize_role(
     profile.verified = True
     profile.active = True
     profile.role_chosen = True
+    await audit.log_action(
+        session,
+        action="profile.role_chosen",
+        actor_user_id=profile_id,
+        resource="users",
+        resource_id=profile_id,
+        metadata={"role": role},
+    )
     await session.commit()
     await session.refresh(profile)
     return profile

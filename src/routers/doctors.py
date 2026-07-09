@@ -18,6 +18,7 @@ from src.db.session import get_db
 from src.schemas.doctor import (
     DoctorCreate,
     DoctorMeResponse,
+    DoctorPoolPage,
     DoctorResponse,
     DoctorSelfUpdate,
     DoctorUpdate,
@@ -110,6 +111,37 @@ async def update_my_doctor(
     return await doctors_service.update_my_profile(db, principal.id, payload)
 
 
+# NOTA: debe ir ANTES de "/{doctor_id}" o FastAPI intenta parsear "pool" como UUID (422).
+@router.get(
+    "/pool",
+    response_model=DoctorPoolPage,
+    summary="Pool de médicos para referir/agendar (paginado, con estado online)",
+)
+async def doctor_pool(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    specialty_id: uuid.UUID | None = Query(None),
+    professional_type_id: uuid.UUID | None = Query(None),
+    online: bool | None = Query(None, description="true=logeados · false=offline · omitir=todos"),
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_permission("doctors.read")),
+) -> DoctorPoolPage:
+    """Médicos activos (status=1) para referir/agendar durante una consulta, con su estado
+    online (logeado < 3 min) y teléfono de contacto. Filtrable por especialidad y tipo de
+    profesional; los online van primero. Excluye al propio médico que consulta. Devuelve
+    `{items, total}` para la paginación del cliente."""
+    items, total = await doctors_service.list_doctor_pool(
+        db,
+        skip=skip,
+        limit=limit,
+        specialty_id=specialty_id,
+        professional_type_id=professional_type_id,
+        online=online,
+        exclude_user_id=principal.id,
+    )
+    return DoctorPoolPage(items=items, total=total)
+
+
 @router.get(
     "/{doctor_id}",
     response_model=DoctorResponse,
@@ -134,9 +166,9 @@ async def update_doctor(
     doctor_id: uuid.UUID,
     payload: DoctorUpdate,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("doctors.write")),
+    principal: Principal = Depends(require_permission("doctors.write")),
 ) -> DoctorResponse:
-    return await doctors_service.update_doctor(db, doctor_id, payload)
+    return await doctors_service.update_doctor(db, doctor_id, payload, actor_user_id=principal.id)
 
 
 @router.delete(
@@ -148,6 +180,6 @@ async def update_doctor(
 async def delete_doctor(
     doctor_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("doctors.write")),
+    principal: Principal = Depends(require_permission("doctors.write")),
 ) -> None:
-    await doctors_service.delete_doctor(db, doctor_id)
+    await doctors_service.delete_doctor(db, doctor_id, actor_user_id=principal.id)

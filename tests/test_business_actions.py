@@ -140,6 +140,10 @@ async def test_profile_online_and_active(client: AsyncClient, db_session: AsyncS
     )
     assert reactivated.json()["active"] is True
 
+    audit_resp = await client.get(f"{PREFIX}/audit-log", params={"resource": "users"})
+    actions = [e["action"] for e in audit_resp.json() if e["resource_id"] == str(target.id)]
+    assert sorted(actions) == sorted(["profile.activated", "profile.deactivated"])
+
 
 async def test_finalize_role_once(client: AsyncClient, db_session: AsyncSession) -> None:
     # Perfil placeholder (role_chosen=False) que finaliza su propio rol vía su JWT.
@@ -157,6 +161,11 @@ async def test_finalize_role_once(client: AsyncClient, db_session: AsyncSession)
     assert ok.status_code == 200, ok.text
     assert ok.json()["role"] == "doctor"
     assert ok.json()["role_chosen"] is True
+
+    audit_resp = await client.get(f"{PREFIX}/audit-log", params={"action": "profile.role_chosen"})
+    entry = next(e for e in audit_resp.json() if e["resource_id"] == str(placeholder.id))
+    assert entry["actor_user_id"] == str(placeholder.id)
+    assert entry["metadata"]["role"] == "doctor"
 
     # Segunda vez -> 400 (ya fue elegido).
     again = await client.post(

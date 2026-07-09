@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.errors import BadRequestError, NotFoundError
 from src.models.patient import Patient
 from src.schemas.patient import PatientCreate, PatientUpdate
+from src.services import audit
 
 
 async def _resolve_dependent_cedula(session: AsyncSession, parent_id: uuid.UUID) -> str | None:
@@ -55,17 +56,38 @@ async def create_patient(session: AsyncSession, data: PatientCreate) -> Patient:
 
 
 async def update_patient(
-    session: AsyncSession, patient_id: uuid.UUID, data: PatientUpdate
+    session: AsyncSession,
+    patient_id: uuid.UUID,
+    data: PatientUpdate,
+    actor_user_id: uuid.UUID | None = None,
 ) -> Patient:
     patient = await get_patient(session, patient_id)
-    for field, value in data.model_dump(exclude_unset=True).items():
+    changes = data.model_dump(exclude_unset=True)
+    for field, value in changes.items():
         setattr(patient, field, value)
+    await audit.log_action(
+        session,
+        action="patient.updated",
+        actor_user_id=actor_user_id,
+        resource="patients",
+        resource_id=patient.id,
+        metadata={"fields": sorted(changes)},
+    )
     await session.commit()
     await session.refresh(patient)
     return patient
 
 
-async def delete_patient(session: AsyncSession, patient_id: uuid.UUID) -> None:
+async def delete_patient(
+    session: AsyncSession, patient_id: uuid.UUID, actor_user_id: uuid.UUID | None = None
+) -> None:
     patient = await get_patient(session, patient_id)
+    await audit.log_action(
+        session,
+        action="patient.deleted",
+        actor_user_id=actor_user_id,
+        resource="patients",
+        resource_id=patient_id,
+    )
     await session.delete(patient)
     await session.commit()

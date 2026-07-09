@@ -88,10 +88,12 @@ async def get_affected_zone(
 async def create_affected_zone(
     payload: AffectedZoneCreate,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("catalogs.manage")),
+    principal: Principal = Depends(require_permission("catalogs.manage")),
 ) -> AffectedZoneResponse:
     """Crea una zona afectada. Requiere rol admin o super_admin."""
-    return await affected_zones_service.create_affected_zone(db, payload)
+    return await affected_zones_service.create_affected_zone(
+        db, payload, actor_user_id=principal.id
+    )
 
 
 @router.patch(
@@ -104,10 +106,12 @@ async def update_affected_zone(
     zone_id: uuid.UUID,
     payload: AffectedZoneUpdate,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("catalogs.manage")),
+    principal: Principal = Depends(require_permission("catalogs.manage")),
 ) -> AffectedZoneResponse:
     """Modifica nombre, estado, país y/o status. Requiere rol admin o super_admin."""
-    return await affected_zones_service.update_affected_zone(db, zone_id, payload)
+    return await affected_zones_service.update_affected_zone(
+        db, zone_id, payload, actor_user_id=principal.id
+    )
 
 
 @router.delete(
@@ -119,7 +123,7 @@ async def update_affected_zone(
 async def delete_affected_zone(
     zone_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("catalogs.manage")),
+    principal: Principal = Depends(require_permission("catalogs.manage")),
 ) -> None:
     """Marca la zona afectada como eliminada con deleted_at."""
-    await affected_zones_service.delete_affected_zone(db, zone_id)
+    await affected_zones_service.delete_affected_zone(db, zone_id, actor_user_id=principal.id)
