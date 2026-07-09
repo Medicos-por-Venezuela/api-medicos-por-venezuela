@@ -143,6 +143,12 @@ async def test_specialty_crud_flow(client: AsyncClient) -> None:
     listed_after_delete = await client.get(f"{PREFIX}/specialties")
     assert all(item["id"] != specialty_id for item in listed_after_delete.json())
 
+    audit_resp = await client.get(f"{PREFIX}/audit-log", params={"resource": "specialties"})
+    entries = [e for e in audit_resp.json() if e["resource_id"] == specialty_id]
+    assert sorted(e["action"] for e in entries) == sorted(
+        ["catalog.created", "catalog.updated", "catalog.deleted"]
+    )
+
 
 async def test_specialty_not_found(client: AsyncClient) -> None:
     missing = "00000000-0000-0000-0000-000000000000"

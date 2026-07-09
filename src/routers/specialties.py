@@ -67,10 +67,10 @@ async def get_catalog() -> SpecialtyCatalogResponse:
 async def create_specialty(
     payload: SpecialtyCreate,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("catalogs.manage")),
+    principal: Principal = Depends(require_permission("catalogs.manage")),
 ) -> SpecialtyResponse:
     """Crea una especialidad. Requiere rol admin o super_admin."""
-    return await specialties_service.create_specialty(db, payload)
+    return await specialties_service.create_specialty(db, payload, actor_user_id=principal.id)
 
 
 @router.get(
@@ -98,10 +98,12 @@ async def update_specialty(
     specialty_id: uuid.UUID,
     payload: SpecialtyUpdate,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("catalogs.manage")),
+    principal: Principal = Depends(require_permission("catalogs.manage")),
 ) -> SpecialtyResponse:
     """Modifica `name` y/o `status`. Requiere rol admin o super_admin."""
-    return await specialties_service.update_specialty(db, specialty_id, payload)
+    return await specialties_service.update_specialty(
+        db, specialty_id, payload, actor_user_id=principal.id
+    )
 
 
 @router.delete(
@@ -113,7 +115,7 @@ async def update_specialty(
 async def delete_specialty(
     specialty_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("catalogs.manage")),
+    principal: Principal = Depends(require_permission("catalogs.manage")),
 ) -> None:
     """Marca la especialidad como eliminada con `deleted_at`."""
-    await specialties_service.delete_specialty(db, specialty_id)
+    await specialties_service.delete_specialty(db, specialty_id, actor_user_id=principal.id)

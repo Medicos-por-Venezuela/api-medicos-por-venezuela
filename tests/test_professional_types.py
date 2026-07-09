@@ -35,13 +35,23 @@ async def client(
     async def _override_get_db() -> AsyncGenerator[AsyncSession, None]:
         yield db_session
 
-    principal = Principal(
+    profile = Profile(
         id=uuid.uuid4(),
+        full_name="Test Admin",
+        role="admin",
+        active=True,
+        verified=True,
+        role_chosen=True,
+    )
+    db_session.add(profile)
+    await db_session.flush()
+    principal = Principal(
+        id=profile.id,
         role="admin",
         active=True,
         verified=True,
         roles=frozenset({"admin"}),
-        permissions=frozenset({"catalogs.manage"}),
+        permissions=frozenset({"catalogs.manage", "audit.read"}),
     )
     app.dependency_overrides[get_db] = _override_get_db
     app.dependency_overrides[get_current_principal] = lambda: principal
@@ -98,6 +108,12 @@ async def test_professional_type_crud_flow(client: AsyncClient, db_session: Asyn
 
     listed_after_delete = await client.get(f"{PREFIX}/professional-types")
     assert all(item["id"] != professional_type_id for item in listed_after_delete.json())
+
+    audit_resp = await client.get(f"{PREFIX}/audit-log", params={"resource": "professional_types"})
+    entries = [e for e in audit_resp.json() if e["resource_id"] == professional_type_id]
+    assert sorted(e["action"] for e in entries) == sorted(
+        ["catalog.created", "catalog.updated", "catalog.deleted"]
+    )
     assert (
         await client.patch(
             f"{PREFIX}/professional-types/{professional_type_id}", json={"name": "Other"}

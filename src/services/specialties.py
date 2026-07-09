@@ -9,6 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.errors import ConflictError, NotFoundError
 from src.models.specialty import Specialty
 from src.schemas.specialty import SpecialtyCreate, SpecialtyUpdate
+from src.services import audit
+
+_RESOURCE = "specialties"
 
 # Catálogo de especialidades de los médicos (lib/utils.ts: SPECIALTIES).
 SPECIALTIES: list[str] = [
@@ -160,17 +163,30 @@ async def get_specialty(session: AsyncSession, specialty_id: uuid.UUID) -> Speci
     return specialty
 
 
-async def create_specialty(session: AsyncSession, data: SpecialtyCreate) -> Specialty:
+async def create_specialty(
+    session: AsyncSession, data: SpecialtyCreate, actor_user_id: uuid.UUID | None = None
+) -> Specialty:
     await _ensure_unique_specialty_name(session, data.name)
     specialty = Specialty(**data.model_dump())
     session.add(specialty)
+    await session.flush()
+    await audit.log_action(
+        session,
+        action="catalog.created",
+        actor_user_id=actor_user_id,
+        resource=_RESOURCE,
+        resource_id=specialty.id,
+    )
     await session.commit()
     await session.refresh(specialty)
     return specialty
 
 
 async def update_specialty(
-    session: AsyncSession, specialty_id: uuid.UUID, data: SpecialtyUpdate
+    session: AsyncSession,
+    specialty_id: uuid.UUID,
+    data: SpecialtyUpdate,
+    actor_user_id: uuid.UUID | None = None,
 ) -> Specialty:
     specialty = await get_specialty(session, specialty_id)
     changes = data.model_dump(exclude_unset=True)
@@ -178,13 +194,30 @@ async def update_specialty(
         await _ensure_unique_specialty_name(session, changes["name"], specialty_id)
     for field, value in changes.items():
         setattr(specialty, field, value)
+    await audit.log_action(
+        session,
+        action="catalog.updated",
+        actor_user_id=actor_user_id,
+        resource=_RESOURCE,
+        resource_id=specialty.id,
+        metadata={"fields": sorted(changes)},
+    )
     await session.commit()
     await session.refresh(specialty)
     return specialty
 
 
-async def delete_specialty(session: AsyncSession, specialty_id: uuid.UUID) -> None:
+async def delete_specialty(
+    session: AsyncSession, specialty_id: uuid.UUID, actor_user_id: uuid.UUID | None = None
+) -> None:
     specialty = await get_specialty(session, specialty_id)
     specialty.status = "inactive"
     specialty.deleted_at = datetime.now(UTC)
+    await audit.log_action(
+        session,
+        action="catalog.deleted",
+        actor_user_id=actor_user_id,
+        resource=_RESOURCE,
+        resource_id=specialty.id,
+    )
     await session.commit()
