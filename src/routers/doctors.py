@@ -15,7 +15,7 @@ from src.core.config import settings
 from src.core.ratelimit import limiter
 from src.core.security import Principal, require_permission
 from src.db.session import get_db
-from src.schemas.doctor import DoctorCreate, DoctorResponse, DoctorUpdate
+from src.schemas.doctor import DoctorCreate, DoctorPoolPage, DoctorResponse, DoctorUpdate
 from src.services import doctors as doctors_service
 
 router = APIRouter(prefix="/doctors", tags=["doctors"])
@@ -58,6 +58,37 @@ async def register_doctor(
 
     Anti-bot: rate limit por IP + campo honeypot (`website`, debe ir vacío)."""
     return await doctors_service.create_doctor(db, payload)
+
+
+# NOTA: debe ir ANTES de "/{doctor_id}" o FastAPI intenta parsear "pool" como UUID (422).
+@router.get(
+    "/pool",
+    response_model=DoctorPoolPage,
+    summary="Pool de médicos para referir/agendar (paginado, con estado online)",
+)
+async def doctor_pool(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    specialty_id: uuid.UUID | None = Query(None),
+    professional_type_id: uuid.UUID | None = Query(None),
+    online: bool | None = Query(None, description="true=logeados · false=offline · omitir=todos"),
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_permission("doctors.read")),
+) -> DoctorPoolPage:
+    """Médicos activos (status=1) para referir/agendar durante una consulta, con su estado
+    online (logeado < 3 min) y teléfono de contacto. Filtrable por especialidad y tipo de
+    profesional; los online van primero. Excluye al propio médico que consulta. Devuelve
+    `{items, total}` para la paginación del cliente."""
+    items, total = await doctors_service.list_doctor_pool(
+        db,
+        skip=skip,
+        limit=limit,
+        specialty_id=specialty_id,
+        professional_type_id=professional_type_id,
+        online=online,
+        exclude_user_id=principal.id,
+    )
+    return DoctorPoolPage(items=items, total=total)
 
 
 @router.get(

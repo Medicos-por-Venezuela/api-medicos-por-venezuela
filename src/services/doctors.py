@@ -9,8 +9,9 @@ queda en True solo si la cédula es válida en ese registro; en cualquier otro c
 import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
@@ -23,6 +24,10 @@ from src.schemas.doctor import DoctorCreate, DoctorUpdate
 from src.services import audit
 from src.services import psicologo as psicologo_service
 from src.services import sacs as sacs_service
+
+# Un médico cuenta como "online" si marcó presencia hace menos de esto (igual criterio
+# que el panel/admin del frontend: last_seen_at < 3 min).
+_ONLINE_WINDOW = timedelta(minutes=3)
 
 
 def _normalize(text: str) -> str:
@@ -107,6 +112,74 @@ async def list_doctors(
     stmt = stmt.order_by(Doctor.created_at.desc()).offset(skip).limit(limit)
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+async def list_doctor_pool(
+    session: AsyncSession,
+    *,
+    skip: int = 0,
+    limit: int = 20,
+    specialty_id: uuid.UUID | None = None,
+    professional_type_id: uuid.UUID | None = None,
+    online: bool | None = None,
+    exclude_user_id: uuid.UUID | None = None,
+) -> tuple[list[dict], int]:
+    """Pool de médicos para referir/agendar: cruza doctors con users (para el estado
+    online desde last_seen_at y el teléfono de contacto) y pagina. Devuelve (filas, total).
+
+    Solo médicos que pueden atender: status == 1 (excluye baja=0 y expulsado=2) y no
+    borrados. El inner join con users descarta los mocks legacy sin user_id. `online`:
+    True = logeado (< 3 min), False = offline, None = todos. Ordena los online primero.
+    `exclude_user_id`: quita al propio médico que consulta (no se refiere a sí mismo).
+    """
+    threshold = datetime.now(UTC) - _ONLINE_WINDOW
+    online_expr = Profile.last_seen_at >= threshold
+    # Teléfono para el enlace de WhatsApp: el de doctors o, si falta, el whatsapp de la cuenta.
+    phone_expr = func.coalesce(Doctor.phone, Profile.whatsapp_number)
+
+    base = (
+        select(
+            Doctor.id,
+            Doctor.full_name,
+            Doctor.specialty_id,
+            Doctor.professional_type_id,
+            phone_expr.label("phone"),
+            online_expr.label("online"),
+        )
+        .join(Profile, Doctor.user_id == Profile.id)
+        .where(Doctor.deleted_at.is_(None), Doctor.status == 1)
+    )
+    if exclude_user_id is not None:
+        base = base.where(Doctor.user_id != exclude_user_id)
+    if specialty_id is not None:
+        base = base.where(Doctor.specialty_id == specialty_id)
+    if professional_type_id is not None:
+        base = base.where(Doctor.professional_type_id == professional_type_id)
+    if online is True:
+        base = base.where(online_expr)
+    elif online is False:
+        base = base.where(or_(Profile.last_seen_at.is_(None), Profile.last_seen_at < threshold))
+
+    total = await session.scalar(select(func.count()).select_from(base.subquery())) or 0
+
+    page = (
+        base.order_by(Profile.last_seen_at.desc().nulls_last(), Doctor.full_name)
+        .offset(skip)
+        .limit(limit)
+    )
+    rows = (await session.execute(page)).all()
+    items = [
+        {
+            "id": r.id,
+            "full_name": r.full_name,
+            "specialty_id": r.specialty_id,
+            "professional_type_id": r.professional_type_id,
+            "phone": r.phone,
+            "online": bool(r.online),
+        }
+        for r in rows
+    ]
+    return items, total
 
 
 async def get_doctor(session: AsyncSession, doctor_id: uuid.UUID) -> Doctor:

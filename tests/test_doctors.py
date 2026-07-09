@@ -4,19 +4,22 @@ Las llamadas al SACS/FPV se mockean (sin red). Los professional_types 'Médico' 
 'Psicólogo' vienen sembrados por la migración, así que se leen de la BD.
 """
 
+import uuid
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.models.doctor import Doctor
 from src.models.professional_type import ProfessionalType
 from src.models.profile import Profile
 from src.models.specialty import Specialty
 from src.schemas.psicologo import PsicologoVerificationResponse
 from src.schemas.sacs import SacsVerificationResponse
 from src.services.doctors import _normalize
-from tests._helpers import make_profile
+from tests._helpers import auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -301,3 +304,135 @@ async def test_doctor_sin_cuenta_no_falla_al_sincronizar(
         )
     assert resp.status_code == 201, resp.text
     assert resp.json()["user_id"] is None
+
+
+# --- Pool de médicos (GET /doctors/pool) ---
+#
+# La BD local tiene datos de prod (~2849 doctores), así que se asserta por PERTENENCIA de id,
+# no por totales absolutos, y se aíslan las filas sembradas con el tipo 'nutricionista' (casi
+# ningún doctor real lo usa) para que el filtro por professional_type_id devuelva solo lo nuestro.
+
+
+async def _pool_doctor(
+    db: AsyncSession,
+    *,
+    online: bool,
+    type_id: str,
+    specialty_id: str | None = None,
+    status: int = 1,
+    name: str = "Dr Pool",
+    phone: str | None = None,
+    user_id: uuid.UUID | None = None,
+) -> Doctor:
+    """Crea un Doctor ligado a un Profile. Por defecto crea el Profile (con last_seen_at
+    reciente/viejo según `online`); si se pasa `user_id`, liga a esa cuenta existente."""
+    if user_id is None:
+        prof = make_profile(role="doctor")
+        prof.last_seen_at = datetime.now(UTC) - (
+            timedelta(minutes=1) if online else timedelta(hours=1)
+        )
+        db.add(prof)
+        await db.flush()
+        user_id = prof.id
+    doctor = Doctor(
+        full_name=name,
+        user_id=user_id,
+        status=status,
+        phone=phone,
+        specialty_id=uuid.UUID(specialty_id) if specialty_id else None,
+        professional_type_id=uuid.UUID(type_id),
+    )
+    db.add(doctor)
+    await db.flush()
+    return doctor
+
+
+async def _pool(client: AsyncClient, **params: object) -> dict:
+    resp = await client.get(f"{PREFIX}/doctors/pool", params=params)
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+async def test_pool_shape_and_online_flag(client: AsyncClient, db_session: AsyncSession) -> None:
+    nutri = await _type_id(db_session, "nutricionista")
+    d_on = await _pool_doctor(db_session, online=True, type_id=nutri, name="Pool Online")
+    d_off = await _pool_doctor(db_session, online=False, type_id=nutri, name="Pool Offline")
+
+    body = await _pool(client, professional_type_id=nutri)
+    assert set(body) == {"items", "total"}
+    assert body["total"] >= 2
+    by_id = {i["id"]: i for i in body["items"]}
+    assert by_id[str(d_on.id)]["online"] is True
+    assert by_id[str(d_off.id)]["online"] is False
+
+
+async def test_pool_online_tab_filters(client: AsyncClient, db_session: AsyncSession) -> None:
+    nutri = await _type_id(db_session, "nutricionista")
+    d_on = await _pool_doctor(db_session, online=True, type_id=nutri)
+    d_off = await _pool_doctor(db_session, online=False, type_id=nutri)
+
+    online = await _pool(client, professional_type_id=nutri, online=True)
+    ids = {i["id"] for i in online["items"]}
+    assert str(d_on.id) in ids and str(d_off.id) not in ids
+
+    offline = await _pool(client, professional_type_id=nutri, online=False)
+    ids = {i["id"] for i in offline["items"]}
+    assert str(d_off.id) in ids and str(d_on.id) not in ids
+
+
+async def test_pool_specialty_filter(client: AsyncClient, db_session: AsyncSession) -> None:
+    nutri = await _type_id(db_session, "nutricionista")
+    specs = (await db_session.execute(select(Specialty).limit(2))).scalars().all()
+    assert len(specs) == 2
+    d_s1 = await _pool_doctor(
+        db_session, online=True, type_id=nutri, specialty_id=str(specs[0].id)
+    )
+    d_s2 = await _pool_doctor(
+        db_session, online=True, type_id=nutri, specialty_id=str(specs[1].id)
+    )
+
+    body = await _pool(client, professional_type_id=nutri, specialty_id=str(specs[0].id))
+    ids = {i["id"] for i in body["items"]}
+    assert str(d_s1.id) in ids and str(d_s2.id) not in ids
+
+
+async def test_pool_excludes_revoked(client: AsyncClient, db_session: AsyncSession) -> None:
+    nutri = await _type_id(db_session, "nutricionista")
+    d_active = await _pool_doctor(db_session, online=True, type_id=nutri, status=1)
+    d_baja = await _pool_doctor(db_session, online=True, type_id=nutri, status=0)
+    d_expelled = await _pool_doctor(db_session, online=True, type_id=nutri, status=2)
+
+    body = await _pool(client, professional_type_id=nutri)
+    ids = {i["id"] for i in body["items"]}
+    assert str(d_active.id) in ids
+    assert str(d_baja.id) not in ids and str(d_expelled.id) not in ids
+
+
+async def test_pool_requires_doctors_read(client: AsyncClient, db_session: AsyncSession) -> None:
+    patient = make_profile(role="patient")  # patient no tiene 'doctors.read'
+    db_session.add(patient)
+    await db_session.flush()
+    resp = await client.get(f"{PREFIX}/doctors/pool", headers=auth_headers(patient.id))
+    assert resp.status_code == 403
+
+
+async def test_pool_excludes_self(
+    client: AsyncClient, db_session: AsyncSession, admin_identity
+) -> None:
+    """El médico que consulta (principal = admin_identity del client) no aparece en su pool."""
+    nutri = await _type_id(db_session, "nutricionista")
+    mine = await _pool_doctor(db_session, online=True, type_id=nutri, user_id=admin_identity.id)
+    other = await _pool_doctor(db_session, online=True, type_id=nutri)
+
+    body = await _pool(client, professional_type_id=nutri)
+    ids = {i["id"] for i in body["items"]}
+    assert str(mine.id) not in ids
+    assert str(other.id) in ids
+
+
+async def test_pool_returns_phone(client: AsyncClient, db_session: AsyncSession) -> None:
+    nutri = await _type_id(db_session, "nutricionista")
+    doc = await _pool_doctor(db_session, online=True, type_id=nutri, phone="+584145200715")
+    body = await _pool(client, professional_type_id=nutri)
+    item = next(i for i in body["items"] if i["id"] == str(doc.id))
+    assert item["phone"] == "+584145200715"
