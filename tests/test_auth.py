@@ -49,6 +49,23 @@ async def test_auth_me(client: AsyncClient, admin_identity: Profile) -> None:
     assert resp.json()["role"] == "admin"
 
 
+async def test_auth_me_permissions(client: AsyncClient, admin_identity: Profile) -> None:
+    resp = await client.get(f"{PREFIX}/auth/me/permissions")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "admin" in body["roles"]
+    assert "users.create" in body["permissions"]
+    assert "roles.assign" in body["permissions"]
+    # Ordenado y sin duplicados: útil para snapshots estables en el frontend.
+    assert body["roles"] == sorted(set(body["roles"]))
+    assert body["permissions"] == sorted(set(body["permissions"]))
+
+
+async def test_auth_me_permissions_requires_token(live_client: AsyncClient) -> None:
+    resp = await live_client.get(f"{PREFIX}/auth/me/permissions")
+    assert resp.status_code == 401
+
+
 async def test_revoked_doctor_loses_staff_access(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
