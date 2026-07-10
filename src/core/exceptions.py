@@ -14,8 +14,10 @@ from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 from src.core.errors import (
     BadRequestError,
     ConflictError,
+    ForbiddenError,
     NotFoundError,
     UnprocessableError,
+    UpstreamServiceError,
 )
 
 logger = logging.getLogger("mpv.api")
@@ -55,6 +57,20 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(UnprocessableError)
     async def _unprocessable(request: Request, exc: UnprocessableError) -> JSONResponse:
         return _json(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc) or "Datos inválidos.")
+
+    @app.exception_handler(ForbiddenError)
+    async def _forbidden(request: Request, exc: ForbiddenError) -> JSONResponse:
+        return _json(status.HTTP_403_FORBIDDEN, str(exc) or "Acción no permitida.")
+
+    @app.exception_handler(UpstreamServiceError)
+    async def _upstream(request: Request, exc: UpstreamServiceError) -> JSONResponse:
+        # Nunca logueamos el body de la respuesta upstream ni el service-role key: solo
+        # el tipo de excepción (mirror de sacs.py). El mensaje al cliente es genérico.
+        logger.error("UpstreamServiceError en %s: %s", request.url.path, type(exc).__name__)
+        return _json(
+            status.HTTP_502_BAD_GATEWAY,
+            "Servicio externo no disponible. Inténtalo de nuevo más tarde.",
+        )
 
     # --- Excepciones nativas de la base de datos ---
     @app.exception_handler(OperationalError)
