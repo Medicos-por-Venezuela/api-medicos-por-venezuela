@@ -62,6 +62,11 @@ class DoctorSelfUpdate(BaseModel):
     `phone`: un médico no puede autoverificarse, reactivarse ni cambiar el contacto
     que liga la cuenta. Cambiar la `cedula` re-dispara la verificación SACS/FPV y
     recalcula `verified` (solo aplica cuando existe fila en `doctors`).
+
+    `professional_type_id` solo se usa cuando una cuenta **sin ficha** (`source:"user"`,
+    médico que entró por Google) completa su registro: junto con `cedula` elige el
+    registro oficial (SACS/FPV) contra el que verificar y **crea** la fila en `doctors`.
+    En una ficha ya existente (`source:"doctor"`) se ignora (el tipo no es auto-editable).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -69,6 +74,7 @@ class DoctorSelfUpdate(BaseModel):
     full_name: str | None = Field(default=None, min_length=2, max_length=200)
     license: str | None = Field(default=None, max_length=100)
     specialty_id: uuid.UUID | None = None
+    professional_type_id: uuid.UUID | None = None
     cedula: str | None = Field(default=None, pattern=_CEDULA_PATTERN)
 
     @field_validator("cedula")
@@ -81,7 +87,12 @@ class DoctorMeResponse(BaseModel):
     """Perfil propio del médico, unificado sobre sus dos posibles fuentes: la fila
     en `doctors` (registro con verificación SACS/FPV) o, si no existe, la cuenta en
     `users` (médicos que entraron por Google/`finalize-role`). `source` indica cuál;
-    en la fuente `user` no hay `cedula` ni `specialty_id` (users guarda el nombre)."""
+    en la fuente `user` no hay `cedula`, `specialty_id` ni `professional_type_id`
+    (users guarda el nombre de la especialidad, no ids, y no conoce el tipo profesional).
+
+    `professional_type_id`/`professional_type` (nombre, ej. "Médico"/"Psicólogo") permiten
+    al frontend elegir el registro correcto (SACS vs FPV) para la verificación en vivo de
+    la cédula. En `source:"user"` ambos vienen `null` hasta que el médico completa su ficha."""
 
     source: Literal["doctor", "user"]
     user_id: uuid.UUID
@@ -91,6 +102,8 @@ class DoctorMeResponse(BaseModel):
     license: str | None = None
     specialty_id: uuid.UUID | None = None
     specialty: str | None = None
+    professional_type_id: uuid.UUID | None = None
+    professional_type: str | None = None
     verified: bool
 
 

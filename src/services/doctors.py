@@ -15,7 +15,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
-from src.core.errors import BadRequestError, NotFoundError
+from src.core.errors import BadRequestError, ConflictError, NotFoundError, UnprocessableError
 from src.models.doctor import Doctor
 from src.models.professional_type import ProfessionalType
 from src.models.profile import Profile
@@ -264,6 +264,29 @@ async def _specialty_name(session: AsyncSession, specialty_id: uuid.UUID | None)
     return await session.scalar(select(Specialty.name).where(Specialty.id == specialty_id))
 
 
+async def _professional_type_name(
+    session: AsyncSession, professional_type_id: uuid.UUID | None
+) -> str | None:
+    if professional_type_id is None:
+        return None
+    return await session.scalar(
+        select(ProfessionalType.name).where(ProfessionalType.id == professional_type_id)
+    )
+
+
+async def _assert_cedula_available(
+    session: AsyncSession, cedula: str, *, exclude_doctor_id: uuid.UUID | None = None
+) -> None:
+    """La cédula no puede pertenecer a otra ficha activa (mismo criterio que el índice
+    único parcial `uq_doctors_cedula_not_deleted`). Se comprueba antes de escribir para
+    devolver un 409 con mensaje de dominio en vez del error de integridad genérico."""
+    stmt = select(Doctor.id).where(Doctor.cedula == cedula, Doctor.deleted_at.is_(None))
+    if exclude_doctor_id is not None:
+        stmt = stmt.where(Doctor.id != exclude_doctor_id)
+    if (await session.execute(stmt)).scalar_one_or_none() is not None:
+        raise ConflictError("La cédula ya pertenece a otro médico.")
+
+
 async def _my_doctor_row(session: AsyncSession, user_id: uuid.UUID) -> Doctor | None:
     """Fila `doctors` ligada a la cuenta (1:1), si existe y no está borrada."""
     stmt = (
@@ -285,7 +308,10 @@ async def _my_doctor_profile(session: AsyncSession, user_id: uuid.UUID) -> Profi
 
 
 def _me_from_doctor(
-    user_id: uuid.UUID, doctor: Doctor, specialty_name: str | None
+    user_id: uuid.UUID,
+    doctor: Doctor,
+    specialty_name: str | None,
+    professional_type_name: str | None,
 ) -> DoctorMeResponse:
     return DoctorMeResponse(
         source="doctor",
@@ -296,7 +322,21 @@ def _me_from_doctor(
         license=doctor.license,
         specialty_id=doctor.specialty_id,
         specialty=specialty_name,
+        professional_type_id=doctor.professional_type_id,
+        professional_type=professional_type_name,
         verified=doctor.verified,
+    )
+
+
+async def _me_from_doctor_row(
+    session: AsyncSession, user_id: uuid.UUID, doctor: Doctor
+) -> DoctorMeResponse:
+    """`_me_from_doctor` resolviendo los nombres de especialidad y tipo profesional."""
+    return _me_from_doctor(
+        user_id,
+        doctor,
+        await _specialty_name(session, doctor.specialty_id),
+        await _professional_type_name(session, doctor.professional_type_id),
     )
 
 
@@ -319,9 +359,7 @@ async def get_my_profile(session: AsyncSession, user_id: uuid.UUID) -> DoctorMeR
     cae a su cuenta en `users` (médicos que entraron por Google/`finalize-role`)."""
     doctor = await _my_doctor_row(session, user_id)
     if doctor is not None:
-        return _me_from_doctor(
-            user_id, doctor, await _specialty_name(session, doctor.specialty_id)
-        )
+        return await _me_from_doctor_row(session, user_id, doctor)
     return _me_from_profile(await _my_doctor_profile(session, user_id))
 
 
@@ -329,12 +367,16 @@ async def _update_my_doctor_row(
     session: AsyncSession, user_id: uuid.UUID, doctor: Doctor, data: DoctorSelfUpdate
 ) -> DoctorMeResponse:
     fields = data.model_dump(exclude_unset=True)
+    # El tipo profesional no es auto-editable en una ficha existente (solo se usa al
+    # crearla desde una cuenta sin ficha); se ignora si viene en el payload.
+    fields.pop("professional_type_id", None)
     new_cedula = fields.pop("cedula", None)
     for field, value in fields.items():
         setattr(doctor, field, value)
     # Cambiar la cédula re-verifica contra el registro oficial de su tipo y
     # recalcula `verified` (fail-closed si ya no valida).
     if new_cedula is not None and new_cedula != doctor.cedula:
+        await _assert_cedula_available(session, new_cedula, exclude_doctor_id=doctor.id)
         doctor.cedula = new_cedula
         doctor.verified = await _verify_credential(
             session, doctor.professional_type_id, new_cedula
@@ -342,7 +384,45 @@ async def _update_my_doctor_row(
     await _sync_user_from_doctor(session, doctor)
     await session.commit()
     await session.refresh(doctor)
-    return _me_from_doctor(user_id, doctor, await _specialty_name(session, doctor.specialty_id))
+    return await _me_from_doctor_row(session, user_id, doctor)
+
+
+async def _complete_registration_from_user(
+    session: AsyncSession, profile: Profile, data: DoctorSelfUpdate
+) -> DoctorMeResponse:
+    """Una cuenta sin ficha (`source:"user"`, médico de Google) completa su registro:
+    verifica la cédula contra el registro oficial de su tipo (SACS/FPV) y **crea** la
+    fila en `doctors`, promoviéndola a `source:"doctor"`.
+
+    `professional_type_id` es obligatorio (elige el registro); sin él no se puede
+    verificar (422). `verified` refleja el resultado del registro (True si la cédula es
+    válida, False si no se encuentra o el servicio falla) — igual que el alta pública,
+    la ficha se crea de todos modos y el frontend muestra el estado por `verified`."""
+    fields = data.model_dump(exclude_unset=True)
+    professional_type_id = fields.get("professional_type_id")
+    if professional_type_id is None:
+        raise UnprocessableError("Indica el tipo de profesional para verificar tu cédula.")
+    cedula = fields["cedula"]  # el caller garantiza que viene
+    await _assert_cedula_available(session, cedula)
+    verified = await _verify_credential(session, professional_type_id, cedula)
+    doctor = Doctor(
+        user_id=profile.id,
+        professional_type_id=professional_type_id,
+        specialty_id=fields.get("specialty_id"),
+        cedula=cedula,
+        full_name=fields.get("full_name") or profile.full_name,
+        license=fields.get("license", profile.medical_license),
+        phone=profile.whatsapp_number,
+        email=profile.email,
+        country_of_residence=profile.country,
+        verified=verified,
+    )
+    session.add(doctor)
+    await session.flush()
+    await _sync_user_from_doctor(session, doctor)
+    await session.commit()
+    await session.refresh(doctor)
+    return await _me_from_doctor_row(session, profile.id, doctor)
 
 
 async def _update_my_profile_row(
@@ -350,9 +430,11 @@ async def _update_my_profile_row(
 ) -> DoctorMeResponse:
     profile = await _my_doctor_profile(session, user_id)
     fields = data.model_dump(exclude_unset=True)
-    # En la fuente `users` no hay cédula ni tipo profesional que verificar: rechazo.
+    # Completar/verificar la cédula = crear la ficha en `doctors` (promoción a source:"doctor").
     if fields.get("cedula") is not None:
-        raise BadRequestError("No puedes editar la cédula desde este perfil.")
+        return await _complete_registration_from_user(session, profile, data)
+    # Sin cédula: solo edición de los campos que viven en `users` (professional_type_id,
+    # que users no almacena, se ignora aquí).
     if fields.get("full_name") is not None:
         profile.full_name = fields["full_name"]
     if "license" in fields:
@@ -368,7 +450,8 @@ async def update_my_profile(
     session: AsyncSession, user_id: uuid.UUID, data: DoctorSelfUpdate
 ) -> DoctorMeResponse:
     """Auto-edición del perfil propio. Sobre la fila `doctors` cambiar la cédula
-    re-verifica SACS/FPV; sobre la cuenta `users` la cédula no es editable (400)."""
+    re-verifica SACS/FPV; una cuenta sin ficha que envía `cedula` + `professional_type_id`
+    la verifica y crea su ficha (promoción a `source:"doctor"`)."""
     doctor = await _my_doctor_row(session, user_id)
     if doctor is not None:
         return await _update_my_doctor_row(session, user_id, doctor, data)

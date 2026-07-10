@@ -92,11 +92,13 @@ async def get_my_doctor(
     response_model=DoctorMeResponse,
     summary="Actualizar mi perfil de médico",
     responses={
-        400: {"description": "Cédula no editable desde este perfil (cuenta sin ficha SACS/FPV)."},
         404: {"description": "No tienes un perfil de médico."},
         409: {"description": "La cédula ya pertenece a otro médico."},
         422: {
-            "description": "Datos inválidos o campos no permitidos (status/verified/email/phone)."
+            "description": (
+                "Datos inválidos, campos no permitidos (status/verified/email/phone) o "
+                "falta `professional_type_id` para verificar la cédula (cuenta sin ficha)."
+            )
         },
     },
 )
@@ -105,9 +107,14 @@ async def update_my_doctor(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ) -> DoctorMeResponse:
-    """Auto-edición de nombre, licencia, especialidad y cédula. Cambiar la cédula
-    re-verifica contra SACS/FPV y recalcula `verified` (solo si hay fila en
-    `doctors`). No permite tocar `status`/`verified`/`email`/`phone`."""
+    """Auto-edición de nombre, licencia, especialidad y cédula.
+
+    - Con ficha (`source:"doctor"`): cambiar la cédula re-verifica contra SACS/FPV y
+      recalcula `verified`. No permite tocar `status`/`verified`/`email`/`phone` ni el
+      tipo profesional.
+    - Sin ficha (`source:"user"`, médico de Google): enviar `cedula` + `professional_type_id`
+      verifica la credencial y **crea** la ficha en `doctors`, promoviendo la cuenta a
+      `source:"doctor"` (`verified` según SACS/FPV)."""
     return await doctors_service.update_my_profile(db, principal.id, payload)
 
 

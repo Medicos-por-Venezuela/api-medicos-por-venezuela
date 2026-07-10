@@ -345,6 +345,10 @@ async def test_get_me_desde_doctors(client: AsyncClient, db_session: AsyncSessio
     assert body["cedula"] == "V-90001001"
     assert body["specialty_id"] == str(specialty.id)
     assert body["specialty"] == specialty.name
+    # professional_type: el frontend lo usa para elegir SACS vs FPV en la verificación en vivo.
+    medico_type_id = await _type_id(db_session, "medico")
+    assert body["professional_type_id"] == medico_type_id
+    assert body["professional_type"] == "Médico"
 
 
 async def test_get_me_fallback_a_users(client: AsyncClient, db_session: AsyncSession) -> None:
@@ -361,6 +365,9 @@ async def test_get_me_fallback_a_users(client: AsyncClient, db_session: AsyncSes
     assert body["specialty_id"] is None
     assert body["specialty"] == "Cardiología"
     assert body["license"] == "MPPS-USR-9"
+    # Sin ficha no se conoce el tipo profesional (users no lo almacena).
+    assert body["professional_type_id"] is None
+    assert body["professional_type"] is None
 
 
 async def test_get_me_paciente_404(client: AsyncClient, db_session: AsyncSession) -> None:
@@ -450,10 +457,11 @@ async def test_patch_me_fallback_users_actualiza(
     assert user.medical_license == "MPPS-USR-77"
 
 
-async def test_patch_me_fallback_users_cedula_400(
+async def test_patch_me_user_cedula_sin_tipo_422(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """En la fuente users no hay tipo/cédula que verificar: editarla es 400."""
+    """Sin ficha, enviar cédula sin professional_type_id no permite elegir el registro
+    (SACS/FPV) contra el que verificar: 422."""
     user = make_profile(role="doctor")
     db_session.add(user)
     await db_session.flush()
@@ -462,7 +470,7 @@ async def test_patch_me_fallback_users_cedula_400(
         headers=auth_headers(user.id),
         json={"cedula": "V-90001004"},
     )
-    assert resp.status_code == 400
+    assert resp.status_code == 422
 
 
 async def test_patch_me_rechaza_campos_no_permitidos_422(
@@ -475,6 +483,118 @@ async def test_patch_me_rechaza_campos_no_permitidos_422(
             f"{PREFIX}/doctors/me", headers=auth_headers(user_id), json=forbidden
         )
         assert resp.status_code == 422, f"{forbidden} -> {resp.status_code}"
+
+
+async def test_patch_me_user_completa_ficha_crea_doctor(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Sin ficha (médico de Google): cédula + professional_type_id válidos verifican
+    contra SACS y CREAN la fila en doctors, promoviendo la cuenta a source:"doctor"."""
+    specialty = (await db_session.execute(select(Specialty).limit(1))).scalar_one()
+    user = make_profile(role="doctor")
+    user.email = "google.doc@test.com"
+    user.whatsapp_number = "+584145200799"
+    user.country = "Venezuela"
+    db_session.add(user)
+    await db_session.flush()
+    medico_type_id = await _type_id(db_session, "medico")
+    with _mock_sacs(encontrado=True, es_medico=True):
+        resp = await client.patch(
+            f"{PREFIX}/doctors/me",
+            headers=auth_headers(user.id),
+            json={
+                "cedula": "V-90002001",
+                "professional_type_id": medico_type_id,
+                "full_name": "Dr Google",
+                "license": "MPPS-GOO-1",
+                "specialty_id": str(specialty.id),
+            },
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["source"] == "doctor"
+    assert body["verified"] is True
+    assert body["cedula"] == "V-90002001"
+    assert body["doctor_id"] is not None
+    assert body["professional_type_id"] == medico_type_id
+    assert body["professional_type"] == "Médico"
+    assert body["specialty"] == specialty.name
+
+    # se creó la fila en doctors ligada al usuario, con el contacto tomado de la cuenta
+    doctor = (
+        await db_session.execute(select(Doctor).where(Doctor.user_id == user.id))
+    ).scalar_one()
+    assert doctor.cedula == "V-90002001"
+    assert doctor.phone == "+584145200799"  # tomado de users.whatsapp_number
+    assert doctor.email == "google.doc@test.com"
+    # y se sincronizó de vuelta a users (specialty/license)
+    await db_session.refresh(user)
+    assert user.specialty == specialty.name
+    assert user.medical_license == "MPPS-GOO-1"
+
+
+async def test_patch_me_user_completa_ficha_no_verificada(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Cédula no encontrada en SACS: la ficha se crea igual (como el alta pública),
+    con verified=False; no es un error de cara al cliente."""
+    user = make_profile(role="doctor")
+    db_session.add(user)
+    await db_session.flush()
+    medico_type_id = await _type_id(db_session, "medico")
+    with _mock_sacs(encontrado=False, es_medico=False):
+        resp = await client.patch(
+            f"{PREFIX}/doctors/me",
+            headers=auth_headers(user.id),
+            json={"cedula": "V-90002002", "professional_type_id": medico_type_id},
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["source"] == "doctor"
+    assert body["verified"] is False
+    assert body["doctor_id"] is not None
+
+
+async def test_patch_me_user_cedula_duplicada_409(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """La cédula ya pertenece a otra ficha activa: 409, sin crear duplicado."""
+    await _seed_doctor_with_account(db_session, cedula="V-90002003")
+    user = make_profile(role="doctor")
+    db_session.add(user)
+    await db_session.flush()
+    medico_type_id = await _type_id(db_session, "medico")
+    with _mock_sacs(encontrado=True, es_medico=True):
+        resp = await client.patch(
+            f"{PREFIX}/doctors/me",
+            headers=auth_headers(user.id),
+            json={"cedula": "V-90002003", "professional_type_id": medico_type_id},
+        )
+    assert resp.status_code == 409
+    exists = (
+        await db_session.execute(select(Doctor).where(Doctor.user_id == user.id))
+    ).scalar_one_or_none()
+    assert exists is None
+
+
+async def test_patch_me_doctor_ignora_professional_type_id(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """En una ficha existente el tipo profesional no es auto-editable: enviarlo no
+    falla (el schema lo acepta) pero no cambia el tipo."""
+    user_id, doctor = await _seed_doctor_with_account(db_session, cedula="V-90002004")
+    original_type = doctor.professional_type_id
+    psico_type_id = await _type_id(db_session, "psicologo")
+    resp = await client.patch(
+        f"{PREFIX}/doctors/me",
+        headers=auth_headers(user_id),
+        json={"professional_type_id": psico_type_id, "full_name": "Dr Mismo Tipo"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["full_name"] == "Dr Mismo Tipo"
+    assert body["professional_type_id"] == str(original_type)  # sin cambios
+    assert body["professional_type"] == "Médico"
 
 
 # --- Pool de médicos (GET /doctors/pool) ---
