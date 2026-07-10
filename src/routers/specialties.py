@@ -57,6 +57,22 @@ async def get_catalog() -> SpecialtyCatalogResponse:
     )
 
 
+@router.get(
+    "/admin",
+    response_model=list[SpecialtyResponse],
+    summary="Listar especialidades (admin)",
+    responses=_VALIDATION,
+)
+async def list_specialties_admin(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    _: Principal = Depends(require_permission("catalogs.manage")),
+) -> list[SpecialtyResponse]:
+    """Lista completa para admin: activas + inactivas (no eliminadas)."""
+    return await specialties_service.list_specialties(db, skip=skip, limit=limit)
+
+
 @router.post(
     "",
     response_model=SpecialtyResponse,
