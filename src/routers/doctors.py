@@ -13,9 +13,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
 from src.core.ratelimit import limiter
-from src.core.security import Principal, require_permission
+from src.core.security import Principal, get_current_principal, require_permission
 from src.db.session import get_db
-from src.schemas.doctor import DoctorCreate, DoctorPoolPage, DoctorResponse, DoctorUpdate
+from src.schemas.doctor import (
+    DoctorCreate,
+    DoctorMeResponse,
+    DoctorPoolPage,
+    DoctorResponse,
+    DoctorSelfUpdate,
+    DoctorUpdate,
+)
 from src.services import doctors as doctors_service
 
 router = APIRouter(prefix="/doctors", tags=["doctors"])
@@ -58,6 +65,57 @@ async def register_doctor(
 
     Anti-bot: rate limit por IP + campo honeypot (`website`, debe ir vacío)."""
     return await doctors_service.create_doctor(db, payload)
+
+
+# --- Perfil propio del médico autenticado (self-service) ---
+# Declarados ANTES de "/{doctor_id}" para que "me" no se interprete como UUID.
+
+
+@router.get(
+    "/me",
+    response_model=DoctorMeResponse,
+    summary="Ver mi perfil de médico",
+    responses={404: {"description": "No tienes un perfil de médico."}},
+)
+async def get_my_doctor(
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
+) -> DoctorMeResponse:
+    """Perfil del médico autenticado (identidad tomada del JWT). Devuelve la fila en
+    `doctors`; si no existe (médicos que entraron por Google/`finalize-role`), cae a
+    la cuenta en `users`. IDOR-safe: el recurso sale del token, nunca de la URL."""
+    return await doctors_service.get_my_profile(db, principal.id)
+
+
+@router.patch(
+    "/me",
+    response_model=DoctorMeResponse,
+    summary="Actualizar mi perfil de médico",
+    responses={
+        404: {"description": "No tienes un perfil de médico."},
+        409: {"description": "La cédula ya pertenece a otro médico."},
+        422: {
+            "description": (
+                "Datos inválidos, campos no permitidos (status/verified/email/phone) o "
+                "falta `professional_type_id` para verificar la cédula (cuenta sin ficha)."
+            )
+        },
+    },
+)
+async def update_my_doctor(
+    payload: DoctorSelfUpdate,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
+) -> DoctorMeResponse:
+    """Auto-edición de nombre, licencia, especialidad y cédula.
+
+    - Con ficha (`source:"doctor"`): cambiar la cédula re-verifica contra SACS/FPV y
+      recalcula `verified`. No permite tocar `status`/`verified`/`email`/`phone` ni el
+      tipo profesional.
+    - Sin ficha (`source:"user"`, médico de Google): enviar `cedula` + `professional_type_id`
+      verifica la credencial y **crea** la ficha en `doctors`, promoviendo la cuenta a
+      `source:"doctor"` (`verified` según SACS/FPV)."""
+    return await doctors_service.update_my_profile(db, principal.id, payload)
 
 
 # NOTA: debe ir ANTES de "/{doctor_id}" o FastAPI intenta parsear "pool" como UUID (422).
