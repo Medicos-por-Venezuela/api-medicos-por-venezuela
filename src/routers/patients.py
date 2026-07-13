@@ -71,9 +71,11 @@ async def update_patient(
     patient_id: uuid.UUID,
     payload: PatientUpdate,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("patients.write")),
+    principal: Principal = Depends(require_permission("patients.write")),
 ) -> PatientResponse:
-    return await patients_service.update_patient(db, patient_id, payload)
+    return await patients_service.update_patient(
+        db, patient_id, payload, actor_user_id=principal.id
+    )
 
 
 @router.delete(
@@ -85,6 +87,6 @@ async def update_patient(
 async def delete_patient(
     patient_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("patients.delete")),
+    principal: Principal = Depends(require_permission("patients.delete")),
 ) -> None:
-    await patients_service.delete_patient(db, patient_id)
+    await patients_service.delete_patient(db, patient_id, actor_user_id=principal.id)

@@ -18,6 +18,7 @@ from src.models.patient import Patient
 from src.models.specialty import Specialty
 from src.schemas.consultation import ConsultationCreate, ConsultationUpdate
 from src.schemas.consultation_event import ConsultationEventCreate
+from src.services import audit
 from src.services.jitsi import new_room_url
 from src.services.specialties import compute_priority
 
@@ -124,6 +125,14 @@ async def close_consultation(
         note=note,
     )
     session.add(event)
+    await audit.log_action(
+        session,
+        action="consultation.closed",
+        actor_user_id=closed_by,
+        resource="consultations",
+        resource_id=consultation_id,
+        metadata={"outcome": outcome},
+    )
     await session.commit()
     await session.refresh(consultation)
     return consultation
@@ -155,19 +164,40 @@ async def ensure_video_room(session: AsyncSession, consultation_id: uuid.UUID) -
 
 
 async def update_consultation(
-    session: AsyncSession, consultation_id: uuid.UUID, data: ConsultationUpdate
+    session: AsyncSession,
+    consultation_id: uuid.UUID,
+    data: ConsultationUpdate,
+    actor_user_id: uuid.UUID | None = None,
 ) -> Consultation:
     _validate_status(data.status)
     consultation = await get_consultation(session, consultation_id)
-    for field, value in data.model_dump(exclude_unset=True).items():
+    changes = data.model_dump(exclude_unset=True)
+    for field, value in changes.items():
         setattr(consultation, field, value)
+    await audit.log_action(
+        session,
+        action="consultation.updated",
+        actor_user_id=actor_user_id,
+        resource="consultations",
+        resource_id=consultation_id,
+        metadata={"fields": sorted(changes)},
+    )
     await session.commit()
     await session.refresh(consultation)
     return consultation
 
 
-async def delete_consultation(session: AsyncSession, consultation_id: uuid.UUID) -> None:
+async def delete_consultation(
+    session: AsyncSession, consultation_id: uuid.UUID, deleted_by: uuid.UUID | None = None
+) -> None:
     consultation = await get_consultation(session, consultation_id)
+    await audit.log_action(
+        session,
+        action="consultation.deleted",
+        actor_user_id=deleted_by,
+        resource="consultations",
+        resource_id=consultation_id,
+    )
     await session.delete(consultation)
     await session.commit()
 

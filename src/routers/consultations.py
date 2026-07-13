@@ -118,9 +118,11 @@ async def update_consultation(
     consultation_id: uuid.UUID,
     payload: ConsultationUpdate,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("consultations.write")),
+    principal: Principal = Depends(require_permission("consultations.write")),
 ) -> ConsultationResponse:
-    return await consultations_service.update_consultation(db, consultation_id, payload)
+    return await consultations_service.update_consultation(
+        db, consultation_id, payload, actor_user_id=principal.id
+    )
 
 
 @router.delete(
@@ -132,9 +134,9 @@ async def update_consultation(
 async def delete_consultation(
     consultation_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("consultations.delete")),
+    principal: Principal = Depends(require_permission("consultations.delete")),
 ) -> None:
-    await consultations_service.delete_consultation(db, consultation_id)
+    await consultations_service.delete_consultation(db, consultation_id, deleted_by=principal.id)
 
 
 # --- Acciones de negocio (cierre, presencia, videoconsulta) ---

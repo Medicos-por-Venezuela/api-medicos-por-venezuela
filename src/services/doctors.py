@@ -9,19 +9,28 @@ queda en True solo si la cédula es válida en ese registro; en cualquier otro c
 import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
-from src.core.errors import BadRequestError, NotFoundError
+from src.core.errors import BadRequestError, ConflictError, NotFoundError, UnprocessableError
 from src.models.doctor import Doctor
 from src.models.professional_type import ProfessionalType
 from src.models.profile import Profile
 from src.models.specialty import Specialty
-from src.schemas.doctor import DoctorCreate, DoctorUpdate
+from src.schemas.doctor import DoctorCreate, DoctorMeResponse, DoctorSelfUpdate, DoctorUpdate
+from src.services import audit
 from src.services import psicologo as psicologo_service
 from src.services import sacs as sacs_service
+
+# Roles de `users` que corresponden a un médico (legacy `specialist` -> doctor).
+_DOCTOR_PROFILE_ROLES = {"doctor", "specialist"}
+
+# Un médico cuenta como "online" si marcó presencia hace menos de esto (igual criterio
+# que el panel/admin del frontend: last_seen_at < 3 min).
+_ONLINE_WINDOW = timedelta(minutes=3)
 
 
 def _normalize(text: str) -> str:
@@ -108,6 +117,74 @@ async def list_doctors(
     return list(result.scalars().all())
 
 
+async def list_doctor_pool(
+    session: AsyncSession,
+    *,
+    skip: int = 0,
+    limit: int = 20,
+    specialty_id: uuid.UUID | None = None,
+    professional_type_id: uuid.UUID | None = None,
+    online: bool | None = None,
+    exclude_user_id: uuid.UUID | None = None,
+) -> tuple[list[dict], int]:
+    """Pool de médicos para referir/agendar: cruza doctors con users (para el estado
+    online desde last_seen_at y el teléfono de contacto) y pagina. Devuelve (filas, total).
+
+    Solo médicos que pueden atender: status == 1 (excluye baja=0 y expulsado=2) y no
+    borrados. El inner join con users descarta los mocks legacy sin user_id. `online`:
+    True = logeado (< 3 min), False = offline, None = todos. Ordena los online primero.
+    `exclude_user_id`: quita al propio médico que consulta (no se refiere a sí mismo).
+    """
+    threshold = datetime.now(UTC) - _ONLINE_WINDOW
+    online_expr = Profile.last_seen_at >= threshold
+    # Teléfono para el enlace de WhatsApp: el de doctors o, si falta, el whatsapp de la cuenta.
+    phone_expr = func.coalesce(Doctor.phone, Profile.whatsapp_number)
+
+    base = (
+        select(
+            Doctor.id,
+            Doctor.full_name,
+            Doctor.specialty_id,
+            Doctor.professional_type_id,
+            phone_expr.label("phone"),
+            online_expr.label("online"),
+        )
+        .join(Profile, Doctor.user_id == Profile.id)
+        .where(Doctor.deleted_at.is_(None), Doctor.status == 1)
+    )
+    if exclude_user_id is not None:
+        base = base.where(Doctor.user_id != exclude_user_id)
+    if specialty_id is not None:
+        base = base.where(Doctor.specialty_id == specialty_id)
+    if professional_type_id is not None:
+        base = base.where(Doctor.professional_type_id == professional_type_id)
+    if online is True:
+        base = base.where(online_expr)
+    elif online is False:
+        base = base.where(or_(Profile.last_seen_at.is_(None), Profile.last_seen_at < threshold))
+
+    total = await session.scalar(select(func.count()).select_from(base.subquery())) or 0
+
+    page = (
+        base.order_by(Profile.last_seen_at.desc().nulls_last(), Doctor.full_name)
+        .offset(skip)
+        .limit(limit)
+    )
+    rows = (await session.execute(page)).all()
+    items = [
+        {
+            "id": r.id,
+            "full_name": r.full_name,
+            "specialty_id": r.specialty_id,
+            "professional_type_id": r.professional_type_id,
+            "phone": r.phone,
+            "online": bool(r.online),
+        }
+        for r in rows
+    ]
+    return items, total
+
+
 async def get_doctor(session: AsyncSession, doctor_id: uuid.UUID) -> Doctor:
     doctor = await session.get(Doctor, doctor_id)
     if doctor is None or doctor.deleted_at is not None:
@@ -136,18 +213,246 @@ async def create_doctor(session: AsyncSession, data: DoctorCreate) -> Doctor:
     return doctor
 
 
-async def update_doctor(session: AsyncSession, doctor_id: uuid.UUID, data: DoctorUpdate) -> Doctor:
+async def update_doctor(
+    session: AsyncSession,
+    doctor_id: uuid.UUID,
+    data: DoctorUpdate,
+    actor_user_id: uuid.UUID | None = None,
+) -> Doctor:
     doctor = await get_doctor(session, doctor_id)
-    for field, value in data.model_dump(exclude_unset=True).items():
+    changes = data.model_dump(exclude_unset=True)
+    for field, value in changes.items():
         setattr(doctor, field, value)
     await _sync_user_from_doctor(session, doctor)
+    await audit.log_action(
+        session,
+        action="doctor.updated",
+        actor_user_id=actor_user_id,
+        resource="doctors",
+        resource_id=doctor.id,
+        metadata={"fields": sorted(changes)},
+    )
     await session.commit()
     await session.refresh(doctor)
     return doctor
 
 
-async def delete_doctor(session: AsyncSession, doctor_id: uuid.UUID) -> None:
+async def delete_doctor(
+    session: AsyncSession, doctor_id: uuid.UUID, actor_user_id: uuid.UUID | None = None
+) -> None:
     """Baja lógica (soft delete): marca deleted_at, no borra la fila."""
     doctor = await get_doctor(session, doctor_id)
     doctor.deleted_at = func.now()
+    await audit.log_action(
+        session,
+        action="doctor.deleted",
+        actor_user_id=actor_user_id,
+        resource="doctors",
+        resource_id=doctor.id,
+    )
     await session.commit()
+
+
+# --- Perfil propio del médico (self-service) ---------------------------------
+# El recurso se resuelve SIEMPRE desde el `user_id` del JWT (nunca de la URL/payload),
+# así que es IDOR-safe por construcción: nadie puede leer/editar el perfil de otro.
+
+
+async def _specialty_name(session: AsyncSession, specialty_id: uuid.UUID | None) -> str | None:
+    if specialty_id is None:
+        return None
+    return await session.scalar(select(Specialty.name).where(Specialty.id == specialty_id))
+
+
+async def _professional_type_name(
+    session: AsyncSession, professional_type_id: uuid.UUID | None
+) -> str | None:
+    if professional_type_id is None:
+        return None
+    return await session.scalar(
+        select(ProfessionalType.name).where(ProfessionalType.id == professional_type_id)
+    )
+
+
+async def _assert_cedula_available(
+    session: AsyncSession, cedula: str, *, exclude_doctor_id: uuid.UUID | None = None
+) -> None:
+    """La cédula no puede pertenecer a otra ficha activa (mismo criterio que el índice
+    único parcial `uq_doctors_cedula_not_deleted`). Se comprueba antes de escribir para
+    devolver un 409 con mensaje de dominio en vez del error de integridad genérico."""
+    stmt = select(Doctor.id).where(Doctor.cedula == cedula, Doctor.deleted_at.is_(None))
+    if exclude_doctor_id is not None:
+        stmt = stmt.where(Doctor.id != exclude_doctor_id)
+    if (await session.execute(stmt)).scalar_one_or_none() is not None:
+        raise ConflictError("La cédula ya pertenece a otro médico.")
+
+
+async def _my_doctor_row(session: AsyncSession, user_id: uuid.UUID) -> Doctor | None:
+    """Fila `doctors` ligada a la cuenta (1:1), si existe y no está borrada."""
+    stmt = (
+        select(Doctor)
+        .where(Doctor.user_id == user_id, Doctor.deleted_at.is_(None))
+        .order_by(Doctor.created_at.desc())
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def _my_doctor_profile(session: AsyncSession, user_id: uuid.UUID) -> Profile:
+    """Cuenta (`users`) del llamante, solo si es un médico. 404 en caso contrario
+    (un paciente/admin sin fila en `doctors` no tiene 'perfil de médico')."""
+    profile = await session.get(Profile, user_id)
+    if profile is None or profile.role not in _DOCTOR_PROFILE_ROLES:
+        raise NotFoundError("No tienes un perfil de médico.")
+    return profile
+
+
+def _me_from_doctor(
+    user_id: uuid.UUID,
+    doctor: Doctor,
+    specialty_name: str | None,
+    professional_type_name: str | None,
+) -> DoctorMeResponse:
+    return DoctorMeResponse(
+        source="doctor",
+        user_id=user_id,
+        doctor_id=doctor.id,
+        cedula=doctor.cedula,
+        full_name=doctor.full_name,
+        license=doctor.license,
+        specialty_id=doctor.specialty_id,
+        specialty=specialty_name,
+        professional_type_id=doctor.professional_type_id,
+        professional_type=professional_type_name,
+        verified=doctor.verified,
+    )
+
+
+async def _me_from_doctor_row(
+    session: AsyncSession, user_id: uuid.UUID, doctor: Doctor
+) -> DoctorMeResponse:
+    """`_me_from_doctor` resolviendo los nombres de especialidad y tipo profesional."""
+    return _me_from_doctor(
+        user_id,
+        doctor,
+        await _specialty_name(session, doctor.specialty_id),
+        await _professional_type_name(session, doctor.professional_type_id),
+    )
+
+
+def _me_from_profile(profile: Profile) -> DoctorMeResponse:
+    return DoctorMeResponse(
+        source="user",
+        user_id=profile.id,
+        doctor_id=None,
+        cedula=None,  # users no guarda cédula
+        full_name=profile.full_name,
+        license=profile.medical_license,
+        specialty_id=None,  # users guarda el nombre de la especialidad, no el id
+        specialty=profile.specialty,
+        verified=profile.verified,
+    )
+
+
+async def get_my_profile(session: AsyncSession, user_id: uuid.UUID) -> DoctorMeResponse:
+    """Perfil del médico autenticado. Prefiere la fila en `doctors`; si no existe,
+    cae a su cuenta en `users` (médicos que entraron por Google/`finalize-role`)."""
+    doctor = await _my_doctor_row(session, user_id)
+    if doctor is not None:
+        return await _me_from_doctor_row(session, user_id, doctor)
+    return _me_from_profile(await _my_doctor_profile(session, user_id))
+
+
+async def _update_my_doctor_row(
+    session: AsyncSession, user_id: uuid.UUID, doctor: Doctor, data: DoctorSelfUpdate
+) -> DoctorMeResponse:
+    fields = data.model_dump(exclude_unset=True)
+    # El tipo profesional no es auto-editable en una ficha existente (solo se usa al
+    # crearla desde una cuenta sin ficha); se ignora si viene en el payload.
+    fields.pop("professional_type_id", None)
+    new_cedula = fields.pop("cedula", None)
+    for field, value in fields.items():
+        setattr(doctor, field, value)
+    # Cambiar la cédula re-verifica contra el registro oficial de su tipo y
+    # recalcula `verified` (fail-closed si ya no valida).
+    if new_cedula is not None and new_cedula != doctor.cedula:
+        await _assert_cedula_available(session, new_cedula, exclude_doctor_id=doctor.id)
+        doctor.cedula = new_cedula
+        doctor.verified = await _verify_credential(
+            session, doctor.professional_type_id, new_cedula
+        )
+    await _sync_user_from_doctor(session, doctor)
+    await session.commit()
+    await session.refresh(doctor)
+    return await _me_from_doctor_row(session, user_id, doctor)
+
+
+async def _complete_registration_from_user(
+    session: AsyncSession, profile: Profile, data: DoctorSelfUpdate
+) -> DoctorMeResponse:
+    """Una cuenta sin ficha (`source:"user"`, médico de Google) completa su registro:
+    verifica la cédula contra el registro oficial de su tipo (SACS/FPV) y **crea** la
+    fila en `doctors`, promoviéndola a `source:"doctor"`.
+
+    `professional_type_id` es obligatorio (elige el registro); sin él no se puede
+    verificar (422). `verified` refleja el resultado del registro (True si la cédula es
+    válida, False si no se encuentra o el servicio falla) — igual que el alta pública,
+    la ficha se crea de todos modos y el frontend muestra el estado por `verified`."""
+    fields = data.model_dump(exclude_unset=True)
+    professional_type_id = fields.get("professional_type_id")
+    if professional_type_id is None:
+        raise UnprocessableError("Indica el tipo de profesional para verificar tu cédula.")
+    cedula = fields["cedula"]  # el caller garantiza que viene
+    await _assert_cedula_available(session, cedula)
+    verified = await _verify_credential(session, professional_type_id, cedula)
+    doctor = Doctor(
+        user_id=profile.id,
+        professional_type_id=professional_type_id,
+        specialty_id=fields.get("specialty_id"),
+        cedula=cedula,
+        full_name=fields.get("full_name") or profile.full_name,
+        license=fields.get("license", profile.medical_license),
+        phone=profile.whatsapp_number,
+        email=profile.email,
+        country_of_residence=profile.country,
+        verified=verified,
+    )
+    session.add(doctor)
+    await session.flush()
+    await _sync_user_from_doctor(session, doctor)
+    await session.commit()
+    await session.refresh(doctor)
+    return await _me_from_doctor_row(session, profile.id, doctor)
+
+
+async def _update_my_profile_row(
+    session: AsyncSession, user_id: uuid.UUID, data: DoctorSelfUpdate
+) -> DoctorMeResponse:
+    profile = await _my_doctor_profile(session, user_id)
+    fields = data.model_dump(exclude_unset=True)
+    # Completar/verificar la cédula = crear la ficha en `doctors` (promoción a source:"doctor").
+    if fields.get("cedula") is not None:
+        return await _complete_registration_from_user(session, profile, data)
+    # Sin cédula: solo edición de los campos que viven en `users` (professional_type_id,
+    # que users no almacena, se ignora aquí).
+    if fields.get("full_name") is not None:
+        profile.full_name = fields["full_name"]
+    if "license" in fields:
+        profile.medical_license = fields["license"]
+    if "specialty_id" in fields:
+        profile.specialty = await _specialty_name(session, fields["specialty_id"])
+    await session.commit()
+    await session.refresh(profile)
+    return _me_from_profile(profile)
+
+
+async def update_my_profile(
+    session: AsyncSession, user_id: uuid.UUID, data: DoctorSelfUpdate
+) -> DoctorMeResponse:
+    """Auto-edición del perfil propio. Sobre la fila `doctors` cambiar la cédula
+    re-verifica SACS/FPV; una cuenta sin ficha que envía `cedula` + `professional_type_id`
+    la verifica y crea su ficha (promoción a `source:"doctor"`)."""
+    doctor = await _my_doctor_row(session, user_id)
+    if doctor is not None:
+        return await _update_my_doctor_row(session, user_id, doctor, data)
+    return await _update_my_profile_row(session, user_id, data)
