@@ -10,7 +10,7 @@ from sqlalchemy import Row, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
-from src.core.errors import ConflictError, NotFoundError, UnprocessableError
+from src.core.errors import ConflictError, ForbiddenError, NotFoundError, UnprocessableError
 from src.models.profile import Profile
 from src.models.rbac import Role, UserRole
 from src.services import audit
@@ -48,8 +48,18 @@ async def _get_role(session: AsyncSession, code: str) -> Role:
 
 
 async def assign_role(
-    session: AsyncSession, user_id: uuid.UUID, role_code: str, actor_user_id: uuid.UUID
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    role_code: str,
+    actor_user_id: uuid.UUID,
+    actor_roles: frozenset[str],
 ) -> tuple[UserRole, Role]:
+    # Único punto de aplicación del guard: otorgar 'super_admin' exige que el actor YA
+    # sea super_admin, sin importar si además tiene 'roles.assign'. Va antes de cualquier
+    # lectura/escritura para no dejar fila ni audit de un intento denegado.
+    if role_code == "super_admin" and "super_admin" not in actor_roles:
+        raise ForbiddenError("Solo un super_admin puede otorgar el rol super_admin.")
+
     if await session.get(Profile, user_id) is None:
         raise NotFoundError("Usuario no encontrado.")
     role = await _get_role(session, role_code)
@@ -82,19 +92,32 @@ async def assign_role(
 
 
 async def revoke_role(
-    session: AsyncSession, user_id: uuid.UUID, role_id: uuid.UUID, actor_user_id: uuid.UUID
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    role_id: uuid.UUID,
+    actor_user_id: uuid.UUID,
+    actor_roles: frozenset[str],
 ) -> None:
-    user_role = (
+    row = (
         await session.execute(
-            select(UserRole).where(
+            select(UserRole, Role)
+            .join(Role, Role.id == UserRole.role_id)
+            .where(
                 UserRole.user_id == user_id,
                 UserRole.role_id == role_id,
                 UserRole.revoked_at.is_(None),
             )
         )
-    ).scalar_one_or_none()
-    if user_role is None:
+    ).one_or_none()
+    if row is None:
         raise NotFoundError("El usuario no tiene ese rol activo.")
+    user_role, role = row
+
+    # Mismo guard que assign_role: revocar 'super_admin' exige que el actor YA
+    # sea super_admin, para que ningún admin plano pueda des-escalar (o
+    # auto-blindarse) a un super_admin solo con 'roles.assign'.
+    if role.code == "super_admin" and "super_admin" not in actor_roles:
+        raise ForbiddenError("Solo un super_admin puede revocar el rol super_admin.")
 
     user_role.revoked_at = func.now()
     await audit.log_action(

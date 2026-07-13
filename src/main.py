@@ -31,6 +31,7 @@ logger = logging.getLogger("mpv.api")
 
 _IS_PROD = settings.ENVIRONMENT == "production"
 _INSECURE_JWT_DEFAULT = "dev-insecure-jwt-secret-change-me"
+_INSECURE_SERVICE_ROLE_DEFAULT = "dev-insecure-service-role-key-change-me"
 
 
 @asynccontextmanager
@@ -40,6 +41,11 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
         raise RuntimeError(
             "SUPABASE_JWT_SECRET tiene el valor por defecto inseguro. "
             "Configúralo en producción (Supabase → Settings → API → JWT Secret)."
+        )
+    if _IS_PROD and settings.SUPABASE_SERVICE_ROLE_KEY == _INSECURE_SERVICE_ROLE_DEFAULT:
+        raise RuntimeError(
+            "SUPABASE_SERVICE_ROLE_KEY tiene el valor por defecto inseguro. "
+            "Configúralo en producción (Supabase → Settings → API → service_role key)."
         )
     yield
 

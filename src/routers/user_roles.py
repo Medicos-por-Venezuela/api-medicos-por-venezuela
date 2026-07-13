@@ -63,7 +63,11 @@ async def list_user_roles(
     response_model=UserRoleResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Asignar un rol a un usuario",
-    responses={**_NOT_FOUND, 409: {"description": "El usuario ya tiene ese rol."}},
+    responses={
+        **_NOT_FOUND,
+        403: {"description": "Solo un super_admin puede otorgar el rol super_admin."},
+        409: {"description": "El usuario ya tiene ese rol."},
+    },
 )
 async def assign_role(
     user_id: uuid.UUID,
@@ -71,9 +75,14 @@ async def assign_role(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(_require_manage),
 ) -> UserRoleResponse:
-    """Asigna `role_code` al usuario (multi-rol: puede tener varios). Auditado."""
+    """Asigna `role_code` al usuario (multi-rol: puede tener varios). Auditado.
+
+    Otorgar `super_admin` exige que el propio actor ya sea `super_admin`
+    (ver `assign_role` en `services/user_roles.py`), incluso si el actor tiene
+    `roles.assign` por otro rol (p. ej. un `admin` plano).
+    """
     user_role, role = await user_roles_service.assign_role(
-        db, user_id, payload.role_code, principal.id
+        db, user_id, payload.role_code, actor_user_id=principal.id, actor_roles=principal.roles
     )
     return UserRoleResponse(
         id=user_role.id,
@@ -88,7 +97,10 @@ async def assign_role(
     "/users/{user_id}/roles/{role_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Revocar un rol de un usuario",
-    responses=_NOT_FOUND,
+    responses={
+        **_NOT_FOUND,
+        403: {"description": "Solo un super_admin puede revocar el rol super_admin."},
+    },
 )
 async def revoke_role(
     user_id: uuid.UUID,
@@ -96,5 +108,10 @@ async def revoke_role(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(_require_manage),
 ) -> None:
-    """Revoca (soft) el rol; conserva el historial en user_roles. Auditado."""
-    await user_roles_service.revoke_role(db, user_id, role_id, principal.id)
+    """Revoca (soft) el rol; conserva el historial en user_roles. Auditado.
+
+    Revocar `super_admin` exige que el propio actor ya sea `super_admin`
+    (mismo guard simétrico que `assign_role`), incluso si el actor tiene
+    `roles.assign` por otro rol (p. ej. un `admin` plano).
+    """
+    await user_roles_service.revoke_role(db, user_id, role_id, principal.id, principal.roles)

@@ -65,6 +65,14 @@ class Settings(BaseSettings):
     # Si no se define, solo se valida HS256 con SUPABASE_JWT_SECRET (comportamiento de siempre).
     SUPABASE_JWKS_URL: str | None = None
 
+    # --- Supabase Admin API (creación de usuarios de Auth) ---
+    # Base URL del proyecto Supabase (local: el gateway del CLI; prod: el proyecto real).
+    # El service-role key da acceso admin total (bypassa RLS): NUNCA se loguea y solo lo
+    # usa `src/services/users.py`. En producción es OBLIGATORIO definirlo por entorno; el
+    # valor por defecto es solo para desarrollo/pruebas locales.
+    SUPABASE_URL: str = "http://127.0.0.1:54321"
+    SUPABASE_SERVICE_ROLE_KEY: str = "dev-insecure-service-role-key-change-me"
+
     # --- Resiliencia de la cola ---
     # Minutos tras los cuales una consulta 'in_progress' sin cerrar se considera
     # estancada y se devuelve a 'waiting' (la libera para otro médico).

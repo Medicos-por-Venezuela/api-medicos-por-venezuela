@@ -19,3 +19,16 @@ class BadRequestError(ValueError):
 
 class UnprocessableError(ValueError):
     """Datos sintácticamente válidos pero semánticamente inválidos. -> HTTP 422."""
+
+
+class ForbiddenError(Exception):
+    """Acción prohibida por una regla de autorización de negocio (no de permiso base).
+    -> HTTP 403. Distinta de un 403 de `require_permission`: esta se lanza desde la capa
+    de servicios cuando la regla depende del estado del recurso o del actor (p. ej. solo
+    un super_admin puede otorgar super_admin), no de la sola posesión de un permiso.
+    """
+
+
+class UpstreamServiceError(Exception):
+    """Un servicio externo (p. ej. Supabase Admin API) falló o es inalcanzable.
+    -> HTTP 502. Nunca debe llevar el cuerpo de la respuesta upstream ni secretos."""

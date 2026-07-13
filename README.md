@@ -381,6 +381,11 @@ uv run uvicorn src.main:app --reload      # http://localhost:8000
 - **Producción:** `.env.supabase` (ignorado por git) o el gestor de secretos del hosting.
   ⚠️ `SUPABASE_JWT_SECRET` es **obligatorio** en producción (Supabase → Settings → API → JWT Secret);
   el valor por defecto del código es solo para desarrollo/pruebas.
+- `SUPABASE_URL` (URL del proyecto; local: `http://127.0.0.1:54321`, el gateway del CLI) y
+  `SUPABASE_SERVICE_ROLE_KEY` (Supabase → Settings → API → `service_role` **secret**) los usa
+  **exclusivamente** `src/services/users.py` para crear usuarios de Auth vía la Admin API
+  (`POST /users`). Igual que `SUPABASE_JWT_SECRET`: **obligatorio** en producción, nunca se
+  loguea, el valor por defecto del código es solo para desarrollo/pruebas.
 
 ## Autenticación y autorización (RBAC granular)
 
@@ -404,7 +409,7 @@ users (profiles) ──< user_roles >── roles ──< role_permissions >─�
 | --- | --- |
 | `patient` | ninguno de staff (solo ve **lo suyo** por pertenencia) |
 | `doctor` | `consultations.read/write/close`, `queue.read/take`, `patients.read`, `doctors.read` |
-| `admin` | todo lo de doctor + `patients.write/delete`, `consultations.delete`, `queue.manage`, `doctors.write/verify`, `profiles.read/manage`, `catalogs.manage`, `roles.assign`, `audit.read` |
+| `admin` | todo lo de doctor + `patients.write/delete`, `consultations.delete`, `queue.manage`, `doctors.write/verify`, `profiles.read/manage`, `catalogs.manage`, `roles.assign`, `audit.read`, `users.create` |
 | `super_admin` | **todos** los permisos |
 
 **Cómo se protege un endpoint** (una línea): `Depends(require_permission("recurso.accion"))` → 403 si
@@ -419,6 +424,11 @@ falta el permiso. Se autoriza por **permiso**, no por rol.
   el registro del sitio); el resto del CRUD exige `catalogs.manage` (admin/super_admin).
 - **Auditoría:** las acciones sensibles se registran en `audit_log` (append-only, **inmutable** por
   trigger). Se leen con `GET /audit-log` (permiso `audit.read`).
+- **Otorgar `super_admin` exige un actor `super_admin`:** `assign_role` (usado tanto por
+  `POST /users/{id}/roles` como por el `initial_role` de `POST /users`) rechaza con `403`
+  otorgar `super_admin` si el propio actor no lo tiene ya, aunque tenga `roles.assign` por otro
+  rol (p. ej. un `admin` plano). `POST /users` además bloquea `super_admin` como `initial_role`
+  con `422` para **cualquier** actor (restricción de creación independiente del guard anterior).
 
 **Agregar un permiso nuevo:** siémbralo en una migración (`permissions` + `role_permissions`) y
 protege el endpoint con `require_permission("...")`. Nunca lo insertes a mano.
@@ -459,8 +469,9 @@ protege el endpoint con `require_permission("...")`. Nunca lo insertes a mano.
 | `GET`   | `/profiles/{id}`                    | Detalle de perfil                    |
 | `GET`   | `/roles`                            | Catálogo de roles (`roles.assign`)   |
 | `GET`   | `/users/{id}/roles`                 | Roles activos de un usuario (`roles.assign`) |
-| `POST`  | `/users/{id}/roles`                 | Asignar rol (auditado; `roles.assign`) |
+| `POST`  | `/users/{id}/roles`                 | Asignar rol (auditado; `roles.assign`; otorgar `super_admin` exige actor `super_admin`) |
 | `DELETE`| `/users/{id}/roles/{role_id}`       | Revocar rol (soft, auditado; `roles.assign`) |
+| `POST`  | `/users`                            | Crear usuario de Auth + rol inicial opcional (auditado; `users.create`) |
 | `GET`   | `/audit-log?action=&actor_user_id=&resource=` | Registro de auditoría (`audit.read`) |
 
 ## Concurrencia: toma de cola anti-colisión
