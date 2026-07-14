@@ -1,9 +1,11 @@
 """Pruebas de autenticación (JWT de Supabase) y autorización (RBAC + IDOR)."""
 
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.profile import Profile
+from src.models.rbac import Role, UserRole
 from tests._helpers import auth_headers, make_profile
 
 PREFIX = "/api/v1"
@@ -47,6 +49,29 @@ async def test_auth_me(client: AsyncClient, admin_identity: Profile) -> None:
     assert resp.status_code == 200
     assert resp.json()["id"] == str(admin_identity.id)
     assert resp.json()["role"] == "admin"
+    assert "admin" in resp.json()["roles"]
+
+
+async def test_auth_me_dual_expone_rol_efectivo_super_admin(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """La fuente de verdad del rol es user_roles (RBAC), no la columna legada users.role:
+    un dual con rol principal 'doctor' + super_admin asignado después debe presentarse como
+    super_admin en /auth/me, con la lista completa en `roles`."""
+    dual = make_profile(role="doctor")  # el trigger de sync agrega 'doctor' a user_roles
+    db_session.add(dual)
+    await db_session.flush()
+    # super_admin ADICIONAL directo en user_roles (otorgarlo vía API exige un super_admin
+    # caller y el client del fixture es admin — aquí probamos /auth/me, no el otorgamiento).
+    super_admin_id = (
+        await db_session.execute(select(Role.id).where(Role.code == "super_admin"))
+    ).scalar_one()
+    db_session.add(UserRole(user_id=dual.id, role_id=super_admin_id))
+    await db_session.flush()
+
+    body = (await client.get(f"{PREFIX}/auth/me", headers=auth_headers(dual.id))).json()
+    assert body["role"] == "super_admin"  # el efectivo más alto, no el legado 'doctor'
+    assert set(body["roles"]) >= {"doctor", "super_admin"}
 
 
 async def test_auth_me_admin_puro_no_es_medico(

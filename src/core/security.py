@@ -27,6 +27,16 @@ logger = logging.getLogger("mpv.api")
 STAFF_ROLES = {"doctor", "admin", "super_admin"}
 ADMIN_ROLES = {"admin", "super_admin"}
 
+# Prioridad para colapsar el multi-rol a UN rol "efectivo" (el más alto gana): lo usa
+# /auth/me para que un dual doctor+super_admin se presente como super_admin, aunque el
+# `users.role` legado diga otra cosa. La fuente de verdad es user_roles, no esa columna.
+_ROLE_PRIORITY = ("super_admin", "admin", "doctor", "specialist", "patient")
+
+
+def effective_role(roles: frozenset[str]) -> str | None:
+    """El rol de mayor prioridad del set RBAC efectivo, o None si el set está vacío."""
+    return next((r for r in _ROLE_PRIORITY if r in roles), None)
+
 # auto_error=False: gestionamos nosotros el 401 (mensaje uniforme).
 _bearer = HTTPBearer(auto_error=False)
 
