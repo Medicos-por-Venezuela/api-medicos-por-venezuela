@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import NotFoundError
-from src.core.security import Principal, get_current_principal
+from src.core.security import Principal, effective_role, get_current_principal
 from src.db.session import get_db
 from src.schemas.auth import PrincipalPermissionsResponse
 from src.schemas.profile import ProfileResponse
@@ -29,9 +29,16 @@ async def me(
 ) -> ProfileResponse:
     """Perfil del titular del JWT (reemplaza getSession + cargar profile). Incluye el contexto de
     médico (`has_doctor_profile`/`doctor_cedula`), con la MISMA lógica que `/doctors/me`, para que
-    el panel decida el redirect sin una segunda llamada."""
+    el panel decida el redirect sin una segunda llamada.
+
+    `role` = el rol EFECTIVO más alto del RBAC (`user_roles`; un dual doctor+super_admin se
+    presenta como super_admin) y `roles` = la lista completa. La columna `users.role` es un
+    único valor legado — el Principal ya trae los roles reales (con fallback al legado para
+    cuentas sin filas RBAC), así que esto no agrega queries."""
     profile = await profiles_service.get_profile(db, principal.id)
     resp = ProfileResponse.model_validate(profile)
+    resp.roles = sorted(principal.roles)
+    resp.role = effective_role(principal.roles) or resp.role
     try:
         doctor_me = await doctors_service.get_my_profile(db, principal.id)
         resp.has_doctor_profile = True
