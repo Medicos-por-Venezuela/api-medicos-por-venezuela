@@ -227,7 +227,7 @@ async def get_panel(
     (`selectinload`) para el card de cada fila."""
     waiting_stmt = (
         select(Consultation)
-        .options(selectinload(Consultation.patient))
+        .options(selectinload(Consultation.patient), selectinload(Consultation.specialty_ref))
         .where(
             Consultation.assigned_doctor_id.is_(None),
             Consultation.status.in_(_PANEL_WAITING_STATUSES),
@@ -236,7 +236,7 @@ async def get_panel(
     )
     mine_stmt = (
         select(Consultation)
-        .options(selectinload(Consultation.patient))
+        .options(selectinload(Consultation.patient), selectinload(Consultation.specialty_ref))
         .where(
             Consultation.assigned_doctor_id == doctor_user_id,
             Consultation.status.in_(_PANEL_MINE_STATUSES),

@@ -199,6 +199,8 @@ class PanelConsultationItem(BaseModel):
     status: str
     priority: str
     category: str | None = None
+    # Nombre de la especialidad solicitada (specialty_id resuelta): con esto matchea el médico.
+    specialty: str | None = None
     chief_complaint: str | None = None
     referred_specialty: str | None = None
     video_room_url: str | None = None

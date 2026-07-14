@@ -21,16 +21,25 @@ Selección del próximo caso ("Atender al siguiente"), en orden:
 - Campos al tomar: `status='in_progress'`, `assigned_doctor_id`, `opened_at` (no pisar si existe),
   `attended_via_whatsapp` (claim).
 
-## 2. Matching de especialidades (`lib/utils.ts`) — PORTAR EXACTO
-`SPECIALTY_NEEDS`: `Medicina general` y `Otra` cubren `['*']` (todo). El resto cubre necesidades
-específicas. `RESERVED_NEEDS = { 'Apoyo emocional': ['Psicología','Psiquiatría'], 'Crisis de ansiedad': ['Psicología','Psiquiatría'] }`.
+## 2. Matching de especialidades — por `consultations.specialty_id` (2026-07-14)
+**La columna del match es `specialty_id`**: el registro del paciente ahora pide la especialidad y
+SIEMPRE la setea (menores → Pediatría; sin elección → Medicina general). El backend resuelve el
+nombre (join a `specialties`) y matchea contra la especialidad del médico. El admin re-rutea un
+caso editando esa columna (Gestionar caso).
 
-- `matchesSpecialty(spec, category, needs)`: true si `SPECIALTY_NEEDS[spec]` incluye `'*'` o alguno
-  de `[category, ...needs]`.
-- `canAttend(spec, category, needs)` (separación dura, dos direcciones):
-  1. Toda necesidad reservada debe permitir esa especialidad (un general **nunca** ve casos de
-     `Apoyo emocional`/`Crisis de ansiedad`).
-  2. `Psicología` **solo** atiende casos con alguna necesidad reservada (no casos físicos).
+- `matches_consultation(spec, c_spec, category, needs)`: si la consulta trae especialidad →
+  **igualdad exacta**; si no (consultas viejas) → fallback legacy `matches_specialty`.
+- `can_attend_consultation(spec, c_spec, category, needs)` (elegibilidad dura): un caso con
+  especialidad Psicología/Psiquiatría solo va a esas dos; `Psicología` solo atiende salud mental;
+  un caso físico explícito lo puede tomar cualquier no-psicólogo (la coincidencia exacta es la
+  PREFERENCIA de attend-next, no un bloqueo). Sin especialidad → fallback legacy `can_attend`.
+- Espejo exacto en el frontend: `matchesConsultation`/`canAttendConsultation` en `lib/utils.ts`
+  (el panel recibe `specialty` ya resuelta en `GET /consultations/panel`).
+
+Fallback legacy (`SPECIALTY_NEEDS`/`RESERVED_NEEDS`, solo para consultas sin `specialty_id`):
+`Medicina general` y `Otra` cubren `['*']`; `RESERVED_NEEDS = { 'Apoyo emocional': ['Psicología',
+'Psiquiatría'], 'Crisis de ansiedad': ['Psicología','Psiquiatría'] }`; `matchesSpecialty` por
+inclusión y `canAttend` con la separación dura bidireccional psicología ↔ físico.
 
 ## 3. Transiciones de estado (`consultations.status`)
 Válidos: `waiting | in_progress | referred_to_specialist | urgent_in_person | closed | cancelled | patient_no_show` (+ `closed_by_admin` en la base real).

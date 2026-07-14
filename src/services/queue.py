@@ -14,7 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.errors import NotFoundError
 from src.models.consultation import Consultation
 from src.models.patient import Patient
-from src.services.specialties import can_attend, matches_specialty
+from src.models.specialty import Specialty
+from src.services.specialties import can_attend_consultation, matches_consultation
 
 # Ventana de presencia: el paciente está "presente" si su heartbeat es < 5 min
 # (igual que PRESENCE_WINDOW_MS en panel-medico.tsx).
@@ -80,35 +81,44 @@ async def attend_next(
 ) -> Consultation:
     """Selecciona y toma el siguiente paciente (réplica de attendNext del frontend):
 
-    1. Elegibles por `can_attend` (admin atiende todo).
+    1. Elegibles por `can_attend_consultation` (admin atiende todo). El matching es por la
+       ESPECIALIDAD solicitada (consultations.specialty_id — el registro del paciente siempre
+       la setea); category/needs quedan de fallback para consultas viejas sin especialidad.
     2. Preferir presentes (heartbeat < 5 min); si ninguno, caer a todos los elegibles.
     3. Preferir match de especialidad; si no, el más antiguo (FIFO).
     4. Toma atómica de ese caso (with_for_update nowait).
     """
-    # Candidatos en espera + needs_tags del paciente, FIFO.
+    # Candidatos en espera + needs_tags del paciente + nombre de la especialidad, FIFO.
     stmt = (
-        select(Consultation, Patient.needs_tags)
+        select(Consultation, Patient.needs_tags, Specialty.name)
         .join(Patient, Consultation.patient_id == Patient.id)
+        .outerjoin(Specialty, Consultation.specialty_id == Specialty.id)
         .where(Consultation.status == "waiting")
         .order_by(Consultation.queued_at.asc())
     )
     rows = (await session.execute(stmt)).all()
 
     eligible = [
-        (c, needs) for (c, needs) in rows if is_admin or can_attend(specialty, c.category, needs)
+        (c, needs, c_spec)
+        for (c, needs, c_spec) in rows
+        if is_admin or can_attend_consultation(specialty, c_spec, c.category, needs)
     ]
     if not eligible:
         raise NotFoundError("No hay pacientes para tu especialidad ahora.")
 
     now = datetime.now(UTC)
-    present = [(c, needs) for (c, needs) in eligible if _is_present(c, now)]
+    present = [row for row in eligible if _is_present(row[0], now)]
     pool = present if present else eligible
 
     if is_admin:
         chosen = pool[0][0]
     else:
         chosen = next(
-            (c for (c, needs) in pool if matches_specialty(specialty, c.category, needs)),
+            (
+                c
+                for (c, needs, c_spec) in pool
+                if matches_consultation(specialty, c_spec, c.category, needs)
+            ),
             pool[0][0],
         )
 

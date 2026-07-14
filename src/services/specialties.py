@@ -122,6 +122,41 @@ def can_attend(specialty: str | None, category: str | None, needs_tags: list[str
     return True
 
 
+# El registro del paciente ahora pide la especialidad y la guarda en consultations.specialty_id:
+# esa columna ES el matching. category/needs_tags quedan como fallback para consultas viejas.
+_PSYCH_SPECIALTIES = {"Psicología", "Psiquiatría"}
+
+
+def matches_consultation(
+    specialty: str | None,
+    consultation_specialty: str | None,
+    category: str | None,
+    needs_tags: list[str] | None,
+) -> bool:
+    """Match de preferencia: igualdad exacta con la especialidad solicitada por el paciente;
+    fallback al matching legacy (category/needs) solo para consultas sin specialty_id."""
+    if consultation_specialty:
+        return specialty == consultation_specialty
+    return matches_specialty(specialty, category, needs_tags)
+
+
+def can_attend_consultation(
+    specialty: str | None,
+    consultation_specialty: str | None,
+    category: str | None,
+    needs_tags: list[str] | None,
+) -> bool:
+    """Elegibilidad dura con la especialidad explícita. La reserva de psicología se mantiene:
+    un caso de salud mental solo va a Psicología/Psiquiatría, y Psicología solo atiende salud
+    mental. Un caso físico explícito lo puede tomar cualquier no-psicólogo (que la especialidad
+    coincida es la PREFERENCIA de attend-next, no un bloqueo — nadie se queda sin atender)."""
+    if consultation_specialty in _PSYCH_SPECIALTIES:
+        return specialty in _PSYCH_SPECIALTIES
+    if consultation_specialty:
+        return specialty != "Psicología"
+    return can_attend(specialty, category, needs_tags)
+
+
 def compute_priority(needs_tags: list[str] | None) -> str:
     """'review' si hay una necesidad sensible; 'normal' en caso contrario."""
     if needs_tags and _PRIORITY_REVIEW_TAGS.intersection(needs_tags):
