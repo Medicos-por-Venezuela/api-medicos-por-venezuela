@@ -47,6 +47,9 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
             "SUPABASE_SERVICE_ROLE_KEY tiene el valor por defecto inseguro. "
             "Configúralo en producción (Supabase → Settings → API → service_role key)."
         )
+    # Deja los orígenes CORS efectivos en los logs de arranque: cuando un front rebota por CORS,
+    # se ve de una si su origen está (o no) en la lista, sin adivinar desde el .env.
+    logger.info("CORS origins efectivos: %s", settings.cors_origins)
     yield
 
 

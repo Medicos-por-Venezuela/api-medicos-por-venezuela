@@ -54,3 +54,10 @@ def test_connect_args_verify_full_verifica_ca() -> None:
 def test_cors_origins_parsing() -> None:
     s = Settings(BACKEND_CORS_ORIGINS="https://a.com, https://b.com ,")
     assert s.cors_origins == ["https://a.com", "https://b.com"]
+
+
+def test_cors_origins_strips_trailing_slash() -> None:
+    # El header Origin del navegador nunca trae barra final; una barra en la env rompía el
+    # match exacto de CORS. El parser la tolera (y descarta entradas que quedan vacías).
+    s = Settings(BACKEND_CORS_ORIGINS="https://a.com/, https://b.com , /")
+    assert s.cors_origins == ["https://a.com", "https://b.com"]
