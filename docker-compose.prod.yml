@@ -1,8 +1,10 @@
 # Compose de PRODUCCIÓN (EC2). Solo la API — la base de datos es Supabase, NO
-# se corre Postgres aquí. Las variables salen de .env.production (no versionado).
+# se corre Postgres aquí. Las variables salen de .env.production (no versionado),
+# inyectadas al contenedor por la clave `env_file:` de abajo (no hace falta --env-file
+# en la CLI: ese flag es solo para interpolar ${VAR} en el YAML, y aquí no se usa).
 #
-# Uso en la EC2:
-#   docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build
+# Uso en la EC2 (lo hace deploy.sh):
+#   docker compose -f docker-compose.prod.yml up -d --build
 services:
   api:
     build: .
@@ -14,5 +16,12 @@ services:
     # Inyecta las variables de entorno (Supabase, JWT, CORS...) desde el archivo.
     env_file:
       - .env.production
+    # Rotación de logs: sin esto, el json-file de Docker crece sin límite y puede llenar
+    # el disco del EC2. 5 archivos de 10 MB = ~50 MB de historial por contenedor.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     # Sin volumen de ./src ni --reload: corre el código horneado en la imagen.
     # El CMD del Dockerfile ya es: uvicorn src.main:app --host 0.0.0.0 --port 8000
