@@ -2,7 +2,7 @@
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -134,3 +134,12 @@ async def test_audit_log_update_manual_de_actor_rechazado() -> None:
     async with AsyncSessionLocal() as s:
         row = (await s.execute(select(AuditLog).where(AuditLog.id == entry_id))).scalar_one()
         assert row.actor_user_id is not None  # sigue intacto
+
+
+async def test_audit_log_truncate_rechazado() -> None:
+    """TRUNCATE no dispara triggers de fila (era el último vector para vaciar la bitácora);
+    el trigger de sentencia trg_audit_log_no_truncate debe bloquearlo."""
+    with pytest.raises(DBAPIError, match="inmutable"):
+        async with AsyncSessionLocal() as s:
+            await s.execute(text("truncate table public.audit_log"))
+            await s.commit()

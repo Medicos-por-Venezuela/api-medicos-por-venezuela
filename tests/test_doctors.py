@@ -813,3 +813,8 @@ async def test_pool_paginacion_disjunta_y_total(
 
     assert len(seen) == len(set(seen)) == total  # sin duplicados ni omisiones
     assert seeded <= set(seen)  # todos los sembrados aparecen
+    # Determinista para el tiebreaker: entre homónimos el orden DEBE ser id ascendente
+    # (uuid hex se compara igual como texto que como uuid en Postgres). Sin Doctor.id en
+    # el order_by, 5 uuids v4 aleatorios no salen ordenados por accidente.
+    seeded_in_order = [i for i in seen if i in seeded]
+    assert seeded_in_order == sorted(seeded)

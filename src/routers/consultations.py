@@ -276,6 +276,7 @@ async def list_consultation_events(
     responses={
         **_NOT_FOUND,
         400: {"description": "El `consultation_id` del cuerpo no coincide con la ruta."},
+        409: {"description": "La consulta está asignada a otro médico."},
     },
 )
 async def create_consultation_event(
@@ -285,5 +286,9 @@ async def create_consultation_event(
     principal: Principal = Depends(require_permission("consultations.write")),
 ) -> ConsultationEventResponse:
     return await consultations_service.create_event(
-        db, consultation_id, payload, created_by=principal.id
+        db,
+        consultation_id,
+        payload,
+        created_by=principal.id,
+        actor_is_admin=principal.is_admin,
     )

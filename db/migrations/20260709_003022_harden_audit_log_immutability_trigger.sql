@@ -36,3 +36,11 @@ begin
 end;
 $$;
 
+-- TRUNCATE no dispara triggers de fila (el base es BEFORE UPDATE OR DELETE ... FOR EACH ROW),
+-- así que era el único vector que quedaba para vaciar la bitácora. Se cierra con un trigger
+-- de sentencia que reusa la misma función (para TRUNCATE ninguna rama del IF matchea -> raise).
+drop trigger if exists trg_audit_log_no_truncate on public.audit_log;
+create trigger trg_audit_log_no_truncate
+    before truncate on public.audit_log
+    for each statement execute function public.audit_log_block_write();
+

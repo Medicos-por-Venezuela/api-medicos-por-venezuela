@@ -293,10 +293,23 @@ async def update_consultation(
     consultation = await get_consultation(session, consultation_id)
     _ensure_can_manage(consultation, actor_user_id, actor_is_admin)
     changes = data.model_dump(exclude_unset=True)
-    # Un no-admin no puede reasignar la consulta a un tercero (tomarla para sí o
-    # liberarla sí; la toma con anti-colisión sigue siendo POST /queue/{id}/take).
-    if not actor_is_admin and changes.get("assigned_doctor_id") not in (None, actor_user_id):
-        raise ConflictError("No puedes asignar la consulta a otro médico.")
+    # Un no-admin NO asigna consultas por PATCH: puede liberar la suya (None) o dejarla igual.
+    # Tomar una consulta es SOLO vía el claim atómico (POST /{id}/claim o /queue/{id}/take):
+    # un PATCH read-then-write reabriría la carrera que el claim resuelve en la base (dos
+    # médicos concurrentes recibirían 200 y el último pisaría al primero en silencio).
+    # doctor_id (ficha del médico) es server-only: lo escribe el backend/cola, no el cliente.
+    if not actor_is_admin:
+        if "doctor_id" in changes and changes["doctor_id"] != consultation.doctor_id:
+            raise ConflictError("doctor_id lo asigna el sistema; no se edita por PATCH.")
+        new_assigned = changes.get("assigned_doctor_id")
+        if (
+            "assigned_doctor_id" in changes
+            and new_assigned is not None
+            and new_assigned != consultation.assigned_doctor_id
+        ):
+            raise ConflictError(
+                "Tomar una consulta es vía el claim atómico (POST /consultations/{id}/claim)."
+            )
     for field, value in changes.items():
         setattr(consultation, field, value)
     await audit.log_action(
@@ -348,8 +361,13 @@ async def create_event(
     consultation_id: uuid.UUID,
     data: ConsultationEventCreate,
     created_by: uuid.UUID | None = None,
+    actor_is_admin: bool = False,
 ) -> ConsultationEvent:
-    await get_consultation(session, consultation_id)  # 404 si no existe
+    consultation = await get_consultation(session, consultation_id)  # 404 si no existe
+    # Mismo anti-IDOR que update/close: los eventos son el historial/auditoría del caso;
+    # sin este check un médico podría inyectar un evento falso (p.ej. "closed") en la
+    # consulta de otro.
+    _ensure_can_manage(consultation, created_by, actor_is_admin)
     if data.consultation_id != consultation_id:
         raise BadRequestError("El consultation_id del cuerpo no coincide con el de la ruta.")
     # created_by SIEMPRE del JWT (no del body) — anti-IDOR.
