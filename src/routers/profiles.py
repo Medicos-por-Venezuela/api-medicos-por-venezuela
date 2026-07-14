@@ -39,11 +39,15 @@ async def list_profiles(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=100),
     role: str | None = Query(None),
+    search: str | None = Query(None, description="Filtra por nombre o email (ILIKE)."),
     db: AsyncSession = Depends(get_db),
     _: Principal = Depends(require_permission("profiles.read")),
 ) -> list[ProfileResponse]:
-    """Lista de perfiles de cuentas; filtrable por `role` (doctor, admin, ...)."""
-    return await profiles_service.list_profiles(db, skip=skip, limit=limit, role=role)
+    """Lista de perfiles de cuentas; filtrable por `role` (doctor, admin, ...) y por `search`
+    (nombre o email — necesario para encontrar a alguien entre miles de usuarios)."""
+    return await profiles_service.list_profiles(
+        db, skip=skip, limit=limit, role=role, search=search
+    )
 
 
 @router.post(

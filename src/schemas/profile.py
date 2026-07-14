@@ -33,6 +33,11 @@ class ProfileResponse(ProfileBase):
     # si redirige a completar el perfil, sin un segundo round-trip.
     has_doctor_profile: bool = False
     doctor_cedula: str | None = None
+    # Roles RBAC efectivos (user_roles; con fallback al legado si la cuenta no tiene filas).
+    # En /auth/me, `role` se sobreescribe con el EFECTIVO más alto de esta lista — la columna
+    # users.role es un único valor legado y puede quedarse corta (p. ej. dual doctor+super_admin).
+    # Solo /auth/me la puebla; en listados (GET /profiles) queda [].
+    roles: list[str] = []
 
 
 class ProfileActiveRequest(BaseModel):

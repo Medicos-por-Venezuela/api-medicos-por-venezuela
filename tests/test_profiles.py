@@ -1,6 +1,9 @@
 """Pruebas del recurso profiles (solo lectura; usa datos ya restaurados)."""
 
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from tests._helpers import make_profile
 
 PREFIX = "/api/v1"
 
@@ -21,6 +24,34 @@ async def test_list_profiles_filter_role(client: AsyncClient) -> None:
     resp = await client.get(f"{PREFIX}/profiles", params={"role": "doctor", "limit": 5})
     assert resp.status_code == 200
     assert all(p["role"] == "doctor" for p in resp.json())
+
+
+async def test_list_profiles_search_by_name(client: AsyncClient, db_session: AsyncSession) -> None:
+    hit = make_profile(role="doctor")
+    hit.full_name = "Zoraida Buscada Perez"
+    miss = make_profile(role="doctor")
+    miss.full_name = "Otro Distinto"
+    db_session.add_all([hit, miss])
+    await db_session.flush()
+
+    resp = await client.get(f"{PREFIX}/profiles", params={"search": "oraida", "limit": 100})
+    assert resp.status_code == 200
+    ids = {p["id"] for p in resp.json()}
+    assert str(hit.id) in ids
+    assert str(miss.id) not in ids
+
+
+async def test_list_profiles_search_by_email(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = make_profile(role="doctor")
+    doc.email = "buscame.unico@example.com"
+    db_session.add(doc)
+    await db_session.flush()
+
+    resp = await client.get(f"{PREFIX}/profiles", params={"search": "buscame.unico", "limit": 100})
+    assert resp.status_code == 200
+    assert str(doc.id) in {p["id"] for p in resp.json()}
 
 
 async def test_profile_not_found(client: AsyncClient) -> None:

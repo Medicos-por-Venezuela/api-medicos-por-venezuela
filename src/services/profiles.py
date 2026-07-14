@@ -2,7 +2,7 @@
 
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import BadRequestError, NotFoundError
@@ -14,11 +14,20 @@ _SELF_ROLES = {"patient", "doctor"}
 
 
 async def list_profiles(
-    session: AsyncSession, skip: int = 0, limit: int = 100, role: str | None = None
+    session: AsyncSession,
+    skip: int = 0,
+    limit: int = 100,
+    role: str | None = None,
+    search: str | None = None,
 ) -> list[Profile]:
     stmt = select(Profile)
     if role:
         stmt = stmt.where(Profile.role == role)
+    # Búsqueda server-side por nombre o email (con ~3000 usuarios, paginar sin buscar es
+    # inservible). ilike va como parámetro enlazado -> sin riesgo de inyección.
+    if search and (term := search.strip()):
+        like = f"%{term}%"
+        stmt = stmt.where(or_(Profile.full_name.ilike(like), Profile.email.ilike(like)))
     stmt = stmt.order_by(Profile.created_at.desc()).offset(skip).limit(limit)
     result = await session.execute(stmt)
     return list(result.scalars().all())
