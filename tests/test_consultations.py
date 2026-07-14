@@ -249,6 +249,17 @@ async def test_panel_devuelve_espera_mias_y_cerradas(
     await client.post(
         f"{PREFIX}/consultations/{cid_mine}/claim", json={}, headers=auth_headers(doc.id)
     )
+    # Una consulta con especialidad explícita: el panel debe traer el NOMBRE resuelto
+    # (es la columna con la que matchea el médico en el frontend).
+    specs = (await client.get(f"{PREFIX}/specialties")).json()
+    pediatria = next(s["id"] for s in specs if s["name"] == "Pediatría")
+    patient_id = await _create_patient(client)
+    cid_spec = (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": patient_id, "specialty_id": pediatria},
+        )
+    ).json()["id"]
 
     resp = await client.get(f"{PREFIX}/consultations/panel", headers=auth_headers(doc.id))
     assert resp.status_code == 200, resp.text
@@ -262,6 +273,9 @@ async def test_panel_devuelve_espera_mias_y_cerradas(
     # el paciente viene anidado en cada fila (el card lo necesita)
     item = next(c for c in data["waiting"] if c["id"] == cid_waiting)
     assert item["patient"]["full_name"] == "Paciente Consulta"
+    assert item["specialty"] is None  # sin specialty_id: el matching cae al legacy
+    item_spec = next(c for c in data["waiting"] if c["id"] == cid_spec)
+    assert item_spec["specialty"] == "Pediatría"
     assert isinstance(data["my_closed_count"], int)
 
 

@@ -41,6 +41,24 @@ async def _doctor(db_session: AsyncSession, specialty: str) -> Profile:
     return doc
 
 
+async def _specialty_id(client: AsyncClient, name: str) -> str:
+    specs = (await client.get(f"{PREFIX}/specialties")).json()
+    return next(s["id"] for s in specs if s["name"] == name)
+
+
+async def _consultation_with_specialty(
+    client: AsyncClient, needs: list[str], specialty_name: str
+) -> str:
+    """Consulta con especialidad EXPLÍCITA (specialty_id), como las crea el registro nuevo."""
+    pid = await _patient(client, needs)
+    sid = await _specialty_id(client, specialty_name)
+    return (
+        await client.post(
+            f"{PREFIX}/consultations", json={"patient_id": pid, "specialty_id": sid}
+        )
+    ).json()["id"]
+
+
 # --- attend-next ---
 
 
@@ -67,6 +85,42 @@ async def test_attend_next_no_eligible_returns_404(
     # Un psicólogo no puede atender un caso físico -> no hay elegibles.
     resp = await client.post(f"{PREFIX}/queue/attend-next", headers=auth_headers(psych.id))
     assert resp.status_code == 404
+
+
+async def test_attend_next_prefiere_specialty_id_sobre_fifo(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El matching es por la especialidad solicitada (specialty_id): aunque haya un caso
+    elegible más viejo, attend-next prefiere el que pide EXACTAMENTE su especialidad."""
+    doc = await _doctor(db_session, "Traumatología")
+    older = await _consultation(client, ["Medicina general"])  # elegible, sin especialidad
+    with_spec = await _consultation_with_specialty(client, ["Medicina general"], "Traumatología")
+
+    resp = await client.post(f"{PREFIX}/queue/attend-next", headers=auth_headers(doc.id))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["id"] == with_spec
+    assert resp.json()["id"] != older
+
+
+async def test_attend_next_reserva_psicologia_por_specialty_id(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Un caso con especialidad Psicología solo va a Psicología/Psiquiatría, aunque sus
+    needs_tags sean genéricos (la especialidad explícita manda sobre el fallback legacy)."""
+    cid_psi = await _consultation_with_specialty(client, ["Medicina general"], "Psicología")
+
+    general = await _doctor(db_session, "Medicina general")
+    resp = await client.post(f"{PREFIX}/queue/attend-next", headers=auth_headers(general.id))
+    # El general puede recibir OTRO caso en espera (datos previos), pero jamás el de psicología.
+    if resp.status_code == 200:
+        assert resp.json()["id"] != cid_psi
+    else:
+        assert resp.status_code == 404
+
+    psych = await _doctor(db_session, "Psicología")
+    took = await client.post(f"{PREFIX}/queue/attend-next", headers=auth_headers(psych.id))
+    assert took.status_code == 200, took.text
+    assert took.json()["id"] == cid_psi
 
 
 # --- cierre / no-show ---

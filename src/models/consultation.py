@@ -90,3 +90,11 @@ class Consultation(Base):
     events: Mapped[list["ConsultationEvent"]] = relationship(  # noqa: F821
         back_populates="consultation", cascade="all, delete-orphan"
     )
+    # noload: solo se puebla con selectinload explícito (el panel) — nunca lazy IO async.
+    specialty_ref: Mapped["Specialty | None"] = relationship(lazy="noload")  # noqa: F821
+
+    @property
+    def specialty(self) -> str | None:
+        """Nombre de la especialidad solicitada (la columna del matching médico<->consulta).
+        None si no hay specialty_id o si specialty_ref no fue cargada con selectinload."""
+        return self.specialty_ref.name if self.specialty_ref else None
