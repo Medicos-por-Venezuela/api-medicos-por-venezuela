@@ -1,0 +1,10 @@
+# Supabase
+.branches
+.temp
+# Snippets del SQL Editor de Studio (estado local; pueden contener PII de la BD restaurada)
+snippets/
+
+# dotenvx
+.env.keys
+.env.local
+.env.*.local

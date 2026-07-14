@@ -1,0 +1,51 @@
+# Entorno / secretos
+.env
+.env.*
+!.env.example
+!.env.production.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+
+# Herramientas / cachés
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE / SO
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Backups de la base de datos (contienen PII real — NUNCA versionar)
+backups/
+*.dump
+*.sql.gz
+
+# Claude Code (versiona CLAUDE.md y .claude/rules; ignora solo lo local)
+.claude/settings.local.json
+.claude/*.local.json
+
+# Logs
+*.log
+# Local Pi runtime state
+.atl/
+
+# Local uv lockfile
+uv.lock
+
+# Node (solo para pinnear el Supabase CLI vía npx — ver package.json). package-lock.json SÍ
+# se versiona (fija la versión exacta del CLI para todos los devs).
+node_modules/
