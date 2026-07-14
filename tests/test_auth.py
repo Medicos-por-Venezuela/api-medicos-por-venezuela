@@ -49,6 +49,28 @@ async def test_auth_me(client: AsyncClient, admin_identity: Profile) -> None:
     assert resp.json()["role"] == "admin"
 
 
+async def test_auth_me_admin_puro_no_es_medico(
+    client: AsyncClient, admin_identity: Profile
+) -> None:
+    """Admin sin ficha de médico: has_doctor_profile=False → el panel NO lo redirige a perfil."""
+    body = (await client.get(f"{PREFIX}/auth/me")).json()
+    assert body["has_doctor_profile"] is False
+    assert body["doctor_cedula"] is None
+
+
+async def test_auth_me_medico_sin_ficha_incluye_contexto(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Médico de Google (rol doctor, sin fila en doctors): has_doctor_profile=True y cédula None,
+    resuelto en la MISMA llamada de /auth/me → el panel lo manda a completar cédula."""
+    doctor = make_profile(role="doctor")
+    db_session.add(doctor)
+    await db_session.flush()
+    body = (await client.get(f"{PREFIX}/auth/me", headers=auth_headers(doctor.id))).json()
+    assert body["has_doctor_profile"] is True
+    assert body["doctor_cedula"] is None
+
+
 async def test_auth_me_permissions(client: AsyncClient, admin_identity: Profile) -> None:
     resp = await client.get(f"{PREFIX}/auth/me/permissions")
     assert resp.status_code == 200

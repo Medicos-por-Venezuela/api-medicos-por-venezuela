@@ -9,9 +9,8 @@ queda en True solo si la cédula es válida en ese registro; en cualquier otro c
 import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
@@ -27,10 +26,6 @@ from src.services import sacs as sacs_service
 
 # Roles de `users` que corresponden a un médico (legacy `specialist` -> doctor).
 _DOCTOR_PROFILE_ROLES = {"doctor", "specialist"}
-
-# Un médico cuenta como "online" si marcó presencia hace menos de esto (igual criterio
-# que el panel/admin del frontend: last_seen_at < 3 min).
-_ONLINE_WINDOW = timedelta(minutes=3)
 
 
 def _normalize(text: str) -> str:
@@ -124,30 +119,28 @@ async def list_doctor_pool(
     limit: int = 20,
     specialty_id: uuid.UUID | None = None,
     professional_type_id: uuid.UUID | None = None,
+    search: str | None = None,
     online: bool | None = None,
+    online_user_ids: list[uuid.UUID] | None = None,
     exclude_user_id: uuid.UUID | None = None,
 ) -> tuple[list[dict], int]:
-    """Pool de médicos para referir/agendar: cruza doctors con users (para el estado
-    online desde last_seen_at y el teléfono de contacto) y pagina. Devuelve (filas, total).
+    """Pool de médicos para referir/agendar (paginado). Devuelve (filas, total). NO trae el
+    teléfono: el número se revela (y se audita) aparte, con `reveal_doctor_contact`.
 
-    Solo médicos que pueden atender: status == 1 (excluye baja=0 y expulsado=2) y no
-    borrados. El inner join con users descarta los mocks legacy sin user_id. `online`:
-    True = logeado (< 3 min), False = offline, None = todos. Ordena los online primero.
-    `exclude_user_id`: quita al propio médico que consulta (no se refiere a sí mismo).
+    Solo médicos que pueden atender: status == 1 (excluye baja=0 y expulsado=2) y no borrados.
+    El inner join con users descarta los mocks legacy sin user_id. Filtros: `search` (nombre,
+    ILIKE), `specialty_id`, `professional_type_id`. El estado "online" lo sabe el cliente
+    (Presence) y lo pasa como `online_user_ids`: `online=True` -> user_id IN esa lista;
+    `online=False` -> NOT IN; `None` -> sin filtro (paginación server-side correcta).
+    `exclude_user_id`: quita al propio médico que consulta.
     """
-    threshold = datetime.now(UTC) - _ONLINE_WINDOW
-    online_expr = Profile.last_seen_at >= threshold
-    # Teléfono para el enlace de WhatsApp: el de doctors o, si falta, el whatsapp de la cuenta.
-    phone_expr = func.coalesce(Doctor.phone, Profile.whatsapp_number)
-
     base = (
         select(
             Doctor.id,
+            Doctor.user_id,
             Doctor.full_name,
             Doctor.specialty_id,
             Doctor.professional_type_id,
-            phone_expr.label("phone"),
-            online_expr.label("online"),
         )
         .join(Profile, Doctor.user_id == Profile.id)
         .where(Doctor.deleted_at.is_(None), Doctor.status == 1)
@@ -158,31 +151,51 @@ async def list_doctor_pool(
         base = base.where(Doctor.specialty_id == specialty_id)
     if professional_type_id is not None:
         base = base.where(Doctor.professional_type_id == professional_type_id)
-    if online is True:
-        base = base.where(online_expr)
-    elif online is False:
-        base = base.where(or_(Profile.last_seen_at.is_(None), Profile.last_seen_at < threshold))
+    if search:
+        base = base.where(Doctor.full_name.ilike(f"%{search}%"))
+    if online is not None:
+        ids = online_user_ids or []
+        base = base.where(Doctor.user_id.in_(ids) if online else Doctor.user_id.not_in(ids))
 
     total = await session.scalar(select(func.count()).select_from(base.subquery())) or 0
 
-    page = (
-        base.order_by(Profile.last_seen_at.desc().nulls_last(), Doctor.full_name)
-        .offset(skip)
-        .limit(limit)
-    )
+    # Orden estable para paginar (nombre + id como desempate); el "online" lo ordena el cliente.
+    page = base.order_by(Doctor.full_name, Doctor.id).offset(skip).limit(limit)
     rows = (await session.execute(page)).all()
     items = [
         {
             "id": r.id,
+            "user_id": r.user_id,
             "full_name": r.full_name,
             "specialty_id": r.specialty_id,
             "professional_type_id": r.professional_type_id,
-            "phone": r.phone,
-            "online": bool(r.online),
         }
         for r in rows
     ]
     return items, total
+
+
+async def reveal_doctor_contact(
+    session: AsyncSession, doctor_id: uuid.UUID, viewer_user_id: uuid.UUID
+) -> str | None:
+    """Devuelve el teléfono de contacto de un médico del pool y REGISTRA en audit_log quién lo
+    vio (para la bitácora del panel admin). El número no se expone en el listado del pool: solo
+    aquí, ligado a un evento de auditoría."""
+    doctor = await get_doctor(session, doctor_id)  # 404 si no existe/está borrado
+    phone = doctor.phone
+    if phone is None and doctor.user_id is not None:
+        user = await session.get(Profile, doctor.user_id)
+        phone = user.whatsapp_number if user else None
+    await audit.log_action(
+        session,
+        action="doctor.contact_viewed",
+        actor_user_id=viewer_user_id,
+        resource="doctors",
+        resource_id=doctor_id,
+        metadata={"doctor_name": doctor.full_name},
+    )
+    await session.commit()
+    return phone
 
 
 async def get_doctor(session: AsyncSession, doctor_id: uuid.UUID) -> Doctor:

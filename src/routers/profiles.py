@@ -47,19 +47,6 @@ async def list_profiles(
 
 
 @router.post(
-    "/me/online",
-    response_model=ProfileResponse,
-    summary="Heartbeat de presencia del médico autenticado",
-)
-async def mark_online(
-    db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_staff),
-) -> ProfileResponse:
-    """Marca al médico autenticado como en línea (`last_seen_at`)."""
-    return await profiles_service.mark_online(db, principal.id)
-
-
-@router.post(
     "/me/finalize-role",
     response_model=ProfileResponse,
     summary="Finalizar el rol del usuario autenticado (patient/doctor)",

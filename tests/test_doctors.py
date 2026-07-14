@@ -607,7 +607,7 @@ async def test_patch_me_doctor_ignora_professional_type_id(
 async def _pool_doctor(
     db: AsyncSession,
     *,
-    online: bool,
+    online: bool = True,
     type_id: str,
     specialty_id: str | None = None,
     status: int = 1,
@@ -644,31 +644,18 @@ async def _pool(client: AsyncClient, **params: object) -> dict:
     return resp.json()
 
 
-async def test_pool_shape_and_online_flag(client: AsyncClient, db_session: AsyncSession) -> None:
+async def test_pool_shape_and_user_id(client: AsyncClient, db_session: AsyncSession) -> None:
+    """El pool devuelve {items,total} y cada fila trae user_id (el frontend cruza con Presence
+    para el estado online); ya NO hay campo `online` en el backend."""
     nutri = await _type_id(db_session, "nutricionista")
-    d_on = await _pool_doctor(db_session, online=True, type_id=nutri, name="Pool Online")
-    d_off = await _pool_doctor(db_session, online=False, type_id=nutri, name="Pool Offline")
+    doc = await _pool_doctor(db_session, type_id=nutri, name="Pool Uno")
 
     body = await _pool(client, professional_type_id=nutri)
     assert set(body) == {"items", "total"}
-    assert body["total"] >= 2
-    by_id = {i["id"]: i for i in body["items"]}
-    assert by_id[str(d_on.id)]["online"] is True
-    assert by_id[str(d_off.id)]["online"] is False
-
-
-async def test_pool_online_tab_filters(client: AsyncClient, db_session: AsyncSession) -> None:
-    nutri = await _type_id(db_session, "nutricionista")
-    d_on = await _pool_doctor(db_session, online=True, type_id=nutri)
-    d_off = await _pool_doctor(db_session, online=False, type_id=nutri)
-
-    online = await _pool(client, professional_type_id=nutri, online=True)
-    ids = {i["id"] for i in online["items"]}
-    assert str(d_on.id) in ids and str(d_off.id) not in ids
-
-    offline = await _pool(client, professional_type_id=nutri, online=False)
-    ids = {i["id"] for i in offline["items"]}
-    assert str(d_off.id) in ids and str(d_on.id) not in ids
+    assert body["total"] >= 1
+    item = next(i for i in body["items"] if i["id"] == str(doc.id))
+    assert item["user_id"] == str(doc.user_id)
+    assert "online" not in item
 
 
 async def test_pool_specialty_filter(client: AsyncClient, db_session: AsyncSession) -> None:
@@ -721,9 +708,67 @@ async def test_pool_excludes_self(
     assert str(other.id) in ids
 
 
-async def test_pool_returns_phone(client: AsyncClient, db_session: AsyncSession) -> None:
+async def test_pool_search_by_name(client: AsyncClient, db_session: AsyncSession) -> None:
     nutri = await _type_id(db_session, "nutricionista")
-    doc = await _pool_doctor(db_session, online=True, type_id=nutri, phone="+584145200715")
+    hit = await _pool_doctor(db_session, type_id=nutri, name="Zoraida Buscada")
+    miss = await _pool_doctor(db_session, type_id=nutri, name="Otro Distinto")
+    body = await _pool(client, professional_type_id=nutri, search="oraida")
+    ids = {i["id"] for i in body["items"]}
+    assert str(hit.id) in ids and str(miss.id) not in ids
+
+
+async def test_pool_online_filter_by_ids(client: AsyncClient, db_session: AsyncSession) -> None:
+    """El cliente pasa los user_ids que sabe online (Presence); el backend filtra IN/NOT IN."""
+    nutri = await _type_id(db_session, "nutricionista")
+    d_on = await _pool_doctor(db_session, type_id=nutri)
+    d_off = await _pool_doctor(db_session, type_id=nutri)
+
+    on = await _pool(
+        client, professional_type_id=nutri, online="true", online_ids=str(d_on.user_id)
+    )
+    ids = {i["id"] for i in on["items"]}
+    assert str(d_on.id) in ids and str(d_off.id) not in ids
+
+    off = await _pool(
+        client, professional_type_id=nutri, online="false", online_ids=str(d_on.user_id)
+    )
+    ids = {i["id"] for i in off["items"]}
+    assert str(d_off.id) in ids and str(d_on.id) not in ids
+
+
+async def test_pool_no_longer_returns_phone(client: AsyncClient, db_session: AsyncSession) -> None:
+    nutri = await _type_id(db_session, "nutricionista")
+    doc = await _pool_doctor(db_session, type_id=nutri, phone="+584145200715")
     body = await _pool(client, professional_type_id=nutri)
     item = next(i for i in body["items"] if i["id"] == str(doc.id))
-    assert item["phone"] == "+584145200715"
+    assert "phone" not in item
+
+
+async def test_reveal_contact_returns_phone_and_audits(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    nutri = await _type_id(db_session, "nutricionista")
+    doc = await _pool_doctor(db_session, type_id=nutri, phone="+584145200715")
+
+    resp = await client.post(f"{PREFIX}/doctors/{doc.id}/contact")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["phone"] == "+584145200715"
+
+    # Queda registrado en audit_log quién vio el contacto (para la bitácora del panel admin).
+    audit = await client.get(f"{PREFIX}/audit-log", params={"resource": "doctors"})
+    actions = [e["action"] for e in audit.json()]
+    assert "doctor.contact_viewed" in actions
+
+
+async def test_reveal_contact_requires_doctors_read(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    nutri = await _type_id(db_session, "nutricionista")
+    doc = await _pool_doctor(db_session, type_id=nutri, phone="+584145200715")
+    patient = make_profile(role="patient")
+    db_session.add(patient)
+    await db_session.flush()
+    resp = await client.post(
+        f"{PREFIX}/doctors/{doc.id}/contact", headers=auth_headers(patient.id)
+    )
+    assert resp.status_code == 403

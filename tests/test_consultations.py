@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.specialty import Specialty
+from tests._helpers import auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -169,3 +170,107 @@ async def test_create_consultation_specialty_id_inexistente_falla_400(
         },
     )
     assert resp.status_code == 400
+
+
+# --- Panel médico: claim atómico + cola (Realtime lo consume del backend) ---
+
+
+async def _create_waiting_consultation(client: AsyncClient) -> str:
+    """Crea una consulta en espera. Sin envejecerla: el panel ya no tiene gate de 20 min, así
+    que una consulta recién creada debe aparecer en la cola de inmediato (tiempo real)."""
+    patient_id = await _create_patient(client)
+    return (
+        await client.post(f"{PREFIX}/consultations", json={"patient_id": patient_id})
+    ).json()["id"]
+
+
+async def test_claim_es_atomico_solo_gana_un_medico(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Dos médicos toman el mismo caso: el primero 200, el segundo 409 (nunca ambos)."""
+    cid = await _create_waiting_consultation(client)
+    d1, d2 = make_profile(role="doctor"), make_profile(role="doctor")
+    db_session.add_all([d1, d2])
+    await db_session.flush()
+
+    r1 = await client.post(
+        f"{PREFIX}/consultations/{cid}/claim", json={}, headers=auth_headers(d1.id)
+    )
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["assigned_doctor_id"] == str(d1.id)
+    assert r1.json()["status"] == "in_progress"
+
+    r2 = await client.post(
+        f"{PREFIX}/consultations/{cid}/claim", json={}, headers=auth_headers(d2.id)
+    )
+    assert r2.status_code == 409, r2.text
+
+
+async def test_claim_via_whatsapp_marca_el_flag(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    cid = await _create_waiting_consultation(client)
+    doc = make_profile(role="doctor")
+    db_session.add(doc)
+    await db_session.flush()
+
+    resp = await client.post(
+        f"{PREFIX}/consultations/{cid}/claim",
+        json={"via_whatsapp": True},
+        headers=auth_headers(doc.id),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["attended_via_whatsapp"] is True
+
+
+async def test_claim_requiere_permiso_queue_take(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    cid = await _create_waiting_consultation(client)
+    patient = make_profile(role="patient")
+    db_session.add(patient)
+    await db_session.flush()
+
+    resp = await client.post(
+        f"{PREFIX}/consultations/{cid}/claim", json={}, headers=auth_headers(patient.id)
+    )
+    assert resp.status_code == 403, resp.text
+
+
+async def test_panel_devuelve_espera_mias_y_cerradas(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = make_profile(role="doctor")
+    db_session.add(doc)
+    await db_session.flush()
+
+    cid_waiting = await _create_waiting_consultation(client)
+    cid_mine = await _create_waiting_consultation(client)
+    await client.post(
+        f"{PREFIX}/consultations/{cid_mine}/claim", json={}, headers=auth_headers(doc.id)
+    )
+
+    resp = await client.get(f"{PREFIX}/consultations/panel", headers=auth_headers(doc.id))
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    waiting_ids = {c["id"] for c in data["waiting"]}
+    mine_ids = {c["id"] for c in data["mine"]}
+
+    assert cid_waiting in waiting_ids
+    assert cid_mine in mine_ids
+    assert cid_mine not in waiting_ids  # ya asignada: sale de la cola de espera
+    # el paciente viene anidado en cada fila (el card lo necesita)
+    item = next(c for c in data["waiting"] if c["id"] == cid_waiting)
+    assert item["patient"]["full_name"] == "Paciente Consulta"
+    assert isinstance(data["my_closed_count"], int)
+
+
+async def test_panel_requiere_permiso_queue_read(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    patient = make_profile(role="patient")
+    db_session.add(patient)
+    await db_session.flush()
+
+    resp = await client.get(f"{PREFIX}/consultations/panel", headers=auth_headers(patient.id))
+    assert resp.status_code == 403, resp.text

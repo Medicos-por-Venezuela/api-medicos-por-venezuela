@@ -27,6 +27,12 @@ class ProfileResponse(ProfileBase):
     id: uuid.UUID
     last_seen_at: datetime | None = None
     created_at: datetime
+    # Contexto de médico resuelto en el mismo /auth/me (evita una segunda llamada a /doctors/me
+    # desde el panel): `has_doctor_profile` = el usuario es médico (con o sin ficha; un admin puro
+    # da False); `doctor_cedula` = su cédula (null si aún no la completó). El panel decide con esto
+    # si redirige a completar el perfil, sin un segundo round-trip.
+    has_doctor_profile: bool = False
+    doctor_cedula: str | None = None
 
 
 class ProfileActiveRequest(BaseModel):

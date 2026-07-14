@@ -1,7 +1,6 @@
 """Capa de negocio para profiles (staff)."""
 
 import uuid
-from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,15 +28,6 @@ async def get_profile(session: AsyncSession, profile_id: uuid.UUID) -> Profile:
     profile = await session.get(Profile, profile_id)
     if profile is None:
         raise NotFoundError("Perfil no encontrado.")
-    return profile
-
-
-async def mark_online(session: AsyncSession, profile_id: uuid.UUID) -> Profile:
-    """Presencia del médico (mark_myself_online): actualiza last_seen_at."""
-    profile = await get_profile(session, profile_id)
-    profile.last_seen_at = datetime.now(UTC)
-    await session.commit()
-    await session.refresh(profile)
     return profile
 
 
