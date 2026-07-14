@@ -128,18 +128,19 @@ class DoctorResponse(BaseModel):
 
 
 class DoctorPoolItem(BaseModel):
-    """Fila del pool de médicos: datos mínimos para listar/referir + estado online.
+    """Fila del pool de médicos: datos mínimos para listar/referir. Sin teléfono: el WhatsApp
+    se revela aparte (y se audita) con POST /doctors/{id}/contact.
 
-    `online` se deriva en el servicio de `users.last_seen_at` (ventana de 3 min); los
-    ids de especialidad/tipo los mapea el frontend a nombre con sus catálogos ya cargados.
+    El estado "online" NO viene del backend: lo resuelve el frontend con Supabase Realtime
+    Presence, cruzando por `user_id`. Los ids de especialidad/tipo los mapea el frontend a
+    nombre con sus catálogos ya cargados.
     """
 
     id: uuid.UUID
+    user_id: uuid.UUID | None = None
     full_name: str
     specialty_id: uuid.UUID | None = None
     professional_type_id: uuid.UUID | None = None
-    phone: str | None = None
-    online: bool
 
 
 class DoctorPoolPage(BaseModel):
@@ -147,3 +148,9 @@ class DoctorPoolPage(BaseModel):
 
     items: list[DoctorPoolItem]
     total: int
+
+
+class DoctorContactResponse(BaseModel):
+    """Teléfono de contacto de un médico del pool, revelado bajo auditoría (POST .../contact)."""
+
+    phone: str | None = None

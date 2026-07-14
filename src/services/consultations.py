@@ -3,8 +3,9 @@
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from src.core.errors import (
     BadRequestError,
@@ -26,6 +27,17 @@ from src.services.specialties import compute_priority
 _HEARTBEAT_OPEN_STATUSES = {"waiting", "in_progress"}
 # Resultados de cierre permitidos.
 _CLOSE_OUTCOMES = {"closed", "patient_no_show"}
+
+# Panel médico: cola de espera (casos sin asignar) y "mis consultas abiertas".
+_PANEL_WAITING_STATUSES = (
+    "waiting",
+    "in_progress",
+    "referred_to_specialist",
+    "urgent_in_person",
+    "contacted_whatsapp",
+    "patient_no_show",
+)
+_PANEL_MINE_STATUSES = ("in_progress", "contacted_whatsapp")
 
 
 def _validate_status(value: str | None) -> None:
@@ -136,6 +148,99 @@ async def close_consultation(
     await session.commit()
     await session.refresh(consultation)
     return consultation
+
+
+async def claim_consultation(
+    session: AsyncSession,
+    consultation_id: uuid.UUID,
+    doctor_user_id: uuid.UUID,
+    via_whatsapp: bool = False,
+) -> Consultation:
+    """Toma una consulta en espera para el médico autenticado.
+
+    Claim ATÓMICO: el UPDATE solo matchea mientras `assigned_doctor_id IS NULL`, así que si
+    otro médico la tomó primero afecta 0 filas y se responde 409. La condición de carrera la
+    resuelve la base (un único ganador), no un read-then-write en la app."""
+    consultation = await get_consultation(session, consultation_id)  # 404 si no existe
+    now = datetime.now(UTC)
+    stmt = (
+        update(Consultation)
+        .where(
+            Consultation.id == consultation_id,
+            Consultation.assigned_doctor_id.is_(None),
+        )
+        .values(
+            status="in_progress",
+            assigned_doctor_id=doctor_user_id,
+            # No pisar opened_at si ya estaba (re-claim tras liberar).
+            opened_at=func.coalesce(Consultation.opened_at, now),
+            attended_via_whatsapp=via_whatsapp,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    result = await session.execute(stmt)
+    if result.rowcount == 0:
+        raise ConflictError("Este paciente ya fue tomado por otro médico.")
+
+    session.add(
+        ConsultationEvent(
+            consultation_id=consultation_id,
+            event_type="opened",
+            created_by=doctor_user_id,
+            note="Atendido vía WhatsApp" if via_whatsapp else "Abierta",
+        )
+    )
+    await audit.log_action(
+        session,
+        action="consultation.claimed",
+        actor_user_id=doctor_user_id,
+        resource="consultations",
+        resource_id=consultation_id,
+        metadata={"via_whatsapp": via_whatsapp},
+    )
+    await session.commit()
+    await session.refresh(consultation)  # el objeto quedó desfasado por el UPDATE en masa
+    return consultation
+
+
+async def get_panel(
+    session: AsyncSession,
+    doctor_user_id: uuid.UUID,
+) -> tuple[list[Consultation], list[Consultation], int]:
+    """Datos del panel médico en una pasada: cola de espera (TODA consulta sin asignar en un
+    estado abierto — el médico las ve en tiempo real para atender de una vez, sin esperar), las
+    consultas abiertas del propio médico y cuántas ha cerrado. El paciente viene precargado
+    (`selectinload`) para el card de cada fila."""
+    waiting_stmt = (
+        select(Consultation)
+        .options(selectinload(Consultation.patient))
+        .where(
+            Consultation.assigned_doctor_id.is_(None),
+            Consultation.status.in_(_PANEL_WAITING_STATUSES),
+        )
+        .order_by(Consultation.created_at.asc())
+    )
+    mine_stmt = (
+        select(Consultation)
+        .options(selectinload(Consultation.patient))
+        .where(
+            Consultation.assigned_doctor_id == doctor_user_id,
+            Consultation.status.in_(_PANEL_MINE_STATUSES),
+        )
+        .order_by(Consultation.created_at.asc())
+    )
+    closed_stmt = (
+        select(func.count())
+        .select_from(Consultation)
+        .where(
+            Consultation.assigned_doctor_id == doctor_user_id,
+            Consultation.status == "closed",
+        )
+    )
+    waiting = list((await session.execute(waiting_stmt)).scalars().all())
+    mine = list((await session.execute(mine_stmt)).scalars().all())
+    my_closed = (await session.execute(closed_stmt)).scalar_one()
+    return waiting, mine, my_closed
 
 
 async def heartbeat(session: AsyncSession, consultation_id: uuid.UUID) -> Consultation:

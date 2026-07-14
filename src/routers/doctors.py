@@ -16,6 +16,7 @@ from src.core.ratelimit import limiter
 from src.core.security import Principal, get_current_principal, require_permission
 from src.db.session import get_db
 from src.schemas.doctor import (
+    DoctorContactResponse,
     DoctorCreate,
     DoctorMeResponse,
     DoctorPoolPage,
@@ -129,24 +130,49 @@ async def doctor_pool(
     limit: int = Query(20, ge=1, le=100),
     specialty_id: uuid.UUID | None = Query(None),
     professional_type_id: uuid.UUID | None = Query(None),
-    online: bool | None = Query(None, description="true=logeados · false=offline · omitir=todos"),
+    search: str | None = Query(None, description="Filtra por nombre (ILIKE)."),
+    online: bool | None = Query(
+        None, description="true=solo online · false=solo offline · omitir=todos"
+    ),
+    online_ids: list[uuid.UUID] | None = Query(
+        None, description="user_ids que el cliente sabe online por Presence (para filtrar online)."
+    ),
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("doctors.read")),
 ) -> DoctorPoolPage:
-    """Médicos activos (status=1) para referir/agendar durante una consulta, con su estado
-    online (logeado < 3 min) y teléfono de contacto. Filtrable por especialidad y tipo de
-    profesional; los online van primero. Excluye al propio médico que consulta. Devuelve
-    `{items, total}` para la paginación del cliente."""
+    """Médicos activos (status=1) para referir/agendar durante una consulta. Filtrable por nombre
+    (`search`), especialidad y tipo. El estado online lo resuelve el frontend con Realtime Presence
+    y lo pasa como `online_ids` + `online` (true/false) para filtrar sin romper la paginación. NO
+    trae el teléfono (se revela con POST .../contact). Excluye al propio médico que consulta."""
     items, total = await doctors_service.list_doctor_pool(
         db,
         skip=skip,
         limit=limit,
         specialty_id=specialty_id,
         professional_type_id=professional_type_id,
+        search=search,
         online=online,
+        online_user_ids=online_ids,
         exclude_user_id=principal.id,
     )
     return DoctorPoolPage(items=items, total=total)
+
+
+@router.post(
+    "/{doctor_id}/contact",
+    response_model=DoctorContactResponse,
+    summary="Revelar el WhatsApp de un médico del pool (queda auditado)",
+    responses=_NOT_FOUND,
+)
+async def reveal_doctor_contact(
+    doctor_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_permission("doctors.read")),
+) -> DoctorContactResponse:
+    """Devuelve el teléfono de contacto del médico y REGISTRA en audit_log que este usuario lo vio
+    (para la bitácora del panel admin). El número no aparece en el listado del pool: solo aquí."""
+    phone = await doctors_service.reveal_doctor_contact(db, doctor_id, viewer_user_id=principal.id)
+    return DoctorContactResponse(phone=phone)
 
 
 @router.get(

@@ -79,8 +79,10 @@ class Settings(BaseSettings):
     STALE_CONSULTATION_MINUTES: int = 30
 
     # --- Videoconsulta (Jitsi) ---
-    # Por defecto el público meet.jit.si; se puede apuntar a una instancia self-hosted.
-    JITSI_DOMAIN: str = "meet.jit.si"
+    # Instancia self-hosted (salas abiertas, sin moderador). NO se usa el público meet.jit.si por
+    # defecto porque ahora exige login de moderador ("no moderators have yet arrived"). Override
+    # con la env JITSI_DOMAIN si el host cambia.
+    JITSI_DOMAIN: str = "meet.medicosporvenezuela.org"
 
     # --- CORS ---
     BACKEND_CORS_ORIGINS: str = "*"

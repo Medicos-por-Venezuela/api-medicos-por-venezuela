@@ -16,6 +16,10 @@ __all__ = [
     "ConsultationResponse",
     "ConsultationPatientResponse",
     "ConsultationCloseRequest",
+    "ConsultationClaimRequest",
+    "ConsultationPanelResponse",
+    "PanelConsultationItem",
+    "PanelPatient",
     "QueueReleaseResponse",
 ]
 
@@ -115,6 +119,7 @@ class ConsultationResponse(ConsultationBase):
     has_rest_note: bool
     follow_up_scheduled: bool
     contacted: bool
+    attended_via_whatsapp: bool
     queued_at: datetime
     started_at: datetime | None = None
     ended_at: datetime | None = None
@@ -157,3 +162,59 @@ class ConsultationPatientResponse(BaseModel):
     closed_at: datetime | None = None
     patient_last_seen_at: datetime | None = None
     created_at: datetime
+
+
+class ConsultationClaimRequest(BaseModel):
+    """Cuerpo para tomar una consulta desde el panel médico."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # true = atención por WhatsApp (sin videollamada); false = se abre la sala de video.
+    via_whatsapp: bool = False
+
+
+class PanelPatient(BaseModel):
+    """Datos del paciente que el card del panel médico necesita mostrar."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    full_name: str
+    cedula: str | None = None
+    phone_whatsapp: str | None = None
+    affected_zone: str | None = None
+    age_range: str | None = None
+    needs_tags: list[str] | None = None
+    description: str | None = None
+
+
+class PanelConsultationItem(BaseModel):
+    """Fila de consulta para las listas del panel médico (cola de espera y las propias),
+    con el paciente anidado. Excluye notas clínicas/internas (no se muestran en la cola)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    code: str
+    status: str
+    priority: str
+    category: str | None = None
+    chief_complaint: str | None = None
+    referred_specialty: str | None = None
+    video_room_url: str | None = None
+    assigned_doctor_id: uuid.UUID | None = None
+    attended_via_whatsapp: bool
+    opened_at: datetime | None = None
+    closed_at: datetime | None = None
+    patient_last_seen_at: datetime | None = None
+    created_at: datetime
+    patient: PanelPatient | None = None
+
+
+class ConsultationPanelResponse(BaseModel):
+    """Payload del panel médico en una sola llamada: cola de espera sin asignar,
+    las consultas abiertas del propio médico y cuántas ha cerrado."""
+
+    waiting: list[PanelConsultationItem]
+    mine: list[PanelConsultationItem]
+    my_closed_count: int

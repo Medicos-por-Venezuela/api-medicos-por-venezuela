@@ -123,12 +123,7 @@ async def test_video_room_idempotent_and_conflict(client: AsyncClient) -> None:
 # --- acciones de perfil ---
 
 
-async def test_profile_online_and_active(client: AsyncClient, db_session: AsyncSession) -> None:
-    # Presencia del médico autenticado (admin es staff).
-    online = await client.post(f"{PREFIX}/profiles/me/online")
-    assert online.status_code == 200
-    assert online.json()["last_seen_at"] is not None
-
+async def test_profile_active_toggle(client: AsyncClient, db_session: AsyncSession) -> None:
     # Revocar/reactivar a OTRO perfil (no el propio admin, para no perder permisos).
     target = await _doctor(db_session, "Cardiología")
     revoked = await client.patch(f"{PREFIX}/profiles/{target.id}/active", json={"active": False})

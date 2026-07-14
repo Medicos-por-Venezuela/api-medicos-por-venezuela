@@ -18,11 +18,14 @@ from src.core.security import (
 )
 from src.db.session import get_db
 from src.schemas.consultation import (
+    ConsultationClaimRequest,
     ConsultationCloseRequest,
     ConsultationCreate,
+    ConsultationPanelResponse,
     ConsultationPatientResponse,
     ConsultationResponse,
     ConsultationUpdate,
+    PanelConsultationItem,
 )
 from src.schemas.consultation_event import (
     ConsultationEventCreate,
@@ -85,6 +88,27 @@ async def create_consultation(
 ) -> ConsultationResponse:
     """Crea una consulta en espera. El `code` lo genera la base de datos (trigger)."""
     return await consultations_service.create_consultation(db, payload)
+
+
+# NOTA: debe ir ANTES de "/{consultation_id}" o FastAPI intenta parsear "panel" como UUID (422).
+@router.get(
+    "/panel",
+    response_model=ConsultationPanelResponse,
+    summary="Cola del panel médico (espera + mías + cerradas)",
+)
+async def consultation_panel(
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_permission("queue.read")),
+) -> ConsultationPanelResponse:
+    """Todo lo que el panel del médico necesita en una llamada: la cola de espera (casos sin
+    asignar), las consultas abiertas del propio médico y cuántas ha cerrado. Reemplaza las
+    lecturas directas a Supabase del panel."""
+    waiting, mine, my_closed = await consultations_service.get_panel(db, principal.id)
+    return ConsultationPanelResponse(
+        waiting=[PanelConsultationItem.model_validate(c) for c in waiting],
+        mine=[PanelConsultationItem.model_validate(c) for c in mine],
+        my_closed_count=my_closed,
+    )
 
 
 @router.get(
@@ -159,6 +183,30 @@ async def close_consultation(
     return await consultations_service.close_consultation(
         db, consultation_id, payload.outcome, closed_by=principal.id, note=payload.note
     )
+
+
+@router.post(
+    "/{consultation_id}/claim",
+    response_model=ConsultationResponse,
+    summary="Tomar una consulta en espera (claim atómico)",
+    responses={
+        **_NOT_FOUND,
+        409: {"description": "La consulta ya fue tomada por otro médico."},
+    },
+)
+async def claim_consultation(
+    consultation_id: uuid.UUID,
+    payload: ConsultationClaimRequest,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_permission("queue.take")),
+) -> ConsultationResponse:
+    """El médico autenticado toma un caso en espera. Atómico: si otro médico lo tomó primero
+    responde 409 (nunca dos médicos sobre el mismo paciente). `via_whatsapp` marca atención
+    por WhatsApp (sin sala de video)."""
+    consultation = await consultations_service.claim_consultation(
+        db, consultation_id, doctor_user_id=principal.id, via_whatsapp=payload.via_whatsapp
+    )
+    return ConsultationResponse.model_validate(consultation)
 
 
 @router.post(

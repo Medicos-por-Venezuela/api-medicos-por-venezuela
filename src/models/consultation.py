@@ -68,6 +68,10 @@ class Consultation(Base):
         Boolean, nullable=False, server_default=text("false")
     )
     contacted: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    # El médico atendió por WhatsApp (sin videollamada). Lo fija el claim del panel.
+    attended_via_whatsapp: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
     queued_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
