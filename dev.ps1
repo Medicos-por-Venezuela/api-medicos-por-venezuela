@@ -33,8 +33,23 @@ if ($LASTEXITCODE -ne 0) { npx supabase start }
 # Primera vez (BD recien creada, sin schema_migrations todavia): si hay un dump de prod
 # en .\backups y credenciales en .env.supabase, restaura datos REALES antes de migrar.
 # En corridas siguientes no toca nada (nunca pisa datos ya cargados).
-$hasSchema = docker exec supabase_db_api-medicos-por-venezuela psql -U postgres -d postgres `
-  -tAc "select to_regclass('public.schema_migrations') is not null" 2>$null
+# El contenedor se resuelve por el nombre de ESTE proyecto primero; solo si no aparece
+# (p.ej. carpeta renombrada) se cae al patron global, avisando si hay varios candidatos:
+# con dos proyectos Supabase corriendo, el patron a secas podia elegir la BD equivocada
+# y saltarse (o disparar) la restauracion del dump contra el proyecto que no era.
+$dbContainer = docker ps --format '{{.Names}}' |
+  Where-Object { $_ -eq 'supabase_db_api-medicos-por-venezuela' } | Select-Object -First 1
+if (-not $dbContainer) {
+  $candidates = @(docker ps --format '{{.Names}}' | Where-Object { $_ -like 'supabase_db_*' })
+  if ($candidates.Count -gt 1) {
+    Write-Warning "Hay $($candidates.Count) contenedores supabase_db_*; usando '$($candidates[0])'. Verifica que sea el de este proyecto."
+  }
+  $dbContainer = $candidates | Select-Object -First 1
+}
+$hasSchema = if ($dbContainer) {
+  docker exec $dbContainer psql -U postgres -d postgres `
+    -tAc "select to_regclass('public.schema_migrations') is not null" 2>$null
+} else { $null }
 if ($hasSchema -ne "t") {
   $dump = Get-ChildItem backups\*.dump -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
   if ($dump -and (Test-Path ".env.supabase") -and (Get-Command bash -ErrorAction SilentlyContinue)) {

@@ -15,12 +15,15 @@ _RESOURCE = "professional_types"
 
 
 async def list_professional_types(
-    session: AsyncSession, skip: int = 0, limit: int = 100
+    session: AsyncSession, skip: int = 0, limit: int = 100, status: str | None = None
 ) -> list[ProfessionalType]:
+    """Lista tipos no borrados; con `status` filtra además por él (el público usa
+    'active' para que desactivar un tipo lo oculte del registro; el admin ve todos)."""
+    stmt = select(ProfessionalType).where(ProfessionalType.status != "deleted")
+    if status:
+        stmt = stmt.where(ProfessionalType.status == status)
     stmt = (
-        select(ProfessionalType)
-        .where(ProfessionalType.status != "deleted")
-        .order_by(ProfessionalType.created_at.desc(), ProfessionalType.id.desc())
+        stmt.order_by(ProfessionalType.created_at.desc(), ProfessionalType.id.desc())
         .offset(skip)
         .limit(limit)
     )

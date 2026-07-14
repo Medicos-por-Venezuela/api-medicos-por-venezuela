@@ -26,7 +26,10 @@ STAMP=$(date +%Y%m%d_%H%M%S)
 mkdir -p backups
 
 echo "[backup] Volcando Supabase local (puerto ${PORT}, formato custom)..."
-docker run --rm -e PGPASSWORD="${PASSWORD}" postgres:17 \
+# --add-host: en Docker Desktop (Win/Mac) host.docker.internal resuelve solo; en Docker
+# sobre Linux nativo no existe sin este mapeo a host-gateway (no-op donde ya resuelve).
+docker run --rm --add-host=host.docker.internal:host-gateway \
+  -e PGPASSWORD="${PASSWORD}" postgres:17 \
   pg_dump -h host.docker.internal -p "${PORT}" -U "${USER}" -d "${DB}" \
   --schema=public --no-owner --no-privileges -Fc \
   > "backups/local_${STAMP}.dump"

@@ -24,6 +24,8 @@ Utiliza estrictamente el "Patrón de Capa de Servicios" (3-Tier Architecture). E
 ## 📄 Paginación Segura
 - NUNCA utilices el método `.all()` en SQLAlchemy para devolver listas de registros.
 - Todo endpoint tipo `GET` que retorne colecciones debe implementar paginación mediante `limit` y `offset` por defecto (máximo 100 registros por página).
+- **Todo `order_by` de un listado paginado termina en una columna única** (p.ej. `.order_by(X.nombre, X.id)`): sin tiebreaker, el orden entre empatados es indefinido y `OFFSET` puede repetir/omitir filas entre páginas.
+- **El test del tiebreaker debe ser determinista, no probabilístico**: no basta "recorrer páginas sin duplicados" (los empates suelen salir en orden repetible por accidente y el test no detecta la regresión). Siembra N filas empatadas y asierta que aparecen **en el orden de la columna de desempate** (lección del review 2026-07-14, ver `test_pool_paginacion_disjunta_y_total`).
 
 ## ⏱️ Resiliencia y Background Tasks
 - Diseña estados transitorios. Si una consulta no se completa o actualiza en X minutos, debe existir un mecanismo (BackgroundTasks de FastAPI o un CRON worker) que libere al paciente, devolviéndolo al estado `esperando`.

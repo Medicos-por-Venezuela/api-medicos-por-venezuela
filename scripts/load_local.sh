@@ -32,7 +32,9 @@ echo "[load] Restaurando ${DUMP} en Supabase local (puerto ${PORT})..."
 # Supabase local publica el puerto en el HOST, no en la red de este contenedor).
 # --disable-triggers: evita que FKs a auth.users (vacías fuera de este dump)
 # bloqueen la carga; el dump es solo del esquema public.
-docker run --rm -i -e PGPASSWORD="${PASSWORD}" postgres:17 \
+# --add-host: necesario en Docker sobre Linux nativo (no-op en Docker Desktop).
+docker run --rm -i --add-host=host.docker.internal:host-gateway \
+  -e PGPASSWORD="${PASSWORD}" postgres:17 \
   pg_restore -h host.docker.internal -p "${PORT}" -U "${USER}" -d "${DB}" \
   --no-owner --no-privileges --disable-triggers < "${DUMP}" || true
 

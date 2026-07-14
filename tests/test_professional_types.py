@@ -214,3 +214,32 @@ async def test_professional_type_soft_deleted_is_hidden(
         select(ProfessionalType).where(ProfessionalType.id == row.id)
     )
     assert result.scalar_one().status == "deleted"
+
+
+async def test_professional_type_inactivo_oculto_en_publico_visible_en_admin(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Desactivar un tipo lo saca del listado público (registro de médicos / pool)
+    pero sigue visible en /admin para gestionarlo — mismo patrón que specialties."""
+    row = ProfessionalType(name="Inactivo QA", status="inactive")
+    db_session.add(row)
+    await db_session.commit()
+
+    publico = await client.get(f"{PREFIX}/professional-types", params={"limit": 100})
+    assert all(item["id"] != str(row.id) for item in publico.json())
+
+    admin = await client.get(f"{PREFIX}/professional-types/admin", params={"limit": 100})
+    assert admin.status_code == 200
+    assert any(item["id"] == str(row.id) for item in admin.json())
+
+
+async def test_professional_type_admin_requiere_permiso(
+    auth_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    doctor = make_profile(role="doctor")  # doctor no tiene catalogs.manage
+    db_session.add(doctor)
+    await db_session.flush()
+    resp = await auth_client.get(
+        f"{PREFIX}/professional-types/admin", headers=auth_headers(doctor.id)
+    )
+    assert resp.status_code == 403
