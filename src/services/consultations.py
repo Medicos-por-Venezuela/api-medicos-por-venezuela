@@ -15,6 +15,7 @@ from src.core.errors import (
 from src.models.consultation import CONSULTATION_STATUSES, Consultation
 from src.models.consultation_event import ConsultationEvent
 from src.models.patient import Patient
+from src.models.profile import Profile
 from src.models.specialty import Specialty
 from src.schemas.consultation import ConsultationCreate, ConsultationUpdate
 from src.schemas.consultation_event import ConsultationEventCreate
@@ -42,20 +43,37 @@ async def list_consultations(
     viewer_is_staff: bool = True,
     viewer_user_id: uuid.UUID | None = None,
 ) -> list[Consultation]:
+    """Lista consultas. Además de las filas `Consultation`, resuelve en el mismo
+    query (LEFT JOIN) `patient_name` y `assigned_doctor_name` y los adjunta como
+    atributos transitorios (no mapeados) a cada instancia, para que
+    `ConsultationResponse` (from_attributes=True) los sirva sin round-trips extra
+    (monitor de consultas del panel admin)."""
     _validate_status(status)
-    stmt = select(Consultation)
+    stmt = (
+        select(
+            Consultation,
+            Patient.full_name.label("patient_name"),
+            Profile.full_name.label("assigned_doctor_name"),
+        )
+        .outerjoin(Patient, Consultation.patient_id == Patient.id)
+        .outerjoin(Profile, Consultation.assigned_doctor_id == Profile.id)
+    )
     if status:
         stmt = stmt.where(Consultation.status == status)
     if patient_id:
         stmt = stmt.where(Consultation.patient_id == patient_id)
     if not viewer_is_staff:
         # Un paciente solo ve las consultas ligadas a su propia cuenta (RLS select_own).
-        stmt = stmt.join(Patient, Consultation.patient_id == Patient.id).where(
-            Patient.user_id == viewer_user_id
-        )
+        stmt = stmt.where(Patient.user_id == viewer_user_id)
     stmt = stmt.order_by(Consultation.created_at.desc()).offset(skip).limit(limit)
-    result = await session.execute(stmt)
-    return list(result.scalars().all())
+    rows = (await session.execute(stmt)).all()
+    consultations = []
+    for row in rows:
+        consultation = row.Consultation
+        consultation.patient_name = row.patient_name
+        consultation.assigned_doctor_name = row.assigned_doctor_name
+        consultations.append(consultation)
+    return consultations
 
 
 async def get_consultation(

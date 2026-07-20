@@ -29,8 +29,9 @@ from src.services import sacs as sacs_service
 _DOCTOR_PROFILE_ROLES = {"doctor", "specialist"}
 
 # Un médico cuenta como "online" si marcó presencia hace menos de esto (igual criterio
-# que el panel/admin del frontend: last_seen_at < 3 min).
-_ONLINE_WINDOW = timedelta(minutes=3)
+# que el panel/admin del frontend: last_seen_at < 3 min). Público: lo reutiliza
+# services/stats.py como única fuente de verdad del criterio "online".
+ONLINE_WINDOW = timedelta(minutes=3)
 
 
 def _normalize(text: str) -> str:
@@ -135,7 +136,7 @@ async def list_doctor_pool(
     True = logeado (< 3 min), False = offline, None = todos. Ordena los online primero.
     `exclude_user_id`: quita al propio médico que consulta (no se refiere a sí mismo).
     """
-    threshold = datetime.now(UTC) - _ONLINE_WINDOW
+    threshold = datetime.now(UTC) - ONLINE_WINDOW
     online_expr = Profile.last_seen_at >= threshold
     # Teléfono para el enlace de WhatsApp: el de doctors o, si falta, el whatsapp de la cuenta.
     phone_expr = func.coalesce(Doctor.phone, Profile.whatsapp_number)
