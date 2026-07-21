@@ -50,6 +50,10 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     # Deja los orígenes CORS efectivos en los logs de arranque: cuando un front rebota por CORS,
     # se ve de una si su origen está (o no) en la lista, sin adivinar desde el .env.
     logger.info("CORS origins efectivos: %s", settings.cors_origins)
+    logger.info(
+        "Mail (Mailtrap): %s",
+        "habilitado" if settings.MAILTRAP_API_TOKEN else "deshabilitado (sin MAILTRAP_API_TOKEN)",
+    )
     yield
 
 
