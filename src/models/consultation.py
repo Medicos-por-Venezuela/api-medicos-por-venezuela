@@ -20,6 +20,7 @@ CONSULTATION_STATUSES = {
     "cancelled",
     "patient_no_show",
     "closed_by_admin",
+    "contacted_whatsapp",
 }
 
 
@@ -74,6 +75,12 @@ class Consultation(Base):
     )
     queued_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    # Momento en que el PACIENTE hace clic en "Entrar a la videoconsulta" (usado
+    # junto a status == "waiting" para el conteo "en espera" del dashboard,
+    # paridad con el comportamiento legacy que consultaba directo a Supabase).
+    entered_call_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -711,6 +711,19 @@ async def test_pool_excludes_self(
     assert str(other.id) in ids
 
 
+async def test_pool_includes_self_when_exclude_self_false(
+    client: AsyncClient, db_session: AsyncSession, admin_identity
+) -> None:
+    """Con exclude_self=false (dashboard admin), el propio médico SÍ aparece — así el KPI
+    'Médicos online' (Presence, incluye al admin-médico) y la lista del pool cuadran."""
+    nutri = await _type_id(db_session, "nutricionista")
+    mine = await _pool_doctor(db_session, online=True, type_id=nutri, user_id=admin_identity.id)
+
+    body = await _pool(client, professional_type_id=nutri, exclude_self="false")
+    ids = {i["id"] for i in body["items"]}
+    assert str(mine.id) in ids
+
+
 async def test_pool_search_by_name(client: AsyncClient, db_session: AsyncSession) -> None:
     nutri = await _type_id(db_session, "nutricionista")
     hit = await _pool_doctor(db_session, type_id=nutri, name="Zoraida Buscada")

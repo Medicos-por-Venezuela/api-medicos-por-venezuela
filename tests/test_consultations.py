@@ -1,11 +1,14 @@
 """Pruebas del recurso consultations y sus eventos (CRUD aislado)."""
 
 import uuid
+from datetime import UTC, datetime
 
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.models.consultation import Consultation
+from src.models.patient import Patient
 from src.models.specialty import Specialty
 from tests._helpers import auth_headers, make_profile
 
@@ -453,3 +456,162 @@ async def test_admin_puede_gestionar_consulta_ajena(
     assert patched.status_code == 200
     closed = await client.post(f"{PREFIX}/consultations/{cid}/close", json={"outcome": "closed"})
     assert closed.status_code == 200
+
+
+# --- entered_call_at (paridad con el dashboard legacy: "en espera" = waiting +
+#     el médico ya entró a la sala) ---------------------------------------------
+
+
+async def test_consultation_entered_call_at_round_trips(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    patient_id = await _create_patient(client)
+    cid = (await client.post(f"{PREFIX}/consultations", json={"patient_id": patient_id})).json()[
+        "id"
+    ]
+
+    consultation = await db_session.get(Consultation, uuid.UUID(cid))
+    assert consultation.entered_call_at is None  # default: nadie ha entrado aún
+
+    now = datetime.now(UTC)
+    consultation.entered_call_at = now
+    await db_session.flush()
+    await db_session.refresh(consultation)
+    assert consultation.entered_call_at is not None
+
+
+# --- Enriquecimiento del listado (patient_name / assigned_doctor_name) --------
+
+
+async def test_consultation_list_includes_patient_and_doctor_names(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    patient_id = await _create_patient(client)
+    doctor_profile = make_profile(role="doctor")
+    db_session.add(doctor_profile)
+    await db_session.flush()
+
+    cid = (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": patient_id, "chief_complaint": "Fiebre"},
+        )
+    ).json()["id"]
+
+    patched = await client.patch(
+        f"{PREFIX}/consultations/{cid}",
+        json={"assigned_doctor_id": str(doctor_profile.id), "status": "in_progress"},
+    )
+    assert patched.status_code == 200, patched.text
+
+    listed = await client.get(f"{PREFIX}/consultations", params={"patient_id": patient_id})
+    assert listed.status_code == 200
+    row = next(c for c in listed.json() if c["id"] == cid)
+    assert row["patient_name"] == "Paciente Consulta"
+    assert row["assigned_doctor_name"] == doctor_profile.full_name
+
+
+async def test_consultation_list_names_are_null_when_unassigned(client: AsyncClient) -> None:
+    patient_id = await _create_patient(client)
+    cid = (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": patient_id, "chief_complaint": "Tos"},
+        )
+    ).json()["id"]
+
+    listed = await client.get(f"{PREFIX}/consultations", params={"patient_id": patient_id})
+    row = next(c for c in listed.json() if c["id"] == cid)
+    assert row["patient_name"] == "Paciente Consulta"
+    assert row["assigned_doctor_name"] is None
+
+
+# --- Anti-PII: un paciente autenticado no debe recibir patient_name / -------
+#     assigned_doctor_name (esos campos son enriquecimiento solo para staff) ---
+
+
+async def test_consultation_list_hides_pii_from_patient_viewer(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Guarda contra un futuro drift de `ConsultationPatientResponse`: si algún día
+    se le agregan `patient_name`/`assigned_doctor_name`, este test debe fallar."""
+    patient_id = await _create_patient(client)
+    doctor_profile = make_profile(role="doctor")
+    db_session.add(doctor_profile)
+    await db_session.flush()
+
+    cid = (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": patient_id, "chief_complaint": "Fiebre"},
+        )
+    ).json()["id"]
+    patched = await client.patch(
+        f"{PREFIX}/consultations/{cid}",
+        json={"assigned_doctor_id": str(doctor_profile.id), "status": "in_progress"},
+    )
+    assert patched.status_code == 200, patched.text
+
+    # La cuenta (users) del paciente, ligada a su ficha (patients.user_id), es el
+    # "viewer" no-staff que la API usa para filtrar por pertenencia (anti-IDOR).
+    patient_profile = make_profile(role="patient")
+    db_session.add(patient_profile)
+    await db_session.flush()
+    patient_row = await db_session.get(Patient, uuid.UUID(patient_id))
+    patient_row.user_id = patient_profile.id
+    await db_session.flush()
+
+    listed = await client.get(
+        f"{PREFIX}/consultations",
+        params={"patient_id": patient_id},
+        headers=auth_headers(patient_profile.id),
+    )
+    assert listed.status_code == 200, listed.text
+    row = next(c for c in listed.json() if c["id"] == cid)
+    assert "patient_name" not in row
+    assert "assigned_doctor_name" not in row
+
+
+# --- Regresión: ConsultationResponse no debe re-validar longitud de datos ------
+#     ya persistidos (bug de producción: filas reales con chief_complaint > 500
+#     causaban un 500 al listar/serializar). ---------------------------------
+
+
+async def test_list_consultations_serializes_chief_complaint_longer_than_500(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    patient_id = await _create_patient(client)
+    long_complaint = "a" * 600  # excede el max_length=500 que tenían los esquemas de entrada.
+
+    consultation = Consultation(
+        patient_id=uuid.UUID(patient_id),
+        status="in_progress",
+        chief_complaint=long_complaint,
+    )
+    db_session.add(consultation)
+    await db_session.flush()
+
+    listed = await client.get(
+        f"{PREFIX}/consultations", params={"status": "in_progress", "limit": 100}
+    )
+    assert listed.status_code == 200, listed.text
+    row = next(c for c in listed.json() if c["id"] == str(consultation.id))
+    assert row["chief_complaint"] == long_complaint
+    assert len(row["chief_complaint"]) == 600
+
+
+async def test_list_consultations_filters_by_contacted_whatsapp_status(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    patient_id = await _create_patient(client)
+
+    consultation = Consultation(
+        patient_id=uuid.UUID(patient_id),
+        status="contacted_whatsapp",
+    )
+    db_session.add(consultation)
+    await db_session.flush()
+
+    listed = await client.get(f"{PREFIX}/consultations", params={"status": "contacted_whatsapp"})
+    assert listed.status_code == 200, listed.text
+    assert any(c["id"] == str(consultation.id) for c in listed.json())

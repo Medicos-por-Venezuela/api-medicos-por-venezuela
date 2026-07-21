@@ -25,19 +25,26 @@ __all__ = [
 
 
 class ConsultationBase(BaseModel):
+    """Base usada SOLO por `ConsultationResponse` (esquema de salida).
+
+    Sin `max_length`: son datos ya persistidos en la base y una validación de
+    salida no debe rechazar filas existentes que excedan un límite pensado para
+    entrada (ver ConsultationCreate/ConsultationUpdate, que sí lo validan).
+    """
+
     patient_id: uuid.UUID
-    priority: str = Field("normal", max_length=20)
-    category: str | None = Field(default=None, max_length=100)
+    priority: str = "normal"
+    category: str | None = None
     # Especialidad solicitada por el paciente (catálogo specialties). Reemplaza a
     # needs_tags para el registro nuevo; el filtro del panel se actualiza aparte.
     specialty_id: uuid.UUID | None = None
-    chief_complaint: str | None = Field(default=None, max_length=500)
-    referred_specialty: str | None = Field(default=None, max_length=100)
+    chief_complaint: str | None = None
+    referred_specialty: str | None = None
     doctor_id: uuid.UUID | None = None
     assigned_doctor_id: uuid.UUID | None = None
-    platform_used: str | None = Field(default=None, max_length=50)
-    meeting_link: str | None = Field(default=None, max_length=500)
-    video_room_url: str | None = Field(default=None, max_length=500)
+    platform_used: str | None = None
+    meeting_link: str | None = None
+    video_room_url: str | None = None
 
 
 class ConsultationCreate(BaseModel):
@@ -127,6 +134,12 @@ class ConsultationResponse(ConsultationBase):
     closed_at: datetime | None = None
     patient_last_seen_at: datetime | None = None
     created_at: datetime
+    # Enriquecimiento para el panel admin (monitor de consultas): nombres resueltos
+    # server-side vía join (patients.full_name / users.full_name por
+    # assigned_doctor_id). Opcionales: nulos si el servicio no los resuelve o la
+    # consulta está sin asignar.
+    patient_name: str | None = None
+    assigned_doctor_name: str | None = None
 
 
 class ConsultationPatientResponse(BaseModel):
