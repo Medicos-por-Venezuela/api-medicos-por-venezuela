@@ -84,6 +84,16 @@ class Settings(BaseSettings):
     # con la env JITSI_DOMAIN si el host cambia.
     JITSI_DOMAIN: str = "meet.medicosporvenezuela.org"
 
+    # --- Correo (Mailtrap) — base para recordatorios y alertas ---
+    # Sin token, el envío queda DESHABILITADO (no-op con warning): local y tests no envían
+    # nada por accidente. En prod va en .env.production (Mailtrap → Sending → API Tokens).
+    MAILTRAP_API_TOKEN: str = ""
+    MAIL_FROM_EMAIL: str = "no-reply@medicosporvenezuela.org"
+    MAIL_FROM_NAME: str = "Médicos por Venezuela"
+    # Sandbox (Email Testing): si se define el inbox, entrega ahí en vez de enviar de verdad —
+    # ideal para probar plantillas en dev sin spamear correos reales.
+    MAILTRAP_INBOX_ID: str | None = None
+
     # --- CORS ---
     BACKEND_CORS_ORIGINS: str = "*"
 

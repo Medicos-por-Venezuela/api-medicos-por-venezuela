@@ -9,6 +9,7 @@ queda en True solo si la cédula es válida en ese registro; en cualquier otro c
 import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +28,9 @@ from src.services import sacs as sacs_service
 # Roles de `users` que corresponden a un médico (legacy `specialist` -> doctor).
 _DOCTOR_PROFILE_ROLES = {"doctor", "specialist"}
 
+# Ventana de "online" por last_seen_at (< 3 min). La reutiliza services/stats.py como única fuente
+# de verdad del KPI doctors_online del dashboard admin (el pool de médicos ya usa Presence).
+ONLINE_WINDOW = timedelta(minutes=3)
 
 def _normalize(text: str) -> str:
     """minúsculas y sin acentos: 'Médico' -> 'medico', 'Psicólogo' -> 'psicologo'."""
