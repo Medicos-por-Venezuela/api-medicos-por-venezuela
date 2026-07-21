@@ -9,9 +9,9 @@ queda en True solo si la cédula es válida en ese registro; en cualquier otro c
 import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
@@ -126,18 +126,23 @@ async def list_doctor_pool(
     specialty_id: uuid.UUID | None = None,
     professional_type_id: uuid.UUID | None = None,
     online: bool | None = None,
+    online_user_ids: list[uuid.UUID] | None = None,
     exclude_user_id: uuid.UUID | None = None,
 ) -> tuple[list[dict], int]:
-    """Pool de médicos para referir/agendar: cruza doctors con users (para el estado
-    online desde last_seen_at y el teléfono de contacto) y pagina. Devuelve (filas, total).
+    """Pool de médicos para referir/agendar: cruza doctors con users (para el teléfono de
+    contacto) y pagina. Devuelve (filas, total).
 
     Solo médicos que pueden atender: status == 1 (excluye baja=0 y expulsado=2) y no
-    borrados. El inner join con users descarta los mocks legacy sin user_id. `online`:
-    True = logeado (< 3 min), False = offline, None = todos. Ordena los online primero.
-    `exclude_user_id`: quita al propio médico que consulta (no se refiere a sí mismo).
+    borrados. El inner join con users descarta los mocks legacy sin user_id.
+
+    `online` lo determina **Realtime Presence**: el cliente manda en `online_user_ids` los
+    user_id conectados AHORA (WebSocket) y un médico cuenta como online si su user_id está en
+    ese set. Se migró desde `last_seen_at`, que quedó vestigial al pasar la presencia a
+    Presence (ya nadie lo actualiza). Sin IDs => nadie online. `online`: True = solo online,
+    False = solo offline, None = todos (ordena los online primero). `exclude_user_id`: quita
+    al propio médico que consulta.
     """
-    threshold = datetime.now(UTC) - ONLINE_WINDOW
-    online_expr = Profile.last_seen_at >= threshold
+    online_expr = Doctor.user_id.in_(online_user_ids or [])
     # Teléfono para el enlace de WhatsApp: el de doctors o, si falta, el whatsapp de la cuenta.
     phone_expr = func.coalesce(Doctor.phone, Profile.whatsapp_number)
 
@@ -162,12 +167,12 @@ async def list_doctor_pool(
     if online is True:
         base = base.where(online_expr)
     elif online is False:
-        base = base.where(or_(Profile.last_seen_at.is_(None), Profile.last_seen_at < threshold))
+        base = base.where(~online_expr)
 
     total = await session.scalar(select(func.count()).select_from(base.subquery())) or 0
 
     page = (
-        base.order_by(Profile.last_seen_at.desc().nulls_last(), Doctor.full_name)
+        base.order_by(online_expr.desc(), Doctor.full_name)
         .offset(skip)
         .limit(limit)
     )

@@ -130,11 +130,17 @@ async def doctor_pool(
     specialty_id: uuid.UUID | None = Query(None),
     professional_type_id: uuid.UUID | None = Query(None),
     online: bool | None = Query(None, description="true=logeados · false=offline · omitir=todos"),
+    online_ids: list[uuid.UUID] | None = Query(
+        None,
+        description="user_id de los médicos conectados AHORA por Realtime Presence (repetible). "
+        "El estado online sale de aquí, no de last_seen_at.",
+    ),
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("doctors.read")),
 ) -> DoctorPoolPage:
     """Médicos activos (status=1) para referir/agendar durante una consulta, con su estado
-    online (logeado < 3 min) y teléfono de contacto. Filtrable por especialidad y tipo de
+    online y teléfono de contacto. El estado online lo determina Realtime Presence: el cliente
+    pasa en `online_user_ids` los user_id conectados ahora. Filtrable por especialidad y tipo de
     profesional; los online van primero. Excluye al propio médico que consulta. Devuelve
     `{items, total}` para la paginación del cliente."""
     items, total = await doctors_service.list_doctor_pool(
@@ -144,6 +150,7 @@ async def doctor_pool(
         specialty_id=specialty_id,
         professional_type_id=professional_type_id,
         online=online,
+        online_user_ids=online_ids,
         exclude_user_id=principal.id,
     )
     return DoctorPoolPage(items=items, total=total)

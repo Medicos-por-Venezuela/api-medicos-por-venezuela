@@ -5,7 +5,6 @@ Las llamadas al SACS/FPV se mockean (sin red). Los professional_types 'Médico' 
 """
 
 import uuid
-from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 from httpx import AsyncClient
@@ -615,13 +614,12 @@ async def _pool_doctor(
     phone: str | None = None,
     user_id: uuid.UUID | None = None,
 ) -> Doctor:
-    """Crea un Doctor ligado a un Profile. Por defecto crea el Profile (con last_seen_at
-    reciente/viejo según `online`); si se pasa `user_id`, liga a esa cuenta existente."""
+    """Crea un Doctor ligado a un Profile (o a `user_id` si se pasa). El estado online ya NO
+    depende de last_seen_at: lo decide `online_user_ids` que el cliente pasa al endpoint (Realtime
+    Presence), así que `online` aquí es solo intención — el test pasa el user_id del que quiere
+    marcar como conectado."""
     if user_id is None:
         prof = make_profile(role="doctor")
-        prof.last_seen_at = datetime.now(UTC) - (
-            timedelta(minutes=1) if online else timedelta(hours=1)
-        )
         db.add(prof)
         await db.flush()
         user_id = prof.id
@@ -649,7 +647,8 @@ async def test_pool_shape_and_online_flag(client: AsyncClient, db_session: Async
     d_on = await _pool_doctor(db_session, online=True, type_id=nutri, name="Pool Online")
     d_off = await _pool_doctor(db_session, online=False, type_id=nutri, name="Pool Offline")
 
-    body = await _pool(client, professional_type_id=nutri)
+    # online lo decide Realtime Presence: pasamos el user_id del "conectado" en online_ids.
+    body = await _pool(client, professional_type_id=nutri, online_ids=[str(d_on.user_id)])
     assert set(body) == {"items", "total"}
     assert body["total"] >= 2
     by_id = {i["id"]: i for i in body["items"]}
@@ -662,11 +661,16 @@ async def test_pool_online_tab_filters(client: AsyncClient, db_session: AsyncSes
     d_on = await _pool_doctor(db_session, online=True, type_id=nutri)
     d_off = await _pool_doctor(db_session, online=False, type_id=nutri)
 
-    online = await _pool(client, professional_type_id=nutri, online=True)
+    ids_online = [str(d_on.user_id)]
+    online = await _pool(
+        client, professional_type_id=nutri, online=True, online_ids=ids_online
+    )
     ids = {i["id"] for i in online["items"]}
     assert str(d_on.id) in ids and str(d_off.id) not in ids
 
-    offline = await _pool(client, professional_type_id=nutri, online=False)
+    offline = await _pool(
+        client, professional_type_id=nutri, online=False, online_ids=ids_online
+    )
     ids = {i["id"] for i in offline["items"]}
     assert str(d_off.id) in ids and str(d_on.id) not in ids
 
