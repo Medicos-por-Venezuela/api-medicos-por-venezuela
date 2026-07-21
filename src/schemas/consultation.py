@@ -17,9 +17,15 @@ __all__ = [
     "ConsultationPatientResponse",
     "ConsultationCloseRequest",
     "ConsultationClaimRequest",
+    "ScheduleFollowUpRequest",
+    "ScheduleReferralRequest",
+    "ReminderRunResponse",
+    "ChainItem",
     "ConsultationPanelResponse",
     "PanelConsultationItem",
     "PanelPatient",
+    "PanelWaitingItem",
+    "PanelWaitingPatient",
     "QueueReleaseResponse",
 ]
 
@@ -101,6 +107,48 @@ class ConsultationCloseRequest(BaseModel):
 
     outcome: Literal["closed", "patient_no_show"] = "closed"
     note: str | None = Field(default=None, max_length=2000)
+    # Firma del médico (dataURL PNG). Se persiste como acto médico firmado (base para récipes).
+    signature: str | None = Field(default=None, max_length=2_000_000)
+
+
+class ScheduleFollowUpRequest(BaseModel):
+    """Agendar seguimiento: cierra la consulta actual (firmada) y crea una consulta HIJA agendada
+    para otra fecha (misma cadena). Ver el módulo Agenda."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scheduled_at: datetime
+    closing_note: str | None = Field(default=None, max_length=2000)
+    signature: str | None = Field(default=None, max_length=2_000_000)
+
+
+class ScheduleReferralRequest(BaseModel):
+    """Agendar con especialista (referencia): entrega la consulta al médico invitado — la actual
+    queda 'referred_to_specialist' — y crea una HIJA agendada asignada a ESE médico, con el motivo
+    firmado. El especialista ve las notas previas (chain). Distinto de 'Agendar seguimiento'."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    invited_doctor_id: uuid.UUID
+    scheduled_at: datetime
+    reason: str = Field(min_length=1, max_length=2000)  # por qué se refiere
+    signature: str | None = Field(default=None, max_length=2_000_000)
+
+
+class ChainItem(BaseModel):
+    """Un eslabón de la cadena de seguimiento (historial cross-consulta padre→hijas)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    code: str
+    status: str
+    chief_complaint: str | None = None
+    internal_note: str | None = None
+    scheduled_at: datetime | None = None
+    closed_at: datetime | None = None
+    created_at: datetime
+    parent_consultation_id: uuid.UUID | None = None
 
 
 class QueueReleaseResponse(BaseModel):
@@ -108,6 +156,13 @@ class QueueReleaseResponse(BaseModel):
 
     released: int
     threshold_minutes: int
+
+
+class ReminderRunResponse(BaseModel):
+    """Resultado de correr los recordatorios de citas (para el cron externo)."""
+
+    sent: int
+    window_minutes: int
 
 
 class ConsultationResponse(ConsultationBase):
@@ -134,6 +189,9 @@ class ConsultationResponse(ConsultationBase):
     closed_at: datetime | None = None
     patient_last_seen_at: datetime | None = None
     created_at: datetime
+    # Agenda / cadena de seguimiento.
+    scheduled_at: datetime | None = None
+    parent_consultation_id: uuid.UUID | None = None
     # Enriquecimiento para el panel admin (monitor de consultas): nombres resueltos
     # server-side vía join (patients.full_name / users.full_name por
     # assigned_doctor_id). Opcionales: nulos si el servicio no los resuelve o la
@@ -186,19 +244,27 @@ class ConsultationClaimRequest(BaseModel):
     via_whatsapp: bool = False
 
 
-class PanelPatient(BaseModel):
-    """Datos del paciente que el card del panel médico necesita mostrar."""
+class PanelWaitingPatient(BaseModel):
+    """Paciente en la COLA DE ESPERA (sin asignar): SIN nombre. Hasta que el médico toma la
+    consulta no se expone el nombre del paciente — ni en la UI ni en la respuesta del endpoint —
+    por seguridad. El médico elige el caso por síntomas/zona, no por nombre."""
 
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    full_name: str
     cedula: str | None = None
     phone_whatsapp: str | None = None
     affected_zone: str | None = None
     age_range: str | None = None
     needs_tags: list[str] | None = None
     description: str | None = None
+
+
+class PanelPatient(PanelWaitingPatient):
+    """Paciente de una consulta YA tomada por el médico (mis consultas abiertas): incluye el
+    nombre, porque el caso ya está siendo atendido."""
+
+    full_name: str
 
 
 class PanelConsultationItem(BaseModel):
@@ -226,10 +292,18 @@ class PanelConsultationItem(BaseModel):
     patient: PanelPatient | None = None
 
 
-class ConsultationPanelResponse(BaseModel):
-    """Payload del panel médico en una sola llamada: cola de espera sin asignar,
-    las consultas abiertas del propio médico y cuántas ha cerrado."""
+class PanelWaitingItem(PanelConsultationItem):
+    """Fila de la COLA DE ESPERA: igual que PanelConsultationItem pero con el paciente SIN nombre
+    (PanelWaitingPatient). Al tomar la consulta pasa a `mine` y ahí sí se muestra con nombre."""
 
-    waiting: list[PanelConsultationItem]
+    patient: PanelWaitingPatient | None = None
+
+
+class ConsultationPanelResponse(BaseModel):
+    """Payload del panel médico en una sola llamada: cola de espera sin asignar (paciente SIN
+    nombre, por seguridad), las consultas abiertas del propio médico (con nombre) y cuántas ha
+    cerrado."""
+
+    waiting: list[PanelWaitingItem]
     mine: list[PanelConsultationItem]
     my_closed_count: int

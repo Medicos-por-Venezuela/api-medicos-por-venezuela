@@ -149,10 +149,11 @@ async def close_consultation(
     outcome: str,
     closed_by: uuid.UUID | None = None,
     note: str | None = None,
+    signature: str | None = None,
     actor_is_admin: bool = False,
 ) -> Consultation:
-    """Cierra una consulta (`closed`) o la marca como ausencia (`patient_no_show`),
-    guardando la nota y registrando el evento de auditoría (réplica de closeConsultation)."""
+    """Cierra una consulta (`closed`) o la marca como ausencia (`patient_no_show`), guardando la
+    nota, la firma del médico (acto firmado, base para récipes) y el evento de auditoría."""
     if outcome not in _CLOSE_OUTCOMES:
         raise UnprocessableError(f"Resultado inválido. Permitidos: {sorted(_CLOSE_OUTCOMES)}")
     consultation = await get_consultation(session, consultation_id)
@@ -161,6 +162,8 @@ async def close_consultation(
     consultation.closed_at = datetime.now(UTC)
     if note is not None:
         consultation.internal_note = note
+    if signature is not None:
+        consultation.close_signature = signature
 
     event = ConsultationEvent(
         consultation_id=consultation_id,
@@ -180,6 +183,225 @@ async def close_consultation(
     await session.commit()
     await session.refresh(consultation)
     return consultation
+
+
+async def schedule_follow_up(
+    session: AsyncSession,
+    *,
+    parent_id: uuid.UUID,
+    scheduled_at: datetime,
+    closing_note: str | None,
+    signature: str | None,
+    actor_user_id: uuid.UUID | None,
+    actor_is_admin: bool = False,
+) -> Consultation:
+    """Cierra la consulta padre (firmada) y crea una HIJA agendada para `scheduled_at`, continuando
+    la cadena (mismo paciente, mismo médico). Todo en una transacción. Ver el módulo Agenda."""
+    parent = await get_consultation(session, parent_id)
+    _ensure_can_manage(parent, actor_user_id, actor_is_admin)
+    if scheduled_at <= datetime.now(UTC):
+        raise UnprocessableError("La fecha de la cita debe ser futura.")
+
+    # 1) Cerrar el padre (firmado).
+    parent.status = "closed"
+    parent.closed_at = datetime.now(UTC)
+    if closing_note is not None:
+        parent.internal_note = closing_note
+    if signature is not None:
+        parent.close_signature = signature
+    session.add(
+        ConsultationEvent(
+            consultation_id=parent.id,
+            event_type="closed",
+            created_by=actor_user_id,
+            note=closing_note,
+        )
+    )
+
+    # 2) Crear la hija agendada (continúa la cadena). `code` lo pone el trigger de la BD.
+    child = Consultation(
+        patient_id=parent.patient_id,
+        assigned_doctor_id=parent.assigned_doctor_id,
+        specialty_id=parent.specialty_id,
+        chief_complaint=parent.chief_complaint,
+        category=parent.category,
+        priority=parent.priority,
+        status="scheduled",
+        scheduled_at=scheduled_at,
+        parent_consultation_id=parent.id,
+    )
+    session.add(child)
+    await session.flush()
+    session.add(
+        ConsultationEvent(
+            consultation_id=child.id,
+            event_type="scheduled",
+            created_by=actor_user_id,
+            note=f"Seguimiento agendado para {scheduled_at.isoformat()}",
+        )
+    )
+    await audit.log_action(
+        session,
+        action="consultation.follow_up_scheduled",
+        actor_user_id=actor_user_id,
+        resource="consultations",
+        resource_id=child.id,
+        metadata={"parent_id": str(parent.id), "scheduled_at": scheduled_at.isoformat()},
+    )
+    await session.commit()
+    await session.refresh(child)
+    return child
+
+
+async def schedule_referral(
+    session: AsyncSession,
+    *,
+    parent_id: uuid.UUID,
+    invited_doctor_id: uuid.UUID,
+    scheduled_at: datetime,
+    reason: str,
+    signature: str | None,
+    actor_user_id: uuid.UUID | None,
+    actor_is_admin: bool = False,
+) -> Consultation:
+    """Agendar con especialista (REFERENCIA): entrega la consulta a OTRO médico. El padre queda
+    'referred_to_specialist' (ya no lo atiende el médico actual) y se crea una HIJA agendada
+    asignada al médico invitado, con el motivo firmado. El referido ve las notas previas (chain).
+    Distinto de 'Agendar seguimiento' (mismo médico) y de una Interconsulta (en vivo, limitada)."""
+    parent = await get_consultation(session, parent_id)
+    _ensure_can_manage(parent, actor_user_id, actor_is_admin)
+    if scheduled_at <= datetime.now(UTC):
+        raise UnprocessableError("La fecha de la cita debe ser futura.")
+    if invited_doctor_id == parent.assigned_doctor_id:
+        raise ConflictError("El especialista debe ser otro médico (usa 'Agendar seguimiento').")
+    invited = await session.get(Profile, invited_doctor_id)
+    if invited is None or invited.role not in ("doctor", "specialist"):
+        raise UnprocessableError("El médico especialista no es válido.")
+
+    # 1) Entregar el padre: queda derivado al especialista (firmado con el motivo).
+    parent.status = "referred_to_specialist"
+    if signature is not None:
+        parent.close_signature = signature
+    session.add(
+        ConsultationEvent(
+            consultation_id=parent.id,
+            event_type="referred_to_specialist",
+            created_by=actor_user_id,
+            note=reason,
+        )
+    )
+
+    # 2) Crear la hija agendada asignada al especialista (continúa la cadena). El motivo va en
+    #    internal_note para que el referido lo vea; las notas previas van por el chain.
+    child = Consultation(
+        patient_id=parent.patient_id,
+        assigned_doctor_id=invited_doctor_id,
+        specialty_id=parent.specialty_id,
+        chief_complaint=parent.chief_complaint,
+        category=parent.category,
+        priority=parent.priority,
+        status="scheduled",
+        scheduled_at=scheduled_at,
+        parent_consultation_id=parent.id,
+        internal_note=reason,
+    )
+    session.add(child)
+    await session.flush()
+    session.add(
+        ConsultationEvent(
+            consultation_id=child.id,
+            event_type="scheduled",
+            created_by=actor_user_id,
+            note=f"Referencia a especialista agendada para {scheduled_at.isoformat()}: {reason}",
+        )
+    )
+    await audit.log_action(
+        session,
+        action="consultation.referred_to_specialist",
+        actor_user_id=actor_user_id,
+        resource="consultations",
+        resource_id=child.id,
+        metadata={
+            "parent_id": str(parent.id),
+            "invited_doctor_id": str(invited_doctor_id),
+            "scheduled_at": scheduled_at.isoformat(),
+        },
+    )
+    await session.commit()
+    await session.refresh(child)
+    return child
+
+
+async def list_agenda(
+    session: AsyncSession,
+    *,
+    doctor_user_id: uuid.UUID | None = None,
+    patient_user_id: uuid.UUID | None = None,
+) -> list[Consultation]:
+    """Citas AGENDADAS (scheduled_at no nulo, status 'scheduled') por fecha ascendente. Filtra por
+    médico asignado (su agenda) o por paciente (la suya). Adjunta patient_name/assigned_doctor_name
+    como transitorios (igual que list_consultations) para ConsultationResponse."""
+    stmt = (
+        select(
+            Consultation,
+            Patient.full_name.label("patient_name"),
+            Profile.full_name.label("assigned_doctor_name"),
+        )
+        .outerjoin(Patient, Consultation.patient_id == Patient.id)
+        .outerjoin(Profile, Consultation.assigned_doctor_id == Profile.id)
+        .where(Consultation.scheduled_at.isnot(None), Consultation.status == "scheduled")
+    )
+    if doctor_user_id is not None:
+        stmt = stmt.where(Consultation.assigned_doctor_id == doctor_user_id)
+    if patient_user_id is not None:
+        stmt = stmt.where(Patient.user_id == patient_user_id)
+    stmt = stmt.order_by(Consultation.scheduled_at.asc())
+    rows = (await session.execute(stmt)).all()
+    out = []
+    for row in rows:
+        c = row.Consultation
+        c.patient_name = row.patient_name
+        c.assigned_doctor_name = row.assigned_doctor_name
+        out.append(c)
+    return out
+
+
+async def get_chain(session: AsyncSession, consultation_id: uuid.UUID) -> list[Consultation]:
+    """Toda la cadena de seguimiento (raíz + descendientes) a la que pertenece la consulta. Sube a
+    la raíz por parent_consultation_id y baja por BFS a las hijas, ordenado."""
+    current = await session.get(Consultation, consultation_id)
+    if current is None:
+        raise NotFoundError("Consulta no encontrada.")
+    root = current
+    guard: set = set()
+    while root.parent_consultation_id is not None and root.id not in guard:
+        guard.add(root.id)
+        parent = await session.get(Consultation, root.parent_consultation_id)
+        if parent is None:
+            break
+        root = parent
+    chain: list[Consultation] = []
+    queue = [root]
+    seen: set = set()
+    while queue:
+        node = queue.pop(0)
+        if node.id in seen:
+            continue
+        seen.add(node.id)
+        chain.append(node)
+        children = (
+            (
+                await session.execute(
+                    select(Consultation)
+                    .where(Consultation.parent_consultation_id == node.id)
+                    .order_by(Consultation.created_at.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        queue.extend(children)
+    return chain
 
 
 async def claim_consultation(

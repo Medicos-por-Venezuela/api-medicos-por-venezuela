@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, String, text
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -37,6 +37,14 @@ class Profile(Base):
         Boolean, nullable=False, server_default=text("false")
     )
     article_8_doc_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Token secreto del feed iCal de la agenda (suscripción webcal://). Null hasta que el usuario
+    # pide su URL de calendario; rotarlo revoca la URL vieja. Ver src/services/calendar.py.
+    calendar_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # Preferencias de notificación: { "<evento>": {"push": bool, "email": bool} }. '{}' = todo on
+    # (opt-out). Ver src/services/notifications.py (catálogo NOTIFICATION_EVENTS + should_send).
+    notification_prefs: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
