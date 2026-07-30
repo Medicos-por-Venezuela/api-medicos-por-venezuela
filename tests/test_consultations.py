@@ -273,12 +273,16 @@ async def test_panel_devuelve_espera_mias_y_cerradas(
     assert cid_waiting in waiting_ids
     assert cid_mine in mine_ids
     assert cid_mine not in waiting_ids  # ya asignada: sale de la cola de espera
-    # el paciente viene anidado en cada fila (el card lo necesita)
+    # Seguridad: la cola de espera (waiting) NO expone el nombre del paciente en la respuesta.
+    # El paciente viene anidado (zona, síntomas para elegir el caso) pero SIN `full_name`.
     item = next(c for c in data["waiting"] if c["id"] == cid_waiting)
-    assert item["patient"]["full_name"] == "Paciente Consulta"
+    assert "full_name" not in item["patient"]
     assert item["specialty"] is None  # sin specialty_id: el matching cae al legacy
     item_spec = next(c for c in data["waiting"] if c["id"] == cid_spec)
     assert item_spec["specialty"] == "Pediatría"
+    # Mis consultas (ya tomadas por el médico) SÍ traen el nombre del paciente.
+    mine_item = next(c for c in data["mine"] if c["id"] == cid_mine)
+    assert mine_item["patient"]["full_name"] == "Paciente Consulta"
     assert isinstance(data["my_closed_count"], int)
 
 
