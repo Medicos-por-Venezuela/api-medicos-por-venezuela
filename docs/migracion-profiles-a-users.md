@@ -135,9 +135,13 @@ Como el frontend nunca dejó de usar `profiles`, el rollback es transparente.
 
 ## 9. Contract futuro (NO mañana — semanas después, con ventana de rollback cumplida)
 
-1. Reescribir `handle_new_auth_user`, `set_my_role`, `current_user_role`, `current_user_specialty`,
-   `is_admin`, `is_staff` para nombrar `users` en vez de `profiles`.
-2. `drop view public.profiles`.
+1. ✅ **HECHO** (`20260721_194334_point_db_functions_to_users_drop_view_dependency.sql`):
+   reescritas `handle_new_auth_user`, `set_my_role`, `current_user_role`, `mark_myself_online` y
+   `admin_delete_patient` para nombrar `public.users` en vez de la vista `profiles`. (`is_admin`/
+   `is_staff` ya solo dependen de `current_user_role`; `current_user_specialty` no existe en este
+   repo.) Con esto **la BD ya no depende de la vista**; el único consumidor restante es el frontend.
+2. `drop view public.profiles` — **solo tras** migrar el frontend fuera de `.from('profiles')`
+   (ver el prompt del repo del front). Es el paso final del contract.
 3. `drop column role, specialty, medical_license, whatsapp_number, ...` de `users` (ya viven en
    `user_roles` / `doctors`).
 4. Quitar el fallback a `profiles.role` en `src/services/authz.py` y el trigger de coexistencia.
