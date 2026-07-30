@@ -21,6 +21,7 @@ CONSULTATION_STATUSES = {
     "patient_no_show",
     "closed_by_admin",
     "contacted_whatsapp",
+    "scheduled",  # cita agendada (Agenda) — aún no atendida
 }
 
 
@@ -92,6 +93,19 @@ class Consultation(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # --- Agenda / seguimiento (módulo Agenda; NO confundir con Interconsulta en vivo) ---
+    # Cita agendada (fecha/hora futura). null = consulta normal de cola en tiempo real.
+    scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Recordatorio "30 min antes" ya enviado (idempotencia del cron de recordatorios).
+    reminder_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Consulta padre de la cadena de seguimiento (auto-FK, patrón de patients.parent_id).
+    parent_consultation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("consultations.id", ondelete="SET NULL"), nullable=True
+    )
+    # Firma del médico al cerrar (dataURL PNG). Acto médico firmado; base para récipes (futuro).
+    close_signature: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     patient: Mapped["Patient"] = relationship(back_populates="consultations")  # noqa: F821
     events: Mapped[list["ConsultationEvent"]] = relationship(  # noqa: F821

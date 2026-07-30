@@ -8,7 +8,7 @@ Autorización (replica las RLS):
 
 import uuid
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.security import (
@@ -18,6 +18,7 @@ from src.core.security import (
 )
 from src.db.session import get_db
 from src.schemas.consultation import (
+    ChainItem,
     ConsultationClaimRequest,
     ConsultationCloseRequest,
     ConsultationCreate,
@@ -26,12 +27,17 @@ from src.schemas.consultation import (
     ConsultationResponse,
     ConsultationUpdate,
     PanelConsultationItem,
+    PanelWaitingItem,
+    ReminderRunResponse,
+    ScheduleFollowUpRequest,
+    ScheduleReferralRequest,
 )
 from src.schemas.consultation_event import (
     ConsultationEventCreate,
     ConsultationEventResponse,
 )
 from src.services import consultations as consultations_service
+from src.services import notifications
 
 router = APIRouter(prefix="/consultations", tags=["consultations"])
 tag_metadata = [
@@ -105,10 +111,43 @@ async def consultation_panel(
     lecturas directas a Supabase del panel."""
     waiting, mine, my_closed = await consultations_service.get_panel(db, principal.id)
     return ConsultationPanelResponse(
-        waiting=[PanelConsultationItem.model_validate(c) for c in waiting],
+        waiting=[PanelWaitingItem.model_validate(c) for c in waiting],
         mine=[PanelConsultationItem.model_validate(c) for c in mine],
         my_closed_count=my_closed,
     )
+
+
+# NOTA: debe ir ANTES de "/{consultation_id}" o FastAPI intenta parsear "agenda" como UUID (422).
+@router.get(
+    "/agenda",
+    response_model=list[ConsultationResponse],
+    summary="Mi agenda: citas agendadas del médico autenticado",
+)
+async def my_agenda(
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_permission("queue.read")),
+) -> list[ConsultationResponse]:
+    """Citas AGENDADAS (status 'scheduled') asignadas al médico autenticado, por fecha ascendente.
+    El paciente ve las suyas por su propio scoping (list_consultations, viewer_is_staff=False)."""
+    agenda = await consultations_service.list_agenda(db, doctor_user_id=principal.id)
+    return [ConsultationResponse.model_validate(c) for c in agenda]
+
+
+@router.post(
+    "/agenda/send-due-reminders",
+    response_model=ReminderRunResponse,
+    summary="Enviar recordatorios de citas próximas (cron externo)",
+)
+async def send_due_reminders(
+    window_minutes: int = Query(30, ge=1, le=1440, description="Ventana en minutos (def. 30)"),
+    db: AsyncSession = Depends(get_db),
+    _: Principal = Depends(require_permission("queue.manage")),
+) -> ReminderRunResponse:
+    """Envía el recordatorio de las citas agendadas cuya hora cae dentro de la ventana y que aún no
+    lo recibieron (idempotente por `reminder_sent_at`). Pensado para un CRON externo que lo llame
+    cada 1–5 min. Ver .knowledge/agenda.md."""
+    sent = await notifications.send_due_reminders(db, window_minutes)
+    return ReminderRunResponse(sent=sent, window_minutes=window_minutes)
 
 
 @router.get(
@@ -194,8 +233,108 @@ async def close_consultation(
         payload.outcome,
         closed_by=principal.id,
         note=payload.note,
+        signature=payload.signature,
         actor_is_admin=principal.is_admin,
     )
+
+
+@router.post(
+    "/{consultation_id}/schedule-follow-up",
+    response_model=ConsultationResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Agendar seguimiento: cierra esta consulta (firmada) y crea la hija agendada",
+    responses={**_NOT_FOUND, 409: {"description": "La consulta está asignada a otro médico."}},
+)
+async def schedule_follow_up(
+    consultation_id: uuid.UUID,
+    payload: ScheduleFollowUpRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_permission("consultations.close")),
+) -> ConsultationResponse:
+    """Cierra la consulta actual (firmada) y crea una consulta HIJA agendada para otra fecha,
+    continuando la cadena de seguimiento. Devuelve la consulta hija creada."""
+    child = await consultations_service.schedule_follow_up(
+        db,
+        parent_id=consultation_id,
+        scheduled_at=payload.scheduled_at,
+        closing_note=payload.closing_note,
+        signature=payload.signature,
+        actor_user_id=principal.id,
+        actor_is_admin=principal.is_admin,
+    )
+    # Email "cita agendada" al paciente (best-effort, fuera de la request).
+    args = await notifications.appointment_email_args(db, child)
+    if args:
+        background_tasks.add_task(notifications.send_appointment_email, **args)
+    return child
+
+
+@router.post(
+    "/{consultation_id}/refer",
+    response_model=ConsultationResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Agendar con especialista: entrega esta consulta (derivada) y agenda con otro médico",
+    responses={**_NOT_FOUND, 409: {"description": "La consulta está asignada a otro médico."}},
+)
+async def refer_to_specialist(
+    consultation_id: uuid.UUID,
+    payload: ScheduleReferralRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_permission("consultations.close")),
+) -> ConsultationResponse:
+    """Deriva la consulta a OTRO médico: la actual queda 'referred_to_specialist' y se crea una
+    hija agendada asignada al especialista, con el motivo firmado. Devuelve la consulta hija."""
+    child = await consultations_service.schedule_referral(
+        db,
+        parent_id=consultation_id,
+        invited_doctor_id=payload.invited_doctor_id,
+        scheduled_at=payload.scheduled_at,
+        reason=payload.reason,
+        signature=payload.signature,
+        actor_user_id=principal.id,
+        actor_is_admin=principal.is_admin,
+    )
+    # Email "cita agendada" al paciente (best-effort, fuera de la request).
+    args = await notifications.appointment_email_args(db, child)
+    if args:
+        background_tasks.add_task(notifications.send_appointment_email, **args)
+    # Email "te refirieron una cita" al especialista (si lo tiene habilitado; opt-out).
+    ref_text = (
+        "Un colega te refirió un paciente para una cita.\n\n"
+        f"Fecha y hora: {notifications.fmt_when(payload.scheduled_at)}\n"
+        f"Motivo: {payload.reason}\n"
+        f"Código de caso: {child.code}\n\n"
+        "Ingresa a tu agenda en Médicos por Venezuela.\n"
+    )
+    ref_args = await notifications.doctor_event_email_args(
+        db,
+        user_id=payload.invited_doctor_id,
+        event="referral_received",
+        subject="Te refirieron un paciente",
+        text=ref_text,
+    )
+    if ref_args:
+        background_tasks.add_task(notifications.send_mail, **ref_args)
+    return child
+
+
+@router.get(
+    "/{consultation_id}/chain",
+    response_model=list[ChainItem],
+    summary="Historial de la cadena de seguimiento (padre→hijas) de una consulta",
+    responses=_NOT_FOUND,
+)
+async def consultation_chain(
+    consultation_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: Principal = Depends(require_permission("consultations.read")),
+) -> list[ChainItem]:
+    """Todas las consultas de la cadena (raíz + descendientes) a la que pertenece esta consulta,
+    ordenadas — para ver el historial de seguimiento completo."""
+    chain = await consultations_service.get_chain(db, consultation_id)
+    return [ChainItem.model_validate(c) for c in chain]
 
 
 @router.post(
