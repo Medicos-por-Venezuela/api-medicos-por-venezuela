@@ -17,11 +17,13 @@ from src.core.security import (
     require_permission,
 )
 from src.db.session import get_db
+from src.models.patient import Patient
 from src.schemas.consultation import (
     ChainItem,
     ConsultationClaimRequest,
     ConsultationCloseRequest,
     ConsultationCreate,
+    ConsultationDetailResponse,
     ConsultationPanelResponse,
     ConsultationPatientResponse,
     ConsultationResponse,
@@ -152,7 +154,7 @@ async def send_due_reminders(
 
 @router.get(
     "/{consultation_id}",
-    response_model=ConsultationResponse | ConsultationPatientResponse,
+    response_model=ConsultationDetailResponse | ConsultationPatientResponse,
     summary="Obtener consulta",
     responses=_NOT_FOUND,
 )
@@ -160,14 +162,17 @@ async def get_consultation(
     consultation_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
-) -> ConsultationResponse | ConsultationPatientResponse:
-    """Staff recibe la vista completa (incluye notas clínicas/internas).
-    Un paciente autenticado solo recibe su propia consulta sin las notas del médico."""
+) -> ConsultationDetailResponse | ConsultationPatientResponse:
+    """Staff recibe la vista completa (incluye notas clínicas/internas) + el paciente anidado, para
+    que el panel no lea `patients` directo. Un paciente autenticado solo recibe su propia consulta
+    sin las notas del médico."""
     consultation = await consultations_service.get_consultation(
         db, consultation_id, viewer_is_staff=principal.is_staff, viewer_user_id=principal.id
     )
     if principal.is_staff:
-        return ConsultationResponse.model_validate(consultation)
+        # Poblar la relación `patient` explícitamente (evita el lazy-load async) para el detalle.
+        consultation.patient = await db.get(Patient, consultation.patient_id)
+        return ConsultationDetailResponse.model_validate(consultation)
     return ConsultationPatientResponse.model_validate(consultation)
 
 
