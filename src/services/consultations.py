@@ -586,14 +586,28 @@ async def delete_consultation(
 async def list_events(
     session: AsyncSession, consultation_id: uuid.UUID
 ) -> list[ConsultationEvent]:
+    """Eventos del caso con el AUTOR resuelto (join con users → author_name/author_role), para que
+    el frontend no lea `users` directo. Los nombres se adjuntan como transitorios (igual que
+    list_agenda) y ConsultationEventResponse (from_attributes) los toma."""
     await get_consultation(session, consultation_id)  # 404 si no existe
     stmt = (
-        select(ConsultationEvent)
+        select(
+            ConsultationEvent,
+            Profile.full_name.label("author_name"),
+            Profile.role.label("author_role"),
+        )
+        .outerjoin(Profile, ConsultationEvent.created_by == Profile.id)
         .where(ConsultationEvent.consultation_id == consultation_id)
         .order_by(ConsultationEvent.created_at.asc())
     )
-    result = await session.execute(stmt)
-    return list(result.scalars().all())
+    rows = (await session.execute(stmt)).all()
+    out = []
+    for row in rows:
+        event = row.ConsultationEvent
+        event.author_name = row.author_name
+        event.author_role = row.author_role
+        out.append(event)
+    return out
 
 
 async def create_event(

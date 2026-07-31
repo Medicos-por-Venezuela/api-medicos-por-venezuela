@@ -14,6 +14,8 @@ __all__ = [
     "ConsultationCreate",
     "ConsultationUpdate",
     "ConsultationResponse",
+    "ConsultationDetailPatient",
+    "ConsultationDetailResponse",
     "ConsultationPatientResponse",
     "ConsultationCloseRequest",
     "ConsultationClaimRequest",
@@ -165,6 +167,24 @@ class ReminderRunResponse(BaseModel):
     window_minutes: int
 
 
+class ConsultationDetailPatient(BaseModel):
+    """Paciente anidado en el DETALLE de una consulta (GET /{id}), para el médico que la atiende
+    (no la cola). Así el frontend no lee la tabla `patients` directo. Solo lo recibe staff
+    autorizado a ver el caso."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    full_name: str
+    cedula: str | None = None
+    phone_whatsapp: str | None = None
+    email: str | None = None
+    affected_zone: str | None = None
+    age_range: str | None = None
+    needs_tags: list[str] | None = None
+    description: str | None = None
+
+
 class ConsultationResponse(ConsultationBase):
     """Vista completa para staff (incluye notas clínicas e internas)."""
 
@@ -198,6 +218,14 @@ class ConsultationResponse(ConsultationBase):
     # consulta está sin asignar.
     patient_name: str | None = None
     assigned_doctor_name: str | None = None
+
+
+class ConsultationDetailResponse(ConsultationResponse):
+    """Detalle de una consulta para el médico que la atiende: la vista de staff + el paciente
+    anidado. SOLO para GET /{id}; los listados usan ConsultationResponse (que no toca la relación
+    `patient`, para no dispararla en lazy-load). El router puebla `patient` explícitamente."""
+
+    patient: ConsultationDetailPatient | None = None
 
 
 class ConsultationPatientResponse(BaseModel):

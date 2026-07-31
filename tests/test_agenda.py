@@ -278,3 +278,32 @@ async def test_close_saves_signature(client: AsyncClient, db_session: AsyncSessi
     db_session.expire_all()
     row = await db_session.get(Consultation, uuid.UUID(cid))
     assert row is not None and row.close_signature == sig
+
+
+async def test_detail_has_patient_and_events_have_author(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = make_profile(role="doctor")
+    db_session.add(doc)
+    await db_session.flush()
+    cid = await _open_consultation(client, doc.id)
+
+    # GET /{id}: el detalle trae el paciente anidado (para el panel, sin leer `patients` directo).
+    r = await client.get(f"{PREFIX}/consultations/{cid}", headers=auth_headers(doc.id))
+    assert r.status_code == 200, r.text
+    patient = r.json()["patient"]
+    assert patient is not None
+    assert patient["full_name"] == "Pac Agenda"
+    assert patient["phone_whatsapp"] == "+58412555222"
+
+    # GET /{id}/events: cada evento trae el autor resuelto (author_name/role).
+    await client.post(
+        f"{PREFIX}/consultations/{cid}/events",
+        json={"consultation_id": cid, "event_type": "admin_update", "note": "n"},
+        headers=auth_headers(doc.id),
+    )
+    ev = await client.get(f"{PREFIX}/consultations/{cid}/events", headers=auth_headers(doc.id))
+    assert ev.status_code == 200, ev.text
+    mine = [e for e in ev.json() if e["created_by"] == str(doc.id)]
+    assert mine and mine[0]["author_name"] == doc.full_name
+    assert mine[0]["author_role"] == "doctor"
