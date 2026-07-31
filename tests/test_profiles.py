@@ -11,9 +11,11 @@ PREFIX = "/api/v1"
 async def test_list_and_get_profile(client: AsyncClient) -> None:
     listed = await client.get(f"{PREFIX}/profiles", params={"limit": 1})
     assert listed.status_code == 200
-    rows = listed.json()
-    assert len(rows) >= 1
-    profile_id = rows[0]["id"]
+    body = listed.json()
+    # Respuesta paginada: {items, total}. El total cuenta TODO (no solo la página de limit=1).
+    assert len(body["items"]) == 1
+    assert body["total"] >= 1
+    profile_id = body["items"][0]["id"]
 
     got = await client.get(f"{PREFIX}/profiles/{profile_id}")
     assert got.status_code == 200
@@ -23,7 +25,34 @@ async def test_list_and_get_profile(client: AsyncClient) -> None:
 async def test_list_profiles_filter_role(client: AsyncClient) -> None:
     resp = await client.get(f"{PREFIX}/profiles", params={"role": "doctor", "limit": 5})
     assert resp.status_code == 200
-    assert all(p["role"] == "doctor" for p in resp.json())
+    assert all(p["role"] == "doctor" for p in resp.json()["items"])
+
+
+async def test_list_profiles_multi_role_active_and_total(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    activo = make_profile(role="specialist")
+    revocado = make_profile(role="admin")
+    revocado.active = False
+    db_session.add_all([activo, revocado])
+    await db_session.flush()
+
+    # roles múltiples: specialist + admin.
+    resp = await client.get(
+        f"{PREFIX}/profiles", params=[("roles", "specialist"), ("roles", "admin"), ("limit", 100)]
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    got = {p["id"] for p in body["items"]}
+    assert str(activo.id) in got and str(revocado.id) in got
+    assert body["total"] >= len(body["items"])
+
+    # active=false → solo revocados.
+    only_revoked = await client.get(
+        f"{PREFIX}/profiles", params={"active": "false", "limit": 100}
+    )
+    ids = {p["id"] for p in only_revoked.json()["items"]}
+    assert str(revocado.id) in ids and str(activo.id) not in ids
 
 
 async def test_list_profiles_search_by_name(client: AsyncClient, db_session: AsyncSession) -> None:
@@ -36,7 +65,7 @@ async def test_list_profiles_search_by_name(client: AsyncClient, db_session: Asy
 
     resp = await client.get(f"{PREFIX}/profiles", params={"search": "oraida", "limit": 100})
     assert resp.status_code == 200
-    ids = {p["id"] for p in resp.json()}
+    ids = {p["id"] for p in resp.json()["items"]}
     assert str(hit.id) in ids
     assert str(miss.id) not in ids
 
@@ -51,7 +80,7 @@ async def test_list_profiles_search_by_email(
 
     resp = await client.get(f"{PREFIX}/profiles", params={"search": "buscame.unico", "limit": 100})
     assert resp.status_code == 200
-    assert str(doc.id) in {p["id"] for p in resp.json()}
+    assert str(doc.id) in {p["id"] for p in resp.json()["items"]}
 
 
 async def test_profile_not_found(client: AsyncClient) -> None:

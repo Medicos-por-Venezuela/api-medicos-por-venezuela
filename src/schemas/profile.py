@@ -40,6 +40,13 @@ class ProfileResponse(ProfileBase):
     roles: list[str] = []
 
 
+class ProfileListResponse(BaseModel):
+    """Listado paginado de perfiles + total exacto (para la tabla de médicos/usuarios admin)."""
+
+    items: list[ProfileResponse]
+    total: int
+
+
 class ProfileActiveRequest(BaseModel):
     """Revocar (`active=false`) o reactivar (`active=true`) un médico."""
 
