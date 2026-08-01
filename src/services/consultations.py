@@ -510,6 +510,18 @@ async def heartbeat(session: AsyncSession, consultation_id: uuid.UUID) -> Consul
     return consultation
 
 
+async def mark_entered_call(session: AsyncSession, consultation_id: uuid.UUID) -> Consultation:
+    """Marca que el paciente entró a la videollamada (`entered_call_at`, idempotente), solo si
+    sigue en espera o en progreso. Reemplaza la RPC mark_patient_entered_call (el bump de
+    patient_last_seen_at quedó obsoleto: la presencia la maneja Realtime Presence)."""
+    consultation = await get_consultation(session, consultation_id)
+    if consultation.status in _HEARTBEAT_OPEN_STATUSES and consultation.entered_call_at is None:
+        consultation.entered_call_at = datetime.now(UTC)
+        await session.commit()
+        await session.refresh(consultation)
+    return consultation
+
+
 async def ensure_video_room(session: AsyncSession, consultation_id: uuid.UUID) -> Consultation:
     """Genera (idempotente) la sala Jitsi de la consulta. Si ya existe, la devuelve;
     solo crea una nueva si la consulta está en espera (réplica de /api/videoconsulta)."""

@@ -384,6 +384,21 @@ async def patient_heartbeat(
 
 
 @router.post(
+    "/{consultation_id}/entered-call",
+    response_model=ConsultationResponse,
+    summary="Marcar que el paciente entró a la videollamada (idempotente, público)",
+    responses=_NOT_FOUND,
+)
+async def mark_entered_call(
+    consultation_id: uuid.UUID, db: AsyncSession = Depends(get_db)
+) -> ConsultationResponse:
+    """Registra `entered_call_at` una sola vez, si la consulta está en `waiting`/`in_progress`.
+    Reemplaza la RPC mark_patient_entered_call. Público: el paciente en la sala puede no estar
+    autenticado (llega por link con el `cid`)."""
+    return await consultations_service.mark_entered_call(db, consultation_id)
+
+
+@router.post(
     "/{consultation_id}/video-room",
     response_model=ConsultationResponse,
     summary="Generar/obtener la sala de video (idempotente, público)",
