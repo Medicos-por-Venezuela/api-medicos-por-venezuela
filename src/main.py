@@ -49,6 +49,13 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
         )
     # Deja los orígenes CORS efectivos en los logs de arranque: cuando un front rebota por CORS,
     # se ve de una si su origen está (o no) en la lista, sin adivinar desde el .env.
+    # El default de BACKEND_CORS_ORIGINS es "*" y el middleware va con allow_credentials=True:
+    # si la env no se setea en prod, se aceptarían credenciales desde cualquier origen.
+    if _IS_PROD and "*" in settings.cors_origins:
+        raise RuntimeError(
+            "BACKEND_CORS_ORIGINS no puede ser '*' en producción (se envían credenciales). "
+            "Define la lista explícita de orígenes del frontend, separados por comas."
+        )
     logger.info("CORS origins efectivos: %s", settings.cors_origins)
     logger.info(
         "Mail (Mailtrap): %s",

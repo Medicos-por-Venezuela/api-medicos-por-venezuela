@@ -1,8 +1,15 @@
 """Pruebas de integración asíncronas del recurso patients (con aislamiento)."""
 
-from httpx import AsyncClient
+import uuid
+from datetime import UTC, datetime
 
+from httpx import AsyncClient
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.models.patient import Patient
 from src.models.profile import Profile
+from tests._helpers import auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -55,7 +62,9 @@ async def test_get_missing_patient_404(client: AsyncClient) -> None:
     assert resp.status_code == 404
 
 
-async def test_list_update_delete_patient(client: AsyncClient, admin_identity: Profile) -> None:
+async def test_list_update_delete_patient(
+    client: AsyncClient, admin_identity: Profile, db_session: AsyncSession
+) -> None:
     created = await client.post(
         f"{PREFIX}/patients",
         json={
@@ -80,11 +89,60 @@ async def test_list_update_delete_patient(client: AsyncClient, admin_identity: P
 
     assert (await client.delete(f"{PREFIX}/patients/{patient_id}")).status_code == 204
     assert (await client.get(f"{PREFIX}/patients/{patient_id}")).status_code == 404
+    # Soft delete: la fila sigue en la BD con deleted_at, no se borró (trazabilidad).
+    row = (
+        await db_session.execute(select(Patient).where(Patient.id == patient_id))
+    ).scalar_one()
+    assert row.deleted_at is not None
+    # Y ya no aparece en el listado.
+    relisted = await client.get(f"{PREFIX}/patients", params={"limit": 100})
+    assert all(p["id"] != patient_id for p in relisted.json())
 
     audit_resp = await client.get(f"{PREFIX}/audit-log", params={"resource": "patients"})
     entries = [e for e in audit_resp.json() if e["resource_id"] == patient_id]
     assert sorted(e["action"] for e in entries) == sorted(["patient.updated", "patient.deleted"])
     assert all(e["actor_user_id"] == str(admin_identity.id) for e in entries)
+
+
+async def test_list_my_patients_scopes_to_own_and_excludes_archived(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """GET /patients/me (portal del paciente): solo los registros ligados a la cuenta del llamante
+    (user_id), sin archivados; nunca los de otro usuario."""
+    me = make_profile(role="patient")
+    db_session.add(me)
+    other_uid = uuid.uuid4()
+    mine = Patient(
+        full_name="Mío",
+        phone_whatsapp="+58412000100",
+        affected_zone="Caracas",
+        needs_tags=[],
+        consent=True,
+        user_id=me.id,
+    )
+    mine_archived = Patient(
+        full_name="Mío Archivado",
+        phone_whatsapp="+58412000101",
+        affected_zone="Caracas",
+        needs_tags=[],
+        consent=True,
+        user_id=me.id,
+        deleted_at=datetime.now(UTC),
+    )
+    other = Patient(
+        full_name="De Otro",
+        phone_whatsapp="+58412000102",
+        affected_zone="Caracas",
+        needs_tags=[],
+        consent=True,
+        user_id=other_uid,
+    )
+    db_session.add_all([mine, mine_archived, other])
+    await db_session.flush()
+
+    resp = await client.get(f"{PREFIX}/patients/me", headers=auth_headers(me.id))
+    assert resp.status_code == 200, resp.text
+    assert {p["id"] for p in resp.json()} == {str(mine.id)}
 
 
 async def test_update_missing_patient_404(client: AsyncClient) -> None:

@@ -99,6 +99,9 @@ def decode_token(token: str) -> dict:
         logger.warning("SEC:token_invalid reason=%s", type(exc).__name__)
         raise _unauthorized("Token inválido o expirado.") from exc
 
+    # PyJWT solo verifica `iss` si se le pasa el parámetro: sin SUPABASE_JWT_ISSUER definido
+    # el comportamiento es el de siempre (el Supabase local emite otro iss y rompería dev).
+    issuer = {"issuer": settings.SUPABASE_JWT_ISSUER} if settings.SUPABASE_JWT_ISSUER else {}
     try:
         if header.get("alg") in _ASYMMETRIC_ALGORITHMS and settings.SUPABASE_JWKS_URL:
             signing_key = _jwks_client(settings.SUPABASE_JWKS_URL).get_signing_key_from_jwt(token)
@@ -107,12 +110,14 @@ def decode_token(token: str) -> dict:
                 signing_key.key,
                 algorithms=list(_ASYMMETRIC_ALGORITHMS),
                 audience=settings.SUPABASE_JWT_AUDIENCE,
+                **issuer,
             )
         return jwt.decode(
             token,
             settings.SUPABASE_JWT_SECRET,
             algorithms=[settings.SUPABASE_JWT_ALGORITHM],
             audience=settings.SUPABASE_JWT_AUDIENCE,
+            **issuer,
         )
     except jwt.PyJWTError as exc:
         logger.warning("SEC:token_invalid reason=%s", type(exc).__name__)

@@ -152,6 +152,22 @@ async def test_patient_heartbeat(client: AsyncClient) -> None:
     assert resp.json()["patient_last_seen_at"] is not None
 
 
+# --- entered-call (público, idempotente): reemplaza la RPC mark_patient_entered_call ---
+
+
+async def test_mark_entered_call_sets_once(client: AsyncClient) -> None:
+    cid = await _consultation(client, ["Medicina general"])
+    resp = await client.post(f"{PREFIX}/consultations/{cid}/entered-call")
+    assert resp.status_code == 200
+    first = resp.json()["entered_call_at"]
+    assert first is not None
+
+    # Idempotente: una segunda llamada no cambia entered_call_at.
+    resp2 = await client.post(f"{PREFIX}/consultations/{cid}/entered-call")
+    assert resp2.status_code == 200
+    assert resp2.json()["entered_call_at"] == first
+
+
 # --- sala de video (idempotente, pública) ---
 
 

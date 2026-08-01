@@ -8,20 +8,24 @@ Autorización (replica las RLS):
 
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import settings
+from src.core.ratelimit import limiter
 from src.core.security import (
     Principal,
     get_current_principal,
     require_permission,
 )
 from src.db.session import get_db
+from src.models.patient import Patient
 from src.schemas.consultation import (
     ChainItem,
     ConsultationClaimRequest,
     ConsultationCloseRequest,
     ConsultationCreate,
+    ConsultationDetailResponse,
     ConsultationPanelResponse,
     ConsultationPatientResponse,
     ConsultationResponse,
@@ -52,19 +56,22 @@ _NOT_FOUND = {404: {"description": "Consulta no encontrada."}}
 
 @router.get(
     "",
-    response_model=list[ConsultationResponse] | list[ConsultationPatientResponse],
+    response_model=list[ConsultationDetailResponse] | list[ConsultationPatientResponse],
     summary="Listar consultas",
 )
 async def list_consultations(
     skip: int = Query(0, ge=0),
-    limit: int = Query(100, ge=1, le=100),
+    # Cap 200: el monitor admin/pacientes muestra los casos recientes (hasta 200) y filtra/ordena
+    # en el cliente. Endpoint solo-staff; el default sigue en 100.
+    limit: int = Query(100, ge=1, le=200),
     status_filter: str | None = Query(None, alias="status"),
     patient_id: uuid.UUID | None = Query(None),
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
-) -> list[ConsultationResponse] | list[ConsultationPatientResponse]:
-    """Staff ve todas las consultas con vista completa.
-    Un paciente autenticado solo ve las suyas, sin notas clínicas ni internas."""
+) -> list[ConsultationDetailResponse] | list[ConsultationPatientResponse]:
+    """Staff ve todas las consultas con vista completa + el paciente anidado (para que el panel
+    admin/pacientes no lea `patients` directo). Un paciente autenticado solo ve las suyas, sin
+    notas clínicas ni internas ni datos anidados de otros."""
     consultations = await consultations_service.list_consultations(
         db,
         skip=skip,
@@ -75,7 +82,7 @@ async def list_consultations(
         viewer_user_id=principal.id,
     )
     if principal.is_staff:
-        return [ConsultationResponse.model_validate(c) for c in consultations]
+        return [ConsultationDetailResponse.model_validate(c) for c in consultations]
     return [ConsultationPatientResponse.model_validate(c) for c in consultations]
 
 
@@ -87,12 +94,16 @@ async def list_consultations(
     responses={
         400: {"description": "El `patient_id` no existe."},
         422: {"description": "`status` inválido."},
+        429: {"description": "Demasiadas consultas desde esta IP (rate limit)."},
     },
 )
+@limiter.limit(settings.PUBLIC_WRITE_RATE_LIMIT)
 async def create_consultation(
-    payload: ConsultationCreate, db: AsyncSession = Depends(get_db)
+    request: Request, payload: ConsultationCreate, db: AsyncSession = Depends(get_db)
 ) -> ConsultationResponse:
-    """Crea una consulta en espera. El `code` lo genera la base de datos (trigger)."""
+    """Crea una consulta en espera. El `code` lo genera la base de datos (trigger).
+
+    `request` es obligatorio para slowapi (lee la IP del cliente), aunque no se use aquí."""
     return await consultations_service.create_consultation(db, payload)
 
 
@@ -152,7 +163,7 @@ async def send_due_reminders(
 
 @router.get(
     "/{consultation_id}",
-    response_model=ConsultationResponse | ConsultationPatientResponse,
+    response_model=ConsultationDetailResponse | ConsultationPatientResponse,
     summary="Obtener consulta",
     responses=_NOT_FOUND,
 )
@@ -160,14 +171,17 @@ async def get_consultation(
     consultation_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
-) -> ConsultationResponse | ConsultationPatientResponse:
-    """Staff recibe la vista completa (incluye notas clínicas/internas).
-    Un paciente autenticado solo recibe su propia consulta sin las notas del médico."""
+) -> ConsultationDetailResponse | ConsultationPatientResponse:
+    """Staff recibe la vista completa (incluye notas clínicas/internas) + el paciente anidado, para
+    que el panel no lea `patients` directo. Un paciente autenticado solo recibe su propia consulta
+    sin las notas del médico."""
     consultation = await consultations_service.get_consultation(
         db, consultation_id, viewer_is_staff=principal.is_staff, viewer_user_id=principal.id
     )
     if principal.is_staff:
-        return ConsultationResponse.model_validate(consultation)
+        # Poblar la relación `patient` explícitamente (evita el lazy-load async) para el detalle.
+        consultation.patient = await db.get(Patient, consultation.patient_id)
+        return ConsultationDetailResponse.model_validate(consultation)
     return ConsultationPatientResponse.model_validate(consultation)
 
 
@@ -373,6 +387,21 @@ async def patient_heartbeat(
     """Marca que el paciente sigue en la sala de espera (`patient_last_seen_at`).
     Solo tiene efecto si la consulta está en `waiting` o `in_progress`."""
     return await consultations_service.heartbeat(db, consultation_id)
+
+
+@router.post(
+    "/{consultation_id}/entered-call",
+    response_model=ConsultationResponse,
+    summary="Marcar que el paciente entró a la videollamada (idempotente, público)",
+    responses=_NOT_FOUND,
+)
+async def mark_entered_call(
+    consultation_id: uuid.UUID, db: AsyncSession = Depends(get_db)
+) -> ConsultationResponse:
+    """Registra `entered_call_at` una sola vez, si la consulta está en `waiting`/`in_progress`.
+    Reemplaza la RPC mark_patient_entered_call. Público: el paciente en la sala puede no estar
+    autenticado (llega por link con el `cid`)."""
+    return await consultations_service.mark_entered_call(db, consultation_id)
 
 
 @router.post(

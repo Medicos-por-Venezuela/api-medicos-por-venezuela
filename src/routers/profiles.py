@@ -5,6 +5,7 @@ finalización de rol operan sobre el propio usuario (del JWT); revocar es admin.
 """
 
 import uuid
+from datetime import date
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +20,7 @@ from src.db.session import get_db
 from src.schemas.profile import (
     ProfileActiveRequest,
     ProfileFinalizeRoleRequest,
+    ProfileListResponse,
     ProfileResponse,
 )
 from src.services import profiles as profiles_service
@@ -34,19 +36,35 @@ tag_metadata = [
 _NOT_FOUND = {404: {"description": "Perfil no encontrado."}}
 
 
-@router.get("", response_model=list[ProfileResponse], summary="Listar perfiles (admin)")
+@router.get("", response_model=ProfileListResponse, summary="Listar perfiles (admin)")
 async def list_profiles(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=100),
-    role: str | None = Query(None),
-    search: str | None = Query(None, description="Filtra por nombre o email (ILIKE)."),
+    role: str | None = Query(None, description="Un rol exacto (retrocompatible)."),
+    roles: list[str] | None = Query(None, description="Uno o varios roles (p. ej. staff)."),
+    search: str | None = Query(None, description="Filtra por nombre, email o especialidad."),
+    active: bool | None = Query(None, description="true=activos, false=revocados, omitir=ambos."),
+    created_from: date | None = Query(None),
+    created_to: date | None = Query(None),
     db: AsyncSession = Depends(get_db),
     _: Principal = Depends(require_permission("profiles.read")),
-) -> list[ProfileResponse]:
-    """Lista de perfiles de cuentas; filtrable por `role` (doctor, admin, ...) y por `search`
-    (nombre o email — necesario para encontrar a alguien entre miles de usuarios)."""
-    return await profiles_service.list_profiles(
-        db, skip=skip, limit=limit, role=role, search=search
+) -> ProfileListResponse:
+    """Lista paginada de perfiles + total exacto. Filtros: `role`/`roles`, `search` (nombre/email/
+    especialidad), `active` (revocado o no) y rango de fechas. Reemplaza el acceso directo del
+    panel admin a la tabla `users`."""
+    items, total = await profiles_service.list_profiles(
+        db,
+        skip=skip,
+        limit=limit,
+        role=role,
+        roles=roles,
+        search=search,
+        active=active,
+        created_from=created_from,
+        created_to=created_to,
+    )
+    return ProfileListResponse(
+        items=[ProfileResponse.model_validate(p) for p in items], total=total
     )
 
 

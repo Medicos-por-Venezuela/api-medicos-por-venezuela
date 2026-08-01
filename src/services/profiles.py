@@ -1,8 +1,9 @@
 """Capa de negocio para profiles (staff)."""
 
 import uuid
+from datetime import date, timedelta
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import BadRequestError, NotFoundError
@@ -15,22 +16,50 @@ _SELF_ROLES = {"patient", "doctor"}
 
 async def list_profiles(
     session: AsyncSession,
+    *,
     skip: int = 0,
     limit: int = 100,
     role: str | None = None,
+    roles: list[str] | None = None,
     search: str | None = None,
-) -> list[Profile]:
-    stmt = select(Profile)
-    if role:
-        stmt = stmt.where(Profile.role == role)
-    # Búsqueda server-side por nombre o email (con ~3000 usuarios, paginar sin buscar es
-    # inservible). ilike va como parámetro enlazado -> sin riesgo de inyección.
+    active: bool | None = None,
+    created_from: date | None = None,
+    created_to: date | None = None,
+) -> tuple[list[Profile], int]:
+    """Perfiles filtrados + total exacto (para la tabla de médicos/usuarios del admin). Reemplaza
+    el acceso directo del frontend a `users`. Filtros: uno o varios roles, estado activo/revocado,
+    rango de fechas, y búsqueda por nombre/email/especialidad. Todo con parámetros enlazados."""
+    conditions = []
+    if roles:
+        conditions.append(Profile.role.in_(roles))
+    elif role:
+        conditions.append(Profile.role == role)
+    # Búsqueda server-side por nombre, email o especialidad (con ~3000 usuarios, paginar sin buscar
+    # es inservible). ilike va como parámetro enlazado -> sin riesgo de inyección.
     if search and (term := search.strip()):
         like = f"%{term}%"
-        stmt = stmt.where(or_(Profile.full_name.ilike(like), Profile.email.ilike(like)))
-    stmt = stmt.order_by(Profile.created_at.desc()).offset(skip).limit(limit)
-    result = await session.execute(stmt)
-    return list(result.scalars().all())
+        conditions.append(
+            or_(
+                Profile.full_name.ilike(like),
+                Profile.email.ilike(like),
+                Profile.specialty.ilike(like),
+            )
+        )
+    if active is not None:
+        conditions.append(Profile.active.is_(active))
+    if created_from is not None:
+        conditions.append(Profile.created_at >= created_from)
+    if created_to is not None:
+        # Incluir todo el día `created_to`: created_at < día siguiente.
+        conditions.append(Profile.created_at < created_to + timedelta(days=1))
+
+    base = select(Profile)
+    if conditions:
+        base = base.where(*conditions)
+    total = await session.scalar(select(func.count()).select_from(base.subquery())) or 0
+    stmt = base.order_by(Profile.created_at.desc()).offset(skip).limit(limit)
+    items = list((await session.execute(stmt)).scalars().all())
+    return items, total
 
 
 async def get_profile(session: AsyncSession, profile_id: uuid.UUID) -> Profile:

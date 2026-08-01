@@ -25,3 +25,7 @@ class ConsultationEventResponse(BaseModel):
     note: str | None = None
     created_by: uuid.UUID | None = None
     created_at: datetime
+    # Autor resuelto server-side (join con users): evita que el frontend lea `users` directo para
+    # pintar el nombre/rol de quien generó el evento. Nulos si el evento no tiene autor.
+    author_name: str | None = None
+    author_role: str | None = None

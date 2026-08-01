@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.consultation import Consultation
 from src.models.patient import Patient
+from src.models.profile import Profile
 from src.models.specialty import Specialty
 from tests._helpers import auth_headers, make_profile
 
@@ -69,6 +70,88 @@ async def test_consultation_crud_and_code_autogeneration(client: AsyncClient) ->
     assert sorted(e["action"] for e in entries) == sorted(
         ["consultation.updated", "consultation.deleted"]
     )
+
+
+async def test_admin_pacientes_list_enrichment_and_admin_fields(
+    client: AsyncClient, admin_identity: Profile
+) -> None:
+    """La lista de consultas (staff) trae el paciente anidado y los campos de gestión admin
+    (admin_seguimiento / nota_admin), para que el panel admin/pacientes no lea `patients` /
+    `consultations` directo de Supabase."""
+    created = await client.post(
+        f"{PREFIX}/patients",
+        json={
+            "full_name": "Ana Admin Caso",
+            "phone_whatsapp": "+58412999111",
+            "affected_zone": "Zulia",
+            "cedula": "V-12345678",
+            "email": "ana.caso@example.com",
+            "consent": True,
+        },
+    )
+    patient_id = created.json()["id"]
+    cid = (
+        await client.post(f"{PREFIX}/consultations", json={"patient_id": patient_id})
+    ).json()["id"]
+
+    # La lista trae el paciente anidado con los datos que muestra/filtra la tabla admin.
+    listed = await client.get(f"{PREFIX}/consultations", params={"patient_id": patient_id})
+    assert listed.status_code == 200
+    row = next(c for c in listed.json() if c["id"] == cid)
+    assert row["patient"]["full_name"] == "Ana Admin Caso"
+    assert row["patient"]["cedula"] == "V-12345678"
+    assert row["patient"]["email"] == "ana.caso@example.com"
+    assert row["patient"]["phone_whatsapp"] == "+58412999111"
+    assert row["admin_seguimiento"] is None
+    assert row["nota_admin"] is None
+
+    # PATCH de los campos de gestión admin (admin_seguimiento es FK a users(id)).
+    patched = await client.patch(
+        f"{PREFIX}/consultations/{cid}",
+        json={"admin_seguimiento": str(admin_identity.id), "nota_admin": "Revisar en 48h"},
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["admin_seguimiento"] == str(admin_identity.id)
+    assert patched.json()["nota_admin"] == "Revisar en 48h"
+
+    # Persistió: la lista los refleja.
+    relisted = await client.get(f"{PREFIX}/consultations", params={"patient_id": patient_id})
+    row2 = next(c for c in relisted.json() if c["id"] == cid)
+    assert row2["admin_seguimiento"] == str(admin_identity.id)
+    assert row2["nota_admin"] == "Revisar en 48h"
+
+
+async def test_patient_view_exposes_scheduled_at(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """La vista del paciente (GET /consultations no-staff) expone scheduled_at para el feed de
+    citas de mi-caso, y NO incluye las notas del staff (vista reducida)."""
+    me = make_profile(role="patient")
+    db_session.add(me)
+    patient = Patient(
+        full_name="Paciente Agenda",
+        phone_whatsapp="+58412000200",
+        affected_zone="Caracas",
+        needs_tags=[],
+        consent=True,
+        user_id=me.id,
+    )
+    db_session.add(patient)
+    await db_session.flush()
+    # Se crea por el endpoint (code/queued_at los pone el backend) y luego se agenda.
+    cid = (
+        await client.post(f"{PREFIX}/consultations", json={"patient_id": str(patient.id)})
+    ).json()["id"]
+    cons = await db_session.get(Consultation, uuid.UUID(cid))
+    assert cons is not None
+    cons.scheduled_at = datetime(2026, 9, 1, 15, 0, tzinfo=UTC)
+    await db_session.flush()
+
+    resp = await client.get(f"{PREFIX}/consultations", headers=auth_headers(me.id))
+    assert resp.status_code == 200, resp.text
+    row = next(c for c in resp.json() if c["id"] == cid)
+    assert row["scheduled_at"] is not None
+    assert "internal_note" not in row  # vista reducida del paciente
 
 
 async def test_consultation_invalid_patient(client: AsyncClient) -> None:

@@ -81,7 +81,9 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     - X-Content-Type-Options: evita MIME-sniffing (XSS via recursos).
     - X-Frame-Options: bloquea clickjacking en iframes.
     - Referrer-Policy: no filtra la URL de origen en requests cross-origin.
+    - Permissions-Policy: la API no necesita geolocalización, micrófono ni cámara.
     - Strict-Transport-Security: fuerza HTTPS solo en producción.
+    - Content-Security-Policy: solo en producción (en dev rompería Swagger /docs).
     """
 
     def __init__(self, app: object, is_production: bool = False) -> None:
@@ -95,8 +97,14 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
         if self._is_production:
             response.headers["Strict-Transport-Security"] = (
                 "max-age=63072000; includeSubDomains; preload"
+            )
+            # Solo en prod: una API JSON no carga nada, pero esta CSP rompería Swagger /docs
+            # (que en prod ya va apagado; en dev sigue disponible).
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
             )
         return response

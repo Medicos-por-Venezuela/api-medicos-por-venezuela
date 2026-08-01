@@ -14,6 +14,8 @@ __all__ = [
     "ConsultationCreate",
     "ConsultationUpdate",
     "ConsultationResponse",
+    "ConsultationDetailPatient",
+    "ConsultationDetailResponse",
     "ConsultationPatientResponse",
     "ConsultationCloseRequest",
     "ConsultationClaimRequest",
@@ -86,6 +88,9 @@ class ConsultationUpdate(BaseModel):
     internal_note: str | None = Field(default=None, max_length=2000)
     doctor_id: uuid.UUID | None = None
     assigned_doctor_id: uuid.UUID | None = None
+    # Gestión del admin (panel admin/pacientes): asignar super_admin de seguimiento / nota libre.
+    admin_seguimiento: uuid.UUID | None = None
+    nota_admin: str | None = Field(default=None, max_length=5000)
     referred_specialty: str | None = Field(default=None, max_length=100)
     platform_used: str | None = Field(default=None, max_length=50)
     meeting_link: str | None = Field(default=None, max_length=500)
@@ -165,6 +170,24 @@ class ReminderRunResponse(BaseModel):
     window_minutes: int
 
 
+class ConsultationDetailPatient(BaseModel):
+    """Paciente anidado en el DETALLE de una consulta (GET /{id}), para el médico que la atiende
+    (no la cola). Así el frontend no lee la tabla `patients` directo. Solo lo recibe staff
+    autorizado a ver el caso."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    full_name: str
+    cedula: str | None = None
+    phone_whatsapp: str | None = None
+    email: str | None = None
+    affected_zone: str | None = None
+    age_range: str | None = None
+    needs_tags: list[str] | None = None
+    description: str | None = None
+
+
 class ConsultationResponse(ConsultationBase):
     """Vista completa para staff (incluye notas clínicas e internas)."""
 
@@ -187,6 +210,7 @@ class ConsultationResponse(ConsultationBase):
     ended_at: datetime | None = None
     opened_at: datetime | None = None
     closed_at: datetime | None = None
+    entered_call_at: datetime | None = None
     patient_last_seen_at: datetime | None = None
     created_at: datetime
     # Agenda / cadena de seguimiento.
@@ -198,6 +222,17 @@ class ConsultationResponse(ConsultationBase):
     # consulta está sin asignar.
     patient_name: str | None = None
     assigned_doctor_name: str | None = None
+    # Gestión del admin (panel admin/pacientes): super_admin de seguimiento + nota libre.
+    admin_seguimiento: uuid.UUID | None = None
+    nota_admin: str | None = None
+
+
+class ConsultationDetailResponse(ConsultationResponse):
+    """Detalle de una consulta para el médico que la atiende: la vista de staff + el paciente
+    anidado. SOLO para GET /{id}; los listados usan ConsultationResponse (que no toca la relación
+    `patient`, para no dispararla en lazy-load). El router puebla `patient` explícitamente."""
+
+    patient: ConsultationDetailPatient | None = None
 
 
 class ConsultationPatientResponse(BaseModel):
@@ -233,6 +268,8 @@ class ConsultationPatientResponse(BaseModel):
     closed_at: datetime | None = None
     patient_last_seen_at: datetime | None = None
     created_at: datetime
+    # Cita agendada (módulo Agenda): el portal del paciente (mi-caso) lista sus próximas citas.
+    scheduled_at: datetime | None = None
 
 
 class ConsultationClaimRequest(BaseModel):
