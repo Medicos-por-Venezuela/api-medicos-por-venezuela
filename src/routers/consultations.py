@@ -54,19 +54,22 @@ _NOT_FOUND = {404: {"description": "Consulta no encontrada."}}
 
 @router.get(
     "",
-    response_model=list[ConsultationResponse] | list[ConsultationPatientResponse],
+    response_model=list[ConsultationDetailResponse] | list[ConsultationPatientResponse],
     summary="Listar consultas",
 )
 async def list_consultations(
     skip: int = Query(0, ge=0),
-    limit: int = Query(100, ge=1, le=100),
+    # Cap 200: el monitor admin/pacientes muestra los casos recientes (hasta 200) y filtra/ordena
+    # en el cliente. Endpoint solo-staff; el default sigue en 100.
+    limit: int = Query(100, ge=1, le=200),
     status_filter: str | None = Query(None, alias="status"),
     patient_id: uuid.UUID | None = Query(None),
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
-) -> list[ConsultationResponse] | list[ConsultationPatientResponse]:
-    """Staff ve todas las consultas con vista completa.
-    Un paciente autenticado solo ve las suyas, sin notas clínicas ni internas."""
+) -> list[ConsultationDetailResponse] | list[ConsultationPatientResponse]:
+    """Staff ve todas las consultas con vista completa + el paciente anidado (para que el panel
+    admin/pacientes no lea `patients` directo). Un paciente autenticado solo ve las suyas, sin
+    notas clínicas ni internas ni datos anidados de otros."""
     consultations = await consultations_service.list_consultations(
         db,
         skip=skip,
@@ -77,7 +80,7 @@ async def list_consultations(
         viewer_user_id=principal.id,
     )
     if principal.is_staff:
-        return [ConsultationResponse.model_validate(c) for c in consultations]
+        return [ConsultationDetailResponse.model_validate(c) for c in consultations]
     return [ConsultationPatientResponse.model_validate(c) for c in consultations]
 
 

@@ -81,12 +81,13 @@ async def update_patient(
 @router.delete(
     "/{patient_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    summary="Eliminar paciente (admin)",
+    summary="Archivar paciente (baja lógica, admin)",
     responses=_NOT_FOUND,
 )
 async def delete_patient(
     patient_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_permission("patients.delete")),
+    # Baja lógica (soft delete), no hard delete: se gatea con patients.write, igual que doctors.
+    principal: Principal = Depends(require_permission("patients.write")),
 ) -> None:
     await patients_service.delete_patient(db, patient_id, actor_user_id=principal.id)

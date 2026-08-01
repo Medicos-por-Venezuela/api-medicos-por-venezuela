@@ -41,6 +41,8 @@ class Patient(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # Soft delete: "borrar" un paciente = marcar esto (nunca hard delete). Las listas lo filtran.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     consultations: Mapped[list["Consultation"]] = relationship(  # noqa: F821
         back_populates="patient", cascade="all, delete-orphan"
