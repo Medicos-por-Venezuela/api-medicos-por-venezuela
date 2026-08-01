@@ -29,7 +29,7 @@ async def test_authz_desde_user_roles(db_session: AsyncSession) -> None:
     roles, perms = await load_authz(db_session, prof.id, prof.role)
     assert "doctor" in roles
     assert "consultations.read" in perms
-    assert "patients.delete" not in perms  # doctor no tiene delete
+    assert "patients.write" not in perms  # el doctor solo lee pacientes, no los edita
 
 
 async def test_authz_multi_rol_une_permisos(db_session: AsyncSession) -> None:
@@ -42,7 +42,7 @@ async def test_authz_multi_rol_une_permisos(db_session: AsyncSession) -> None:
     roles, perms = await load_authz(db_session, prof.id, prof.role)
     assert {"doctor", "admin"} <= roles
     assert "consultations.read" in perms  # de doctor
-    assert "patients.delete" in perms  # de admin
+    assert "patients.write" in perms  # de admin
     assert "roles.assign" in perms  # de admin
 
 

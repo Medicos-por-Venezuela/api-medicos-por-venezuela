@@ -1,7 +1,10 @@
 """Pruebas de integración asíncronas del recurso patients (con aislamiento)."""
 
 from httpx import AsyncClient
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.models.patient import Patient
 from src.models.profile import Profile
 
 PREFIX = "/api/v1"
@@ -55,7 +58,9 @@ async def test_get_missing_patient_404(client: AsyncClient) -> None:
     assert resp.status_code == 404
 
 
-async def test_list_update_delete_patient(client: AsyncClient, admin_identity: Profile) -> None:
+async def test_list_update_delete_patient(
+    client: AsyncClient, admin_identity: Profile, db_session: AsyncSession
+) -> None:
     created = await client.post(
         f"{PREFIX}/patients",
         json={
@@ -80,6 +85,14 @@ async def test_list_update_delete_patient(client: AsyncClient, admin_identity: P
 
     assert (await client.delete(f"{PREFIX}/patients/{patient_id}")).status_code == 204
     assert (await client.get(f"{PREFIX}/patients/{patient_id}")).status_code == 404
+    # Soft delete: la fila sigue en la BD con deleted_at, no se borró (trazabilidad).
+    row = (
+        await db_session.execute(select(Patient).where(Patient.id == patient_id))
+    ).scalar_one()
+    assert row.deleted_at is not None
+    # Y ya no aparece en el listado.
+    relisted = await client.get(f"{PREFIX}/patients", params={"limit": 100})
+    assert all(p["id"] != patient_id for p in relisted.json())
 
     audit_resp = await client.get(f"{PREFIX}/audit-log", params={"resource": "patients"})
     entries = [e for e in audit_resp.json() if e["resource_id"] == patient_id]

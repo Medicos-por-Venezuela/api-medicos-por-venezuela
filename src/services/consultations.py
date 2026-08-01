@@ -55,16 +55,16 @@ async def list_consultations(
     viewer_is_staff: bool = True,
     viewer_user_id: uuid.UUID | None = None,
 ) -> list[Consultation]:
-    """Lista consultas. Además de las filas `Consultation`, resuelve en el mismo
-    query (LEFT JOIN) `patient_name` y `assigned_doctor_name` y los adjunta como
-    atributos transitorios (no mapeados) a cada instancia, para que
-    `ConsultationResponse` (from_attributes=True) los sirva sin round-trips extra
-    (monitor de consultas del panel admin)."""
+    """Lista consultas. En el mismo query (LEFT JOIN) resuelve `patient_name` y
+    `assigned_doctor_name` como atributos transitorios, y puebla la relación `patient`
+    con la entidad ya cargada (sin N+1 ni lazy-load async), para que el detalle del panel
+    admin (ConsultationDetailResponse) sirva el paciente anidado sin round-trips extra. Los
+    response models que no tienen campo `patient` (ConsultationResponse/Patient) lo ignoran."""
     _validate_status(status)
     stmt = (
         select(
             Consultation,
-            Patient.full_name.label("patient_name"),
+            Patient,
             Profile.full_name.label("assigned_doctor_name"),
         )
         .outerjoin(Patient, Consultation.patient_id == Patient.id)
@@ -82,7 +82,9 @@ async def list_consultations(
     consultations = []
     for row in rows:
         consultation = row.Consultation
-        consultation.patient_name = row.patient_name
+        if row.Patient is not None:
+            consultation.patient = row.Patient  # relación poblada desde el join
+        consultation.patient_name = row.Patient.full_name if row.Patient else None
         consultation.assigned_doctor_name = row.assigned_doctor_name
         consultations.append(consultation)
     return consultations

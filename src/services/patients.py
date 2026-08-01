@@ -27,14 +27,20 @@ async def _resolve_dependent_cedula(session: AsyncSession, parent_id: uuid.UUID)
 
 
 async def list_patients(session: AsyncSession, skip: int = 0, limit: int = 100) -> list[Patient]:
-    stmt = select(Patient).order_by(Patient.created_at.desc()).offset(skip).limit(limit)
+    stmt = (
+        select(Patient)
+        .where(Patient.deleted_at.is_(None))  # soft delete: no listar los archivados
+        .order_by(Patient.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    )
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
 
 async def get_patient(session: AsyncSession, patient_id: uuid.UUID) -> Patient:
     patient = await session.get(Patient, patient_id)
-    if patient is None:
+    if patient is None or patient.deleted_at is not None:  # soft delete: el archivado es 404
         raise NotFoundError("Paciente no encontrado.")
     return patient
 
@@ -81,13 +87,15 @@ async def update_patient(
 async def delete_patient(
     session: AsyncSession, patient_id: uuid.UUID, actor_user_id: uuid.UUID | None = None
 ) -> None:
+    """Baja lógica (soft delete): marca deleted_at, no borra la fila (trazabilidad). Mismo patrón
+    que delete_doctor. get_patient ya devuelve 404 si el paciente estaba archivado."""
     patient = await get_patient(session, patient_id)
+    patient.deleted_at = func.now()
     await audit.log_action(
         session,
         action="patient.deleted",
         actor_user_id=actor_user_id,
         resource="patients",
-        resource_id=patient_id,
+        resource_id=patient.id,
     )
-    await session.delete(patient)
     await session.commit()

@@ -88,6 +88,9 @@ class ConsultationUpdate(BaseModel):
     internal_note: str | None = Field(default=None, max_length=2000)
     doctor_id: uuid.UUID | None = None
     assigned_doctor_id: uuid.UUID | None = None
+    # Gestión del admin (panel admin/pacientes): asignar super_admin de seguimiento / nota libre.
+    admin_seguimiento: uuid.UUID | None = None
+    nota_admin: str | None = Field(default=None, max_length=5000)
     referred_specialty: str | None = Field(default=None, max_length=100)
     platform_used: str | None = Field(default=None, max_length=50)
     meeting_link: str | None = Field(default=None, max_length=500)
@@ -218,6 +221,9 @@ class ConsultationResponse(ConsultationBase):
     # consulta está sin asignar.
     patient_name: str | None = None
     assigned_doctor_name: str | None = None
+    # Gestión del admin (panel admin/pacientes): super_admin de seguimiento + nota libre.
+    admin_seguimiento: uuid.UUID | None = None
+    nota_admin: str | None = None
 
 
 class ConsultationDetailResponse(ConsultationResponse):

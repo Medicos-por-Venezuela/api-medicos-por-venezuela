@@ -106,6 +106,11 @@ class Consultation(Base):
     )
     # Firma del médico al cerrar (dataURL PNG). Acto médico firmado; base para récipes (futuro).
     close_signature: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # --- Gestión del admin (panel admin/pacientes; editables inline en la tabla) ---
+    # super_admin de seguimiento asignado al caso (uuid a users; sin FK en el ORM, la BD la tiene).
+    admin_seguimiento: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # Nota libre del admin sobre el caso.
+    nota_admin: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     patient: Mapped["Patient"] = relationship(back_populates="consultations")  # noqa: F821
     events: Mapped[list["ConsultationEvent"]] = relationship(  # noqa: F821
