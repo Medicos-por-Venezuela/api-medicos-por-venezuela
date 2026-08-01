@@ -69,6 +69,9 @@ async def list_consultations(
         )
         .outerjoin(Patient, Consultation.patient_id == Patient.id)
         .outerjoin(Profile, Consultation.assigned_doctor_id == Profile.id)
+        # Soft delete: no listar consultas de pacientes archivados (los datos quedan en la BD para
+        # trazabilidad, pero el caso desaparece del monitor, igual que antes con el "eliminar").
+        .where(Patient.deleted_at.is_(None))
     )
     if status:
         stmt = stmt.where(Consultation.status == status)

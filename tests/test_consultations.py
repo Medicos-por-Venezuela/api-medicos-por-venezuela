@@ -121,6 +121,25 @@ async def test_admin_pacientes_list_enrichment_and_admin_fields(
     assert row2["nota_admin"] == "Revisar en 48h"
 
 
+async def test_archived_patient_consultations_hidden_from_list(client: AsyncClient) -> None:
+    """Soft delete: al archivar un paciente, sus consultas desaparecen del monitor (aunque quedan
+    en la BD). Paridad con el "eliminar" viejo, sin pérdida de datos."""
+    patient_id = await _create_patient(client)
+    cid = (
+        await client.post(f"{PREFIX}/consultations", json={"patient_id": patient_id})
+    ).json()["id"]
+
+    listed = await client.get(f"{PREFIX}/consultations", params={"limit": 200})
+    assert any(c["id"] == cid for c in listed.json())
+
+    # Archivar el paciente (baja lógica).
+    assert (await client.delete(f"{PREFIX}/patients/{patient_id}")).status_code == 204
+
+    # Su consulta ya no aparece en el listado.
+    relisted = await client.get(f"{PREFIX}/consultations", params={"limit": 200})
+    assert all(c["id"] != cid for c in relisted.json())
+
+
 async def test_consultation_invalid_patient(client: AsyncClient) -> None:
     resp = await client.post(
         f"{PREFIX}/consultations",
