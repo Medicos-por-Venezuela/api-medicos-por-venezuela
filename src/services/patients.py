@@ -38,6 +38,19 @@ async def list_patients(session: AsyncSession, skip: int = 0, limit: int = 100) 
     return list(result.scalars().all())
 
 
+async def list_patients_for_user(session: AsyncSession, user_id: uuid.UUID) -> list[Patient]:
+    """Registros de paciente ligados a la cuenta del usuario (user_id == caller, no archivados).
+    Para el portal del paciente (mi-caso), que no tiene el permiso staff patients.read; replica la
+    RLS patients_select_own (user_id = auth.uid())."""
+    stmt = (
+        select(Patient)
+        .where(Patient.user_id == user_id, Patient.deleted_at.is_(None))
+        .order_by(Patient.created_at.asc())
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
 async def get_patient(session: AsyncSession, patient_id: uuid.UUID) -> Patient:
     patient = await session.get(Patient, patient_id)
     if patient is None or patient.deleted_at is not None:  # soft delete: el archivado es 404

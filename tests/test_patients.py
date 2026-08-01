@@ -1,11 +1,15 @@
 """Pruebas de integración asíncronas del recurso patients (con aislamiento)."""
 
+import uuid
+from datetime import UTC, datetime
+
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.patient import Patient
 from src.models.profile import Profile
+from tests._helpers import auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -98,6 +102,47 @@ async def test_list_update_delete_patient(
     entries = [e for e in audit_resp.json() if e["resource_id"] == patient_id]
     assert sorted(e["action"] for e in entries) == sorted(["patient.updated", "patient.deleted"])
     assert all(e["actor_user_id"] == str(admin_identity.id) for e in entries)
+
+
+async def test_list_my_patients_scopes_to_own_and_excludes_archived(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """GET /patients/me (portal del paciente): solo los registros ligados a la cuenta del llamante
+    (user_id), sin archivados; nunca los de otro usuario."""
+    me = make_profile(role="patient")
+    db_session.add(me)
+    other_uid = uuid.uuid4()
+    mine = Patient(
+        full_name="Mío",
+        phone_whatsapp="+58412000100",
+        affected_zone="Caracas",
+        needs_tags=[],
+        consent=True,
+        user_id=me.id,
+    )
+    mine_archived = Patient(
+        full_name="Mío Archivado",
+        phone_whatsapp="+58412000101",
+        affected_zone="Caracas",
+        needs_tags=[],
+        consent=True,
+        user_id=me.id,
+        deleted_at=datetime.now(UTC),
+    )
+    other = Patient(
+        full_name="De Otro",
+        phone_whatsapp="+58412000102",
+        affected_zone="Caracas",
+        needs_tags=[],
+        consent=True,
+        user_id=other_uid,
+    )
+    db_session.add_all([mine, mine_archived, other])
+    await db_session.flush()
+
+    resp = await client.get(f"{PREFIX}/patients/me", headers=auth_headers(me.id))
+    assert resp.status_code == 200, resp.text
+    assert {p["id"] for p in resp.json()} == {str(mine.id)}
 
 
 async def test_update_missing_patient_404(client: AsyncClient) -> None:

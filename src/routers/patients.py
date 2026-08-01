@@ -9,7 +9,7 @@ import uuid
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.security import Principal, require_permission
+from src.core.security import Principal, get_current_principal, require_permission
 from src.db.session import get_db
 from src.schemas.patient import PatientCreate, PatientResponse, PatientUpdate
 from src.services import patients as patients_service
@@ -45,6 +45,21 @@ async def create_patient(
 ) -> PatientResponse:
     """Crea un paciente. Requiere `consent = true` (igual que la política RLS pública)."""
     return await patients_service.create_patient(db, payload)
+
+
+@router.get(
+    "/me",
+    response_model=list[PatientResponse],
+    summary="Mis registros de paciente (portal del paciente)",
+)
+async def list_my_patients(
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
+) -> list[PatientResponse]:
+    """Registros de paciente ligados a la cuenta del llamante (mi-caso). Replica la RLS
+    patients_select_own (user_id = auth.uid()); no requiere el permiso staff patients.read.
+    Debe ir ANTES de /{patient_id} o FastAPI intenta parsear 'me' como UUID (422)."""
+    return await patients_service.list_patients_for_user(db, principal.id)
 
 
 @router.get(
