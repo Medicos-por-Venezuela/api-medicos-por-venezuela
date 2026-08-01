@@ -121,6 +121,39 @@ async def test_admin_pacientes_list_enrichment_and_admin_fields(
     assert row2["nota_admin"] == "Revisar en 48h"
 
 
+async def test_patient_view_exposes_scheduled_at(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """La vista del paciente (GET /consultations no-staff) expone scheduled_at para el feed de
+    citas de mi-caso, y NO incluye las notas del staff (vista reducida)."""
+    me = make_profile(role="patient")
+    db_session.add(me)
+    patient = Patient(
+        full_name="Paciente Agenda",
+        phone_whatsapp="+58412000200",
+        affected_zone="Caracas",
+        needs_tags=[],
+        consent=True,
+        user_id=me.id,
+    )
+    db_session.add(patient)
+    await db_session.flush()
+    # Se crea por el endpoint (code/queued_at los pone el backend) y luego se agenda.
+    cid = (
+        await client.post(f"{PREFIX}/consultations", json={"patient_id": str(patient.id)})
+    ).json()["id"]
+    cons = await db_session.get(Consultation, uuid.UUID(cid))
+    assert cons is not None
+    cons.scheduled_at = datetime(2026, 9, 1, 15, 0, tzinfo=UTC)
+    await db_session.flush()
+
+    resp = await client.get(f"{PREFIX}/consultations", headers=auth_headers(me.id))
+    assert resp.status_code == 200, resp.text
+    row = next(c for c in resp.json() if c["id"] == cid)
+    assert row["scheduled_at"] is not None
+    assert "internal_note" not in row  # vista reducida del paciente
+
+
 async def test_consultation_invalid_patient(client: AsyncClient) -> None:
     resp = await client.post(
         f"{PREFIX}/consultations",

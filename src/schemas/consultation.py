@@ -268,6 +268,8 @@ class ConsultationPatientResponse(BaseModel):
     closed_at: datetime | None = None
     patient_last_seen_at: datetime | None = None
     created_at: datetime
+    # Cita agendada (módulo Agenda): el portal del paciente (mi-caso) lista sus próximas citas.
+    scheduled_at: datetime | None = None
 
 
 class ConsultationClaimRequest(BaseModel):
