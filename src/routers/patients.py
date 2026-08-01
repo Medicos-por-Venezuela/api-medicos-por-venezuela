@@ -6,9 +6,11 @@ eliminar requieren admin (replica las RLS).
 
 import uuid
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import settings
+from src.core.ratelimit import limiter
 from src.core.security import Principal, get_current_principal, require_permission
 from src.db.session import get_db
 from src.schemas.patient import PatientCreate, PatientResponse, PatientUpdate
@@ -38,12 +40,18 @@ async def list_patients(
     response_model=PatientResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Crear paciente (público)",
-    responses={400: {"description": "Falta el consentimiento (`consent = true`)."}},
+    responses={
+        400: {"description": "Falta el consentimiento (`consent = true`)."},
+        429: {"description": "Demasiadas altas desde esta IP (rate limit)."},
+    },
 )
+@limiter.limit(settings.PUBLIC_WRITE_RATE_LIMIT)
 async def create_patient(
-    payload: PatientCreate, db: AsyncSession = Depends(get_db)
+    request: Request, payload: PatientCreate, db: AsyncSession = Depends(get_db)
 ) -> PatientResponse:
-    """Crea un paciente. Requiere `consent = true` (igual que la política RLS pública)."""
+    """Crea un paciente. Requiere `consent = true` (igual que la política RLS pública).
+
+    `request` es obligatorio para slowapi (lee la IP del cliente), aunque no se use aquí."""
     return await patients_service.create_patient(db, payload)
 
 

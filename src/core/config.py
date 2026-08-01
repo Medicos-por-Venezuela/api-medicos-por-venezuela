@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     SUPABASE_JWT_SECRET: str = "dev-insecure-jwt-secret-change-me"
     SUPABASE_JWT_ALGORITHM: str = "HS256"
     SUPABASE_JWT_AUDIENCE: str = "authenticated"
+    # Emisor esperado del token ({SUPABASE_URL}/auth/v1 en prod). PyJWT solo verifica `iss`
+    # si se le pasa el parámetro, así que dejarlo en None mantiene dev intacto (el Supabase
+    # local emite otro iss). En producción conviene definirlo por entorno.
+    SUPABASE_JWT_ISSUER: str | None = None
     # Opcional: URL de JWKS (claves asimétricas ES256/RS256 "JWT signing keys" de Supabase;
     # el CLI de Supabase local las usa por defecto: {API_URL}/auth/v1/.well-known/jwks.json).
     # Si no se define, solo se valida HS256 con SUPABASE_JWT_SECRET (comportamiento de siempre).
@@ -101,6 +105,9 @@ class Settings(BaseSettings):
     # Storage en memoria por proceso; para varias instancias, usar Redis.
     RATE_LIMIT_ENABLED: bool = True
     DOCTOR_REGISTER_RATE_LIMIT: str = "5/minute"
+    # Escrituras públicas (alta de paciente y de consulta): sin límite, cualquiera puede
+    # inundar la cola con casos falsos que los médicos ven en el panel.
+    PUBLIC_WRITE_RATE_LIMIT: str = "10/minute"
 
     def _normalize_async_scheme(self, url: str) -> str:
         """Garantiza el driver async (postgresql+asyncpg://)."""
