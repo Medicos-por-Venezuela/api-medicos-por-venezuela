@@ -8,9 +8,11 @@ Autorización (replica las RLS):
 
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import settings
+from src.core.ratelimit import limiter
 from src.core.security import (
     Principal,
     get_current_principal,
@@ -92,12 +94,16 @@ async def list_consultations(
     responses={
         400: {"description": "El `patient_id` no existe."},
         422: {"description": "`status` inválido."},
+        429: {"description": "Demasiadas consultas desde esta IP (rate limit)."},
     },
 )
+@limiter.limit(settings.PUBLIC_WRITE_RATE_LIMIT)
 async def create_consultation(
-    payload: ConsultationCreate, db: AsyncSession = Depends(get_db)
+    request: Request, payload: ConsultationCreate, db: AsyncSession = Depends(get_db)
 ) -> ConsultationResponse:
-    """Crea una consulta en espera. El `code` lo genera la base de datos (trigger)."""
+    """Crea una consulta en espera. El `code` lo genera la base de datos (trigger).
+
+    `request` es obligatorio para slowapi (lee la IP del cliente), aunque no se use aquí."""
     return await consultations_service.create_consultation(db, payload)
 
 

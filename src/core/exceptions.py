@@ -36,6 +36,17 @@ def is_lock_not_available(exc: Exception) -> bool:
     return False
 
 
+def _safe(exc: Exception) -> str:
+    """Resumen logueable de un error de base de datos, SIN PII.
+
+    `str()` de una excepción de SQLAlchemy incluye "[SQL: ...] [parameters: (...)]", es decir
+    nombre, cédula y teléfono del paciente en los logs. Aquí solo el tipo y el SQLSTATE
+    (mismo criterio que el handler de UpstreamServiceError)."""
+    orig = getattr(exc, "orig", None)
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    return f"{type(exc).__name__}(sqlstate={sqlstate})" if sqlstate else type(exc).__name__
+
+
 def _json(status_code: int, detail: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"detail": detail})
 
@@ -76,7 +87,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(OperationalError)
     async def _operational(request: Request, exc: OperationalError) -> JSONResponse:
         # Típicamente: fila bloqueada por otra transacción (with_for_update nowait).
-        logger.warning("OperationalError en %s: %s", request.url.path, exc)
+        logger.warning("OperationalError en %s: %s", request.url.path, _safe(exc))
         return _json(
             status.HTTP_409_CONFLICT,
             "Conflicto de concurrencia: el recurso está siendo modificado por otra "
@@ -86,7 +97,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(IntegrityError)
     async def _integrity(request: Request, exc: IntegrityError) -> JSONResponse:
         # Típicamente: violación de UNIQUE o FOREIGN KEY.
-        logger.warning("IntegrityError en %s: %s", request.url.path, exc)
+        logger.warning("IntegrityError en %s: %s", request.url.path, _safe(exc))
         return _json(
             status.HTTP_409_CONFLICT,
             "Conflicto de integridad de datos (duplicado o referencia inexistente).",
@@ -96,13 +107,13 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def _dbapi(request: Request, exc: DBAPIError) -> JSONResponse:
         # asyncpg mapea LockNotAvailableError (55P03) a DBAPIError, no a OperationalError.
         if is_lock_not_available(exc):
-            logger.warning("Lock no disponible en %s: %s", request.url.path, exc)
+            logger.warning("Lock no disponible en %s: %s", request.url.path, _safe(exc))
             return _json(
                 status.HTTP_409_CONFLICT,
                 "Conflicto de concurrencia: el recurso está bloqueado por otra "
                 "operación. Inténtalo de nuevo.",
             )
-        logger.error("DBAPIError en %s: %s", request.url.path, exc)
+        logger.error("DBAPIError en %s: %s", request.url.path, _safe(exc))
         return _json(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "Error interno de base de datos.",
