@@ -210,6 +210,7 @@ class ConsultationResponse(ConsultationBase):
     ended_at: datetime | None = None
     opened_at: datetime | None = None
     closed_at: datetime | None = None
+    entered_call_at: datetime | None = None
     patient_last_seen_at: datetime | None = None
     created_at: datetime
     # Agenda / cadena de seguimiento.
