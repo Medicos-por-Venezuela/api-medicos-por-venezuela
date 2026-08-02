@@ -40,6 +40,53 @@ async def _claim(client: AsyncClient, cid: str, doctor_id) -> None:
     assert r.status_code == 200, r.text
 
 
+async def test_la_interconsulta_se_persiste_de_verdad(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Regresión del bug de producción: la API respondía 201 con un id real y la fila NO existía.
+
+    `create_interconsultation` hacía `flush()` sin `commit()`. El flush manda el INSERT y rellena
+    `inter.id` — por eso la respuesta se veía perfecta — pero `get_db` cierra la sesión al acabar
+    el request y eso hace ROLLBACK. En prod: 201 correctos y `count(*) = 0`.
+
+    No se puede comprobar por visibilidad de datos: `db_session` usa
+    `join_transaction_mode="create_savepoint"`, y dentro de la misma sesión `flush()` y `commit()`
+    son indistinguibles — por eso los 269 tests pasaban con el bug dentro. Así que se comprueba lo
+    único que los distingue: que la llamada COMMITEA. Si alguien vuelve a quitar el commit, esto
+    se pone rojo aunque la respuesta siga siendo un 201 impecable.
+    """
+    attending = make_profile(role="doctor")
+    invited = make_profile(role="doctor")
+    db_session.add_all([attending, invited])
+    await db_session.flush()
+    cid = await _consultation_with_patient(client)
+    await _claim(client, cid, attending.id)
+
+    commits = 0
+    original_commit = db_session.commit
+
+    async def contar_commits() -> None:
+        nonlocal commits
+        commits += 1
+        await original_commit()
+
+    db_session.commit = contar_commits  # type: ignore[method-assign]
+    try:
+        resp = await client.post(
+            f"{PREFIX}/interconsultations",
+            json={"consultation_id": cid, "invited_doctor_id": str(invited.id)},
+            headers=auth_headers(attending.id),
+        )
+    finally:
+        db_session.commit = original_commit  # type: ignore[method-assign]
+
+    assert resp.status_code == 201, resp.text
+    assert commits == 1, (
+        "create_interconsultation no commiteó: get_db hace rollback al cerrar la sesión, así que "
+        "la fila se descarta aunque la API responda 201 con un id real (bug de prod 2026-08-02)"
+    )
+
+
 async def test_create_and_invitee_limited_view(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
