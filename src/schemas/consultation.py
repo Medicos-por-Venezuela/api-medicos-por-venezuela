@@ -12,6 +12,7 @@ from src.models.consultation import CONSULTATION_STATUSES
 __all__ = [
     "CONSULTATION_STATUSES",
     "ConsultationCreate",
+    "ConsultationCreatedResponse",
     "ConsultationUpdate",
     "ConsultationResponse",
     "ConsultationDetailPatient",
@@ -235,6 +236,18 @@ class ConsultationDetailResponse(ConsultationResponse):
     patient: ConsultationDetailPatient | None = None
 
 
+class ConsultationCreatedResponse(ConsultationResponse):
+    """Respuesta de POST /consultations: la consulta MÁS el token de acceso a su sala.
+
+    El token se entrega aquí y solo aquí — es la única vez que el paciente anónimo puede
+    recibirlo, porque no tiene sesión con la que volver a pedirlo. El frontend lo lleva en la
+    URL de /sala-espera en lugar del `cid` crudo. Deliberadamente NO va en
+    `ConsultationResponse`: los listados del panel no deben repartir credenciales de sala.
+    """
+
+    access_token: str
+
+
 class ConsultationPatientResponse(BaseModel):
     """Vista reducida para pacientes autenticados.
 
@@ -295,6 +308,9 @@ class PanelWaitingPatient(BaseModel):
     age_range: str | None = None
     needs_tags: list[str] | None = None
     description: str | None = None
+    # Las alergias se piden en el registro y son dato clínico de decisión: el médico las
+    # necesita ANTES de tomar el caso, no después. Van sin nombre, como el resto de la fila.
+    allergies: str | None = None
 
 
 class PanelPatient(PanelWaitingPatient):
