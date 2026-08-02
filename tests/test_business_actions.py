@@ -1,5 +1,5 @@
 """Pruebas de integración de la lógica de negocio portada del Next.js:
-attend-next, cierre/no-show, heartbeat, sala de video y acciones de perfil.
+separación por especialidad (cola + claim), cierre/no-show, sala de video y acciones de perfil.
 
 El `client` va autenticado como admin; cuando se necesita un médico con especialidad
 concreta (matching), se firma un JWT para un perfil doctor insertado en la sesión.
@@ -14,7 +14,7 @@ from tests._helpers import auth_headers, make_profile
 PREFIX = "/api/v1"
 
 
-async def _patient(client: AsyncClient, needs: list[str]) -> str:
+async def _patient(client: AsyncClient, needs: list[str], allergies: str | None = None) -> str:
     return (
         await client.post(
             f"{PREFIX}/patients",
@@ -24,6 +24,7 @@ async def _patient(client: AsyncClient, needs: list[str]) -> str:
                 "affected_zone": "Caracas",
                 "needs_tags": needs,
                 "consent": True,
+                "allergies": allergies,
             },
         )
     ).json()["id"]
@@ -34,8 +35,8 @@ async def _consultation(client: AsyncClient, needs: list[str]) -> str:
     return (await client.post(f"{PREFIX}/consultations", json={"patient_id": pid})).json()["id"]
 
 
-async def _doctor(db_session: AsyncSession, specialty: str) -> Profile:
-    doc = make_profile(role="doctor", specialty=specialty)
+async def _doctor(db_session: AsyncSession, specialty: str, role: str = "doctor") -> Profile:
+    doc = make_profile(role=role, specialty=specialty)
     db_session.add(doc)
     await db_session.flush()
     return doc
@@ -59,68 +60,114 @@ async def _consultation_with_specialty(
     ).json()["id"]
 
 
-# --- attend-next ---
+# --- Separación por especialidad en la cola y en el claim ---
+# Antes esto se probaba contra POST /queue/attend-next, un endpoint que ningún cliente
+# llamaba. La regla vive ahora donde el panel la ejerce de verdad: GET /consultations/panel
+# (qué casos VE el médico) y POST /consultations/{id}/claim (cuáles puede TOMAR).
 
 
-async def test_attend_next_picks_specialty_match(
+async def _panel_waiting_ids(client: AsyncClient, doctor_id) -> list[str]:
+    resp = await client.get(f"{PREFIX}/consultations/panel", headers=auth_headers(doctor_id))
+    assert resp.status_code == 200, resp.text
+    return [c["id"] for c in resp.json()["waiting"]]
+
+
+async def test_claim_asigna_caso_de_su_especialidad(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     doc = await _doctor(db_session, "Traumatología")
     cid = await _consultation(client, ["Lesión física"])  # -> category 'Lesión física'
 
-    resp = await client.post(f"{PREFIX}/queue/attend-next", headers=auth_headers(doc.id))
+    resp = await client.post(
+        f"{PREFIX}/consultations/{cid}/claim", json={}, headers=auth_headers(doc.id)
+    )
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["id"] == cid
     assert body["status"] == "in_progress"
     assert body["assigned_doctor_id"] == str(doc.id)
-    assert body["priority"] == "review"  # derivado de 'Lesión física'
 
 
-async def test_attend_next_no_eligible_returns_404(
+async def test_psicologo_no_ve_caso_fisico_en_la_cola(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
+    """El bug reportado en producción: el panel devolvía TODA la cola y un psicólogo veía la
+    cédula, el teléfono y el motivo de un caso de salud física."""
     psych = await _doctor(db_session, "Psicología")
-    await _consultation(client, ["Lesión física"])  # caso físico
-    # Un psicólogo no puede atender un caso físico -> no hay elegibles.
-    resp = await client.post(f"{PREFIX}/queue/attend-next", headers=auth_headers(psych.id))
-    assert resp.status_code == 404
+    cid = await _consultation(client, ["Lesión física"])
+
+    assert cid not in await _panel_waiting_ids(client, psych.id)
 
 
-async def test_attend_next_prefiere_specialty_id_sobre_fifo(
+async def test_psicologo_no_puede_tomar_caso_fisico_ni_por_post_directo(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """El matching es por la especialidad solicitada (specialty_id): aunque haya un caso
-    elegible más viejo, attend-next prefiere el que pide EXACTAMENTE su especialidad."""
-    doc = await _doctor(db_session, "Traumatología")
-    older = await _consultation(client, ["Medicina general"])  # elegible, sin especialidad
-    with_spec = await _consultation_with_specialty(client, ["Medicina general"], "Traumatología")
+    """Filtrar la lista no es control de acceso: el claim debe rechazarlo por su cuenta,
+    porque un POST directo se salta cualquier filtro de la UI."""
+    psych = await _doctor(db_session, "Psicología")
+    cid = await _consultation(client, ["Lesión física"])
 
-    resp = await client.post(f"{PREFIX}/queue/attend-next", headers=auth_headers(doc.id))
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["id"] == with_spec
-    assert resp.json()["id"] != older
+    resp = await client.post(
+        f"{PREFIX}/consultations/{cid}/claim", json={}, headers=auth_headers(psych.id)
+    )
+    assert resp.status_code == 403, resp.text
 
 
-async def test_attend_next_reserva_psicologia_por_specialty_id(
+async def test_caso_de_psicologia_reservado_por_specialty_id(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     """Un caso con especialidad Psicología solo va a Psicología/Psiquiatría, aunque sus
-    needs_tags sean genéricos (la especialidad explícita manda sobre el fallback legacy)."""
+    needs_tags sean genéricos (la especialidad explícita manda sobre el fallback legacy).
+    La reserva es bidireccional: el general ni lo ve ni lo puede tomar."""
     cid_psi = await _consultation_with_specialty(client, ["Medicina general"], "Psicología")
 
     general = await _doctor(db_session, "Medicina general")
-    resp = await client.post(f"{PREFIX}/queue/attend-next", headers=auth_headers(general.id))
-    # El general puede recibir OTRO caso en espera (datos previos), pero jamás el de psicología.
-    if resp.status_code == 200:
-        assert resp.json()["id"] != cid_psi
-    else:
-        assert resp.status_code == 404
+    assert cid_psi not in await _panel_waiting_ids(client, general.id)
+    blocked = await client.post(
+        f"{PREFIX}/consultations/{cid_psi}/claim", json={}, headers=auth_headers(general.id)
+    )
+    assert blocked.status_code == 403, blocked.text
 
     psych = await _doctor(db_session, "Psicología")
-    took = await client.post(f"{PREFIX}/queue/attend-next", headers=auth_headers(psych.id))
+    assert cid_psi in await _panel_waiting_ids(client, psych.id)
+    took = await client.post(
+        f"{PREFIX}/consultations/{cid_psi}/claim", json={}, headers=auth_headers(psych.id)
+    )
     assert took.status_code == 200, took.text
     assert took.json()["id"] == cid_psi
+
+
+async def test_admin_ve_y_toma_toda_la_cola(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El admin no queda acotado por especialidad: sigue viendo la cola entera."""
+    cid_psi = await _consultation_with_specialty(client, ["Medicina general"], "Psicología")
+    admin = await _doctor(db_session, "Medicina general", role="admin")
+
+    assert cid_psi in await _panel_waiting_ids(client, admin.id)
+    took = await client.post(
+        f"{PREFIX}/consultations/{cid_psi}/claim", json={}, headers=auth_headers(admin.id)
+    )
+    assert took.status_code == 200, took.text
+
+
+async def test_la_cola_del_panel_expone_las_alergias(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Las alergias se piden en el registro y son dato de decisión clínica: el médico las
+    necesita ANTES de tomar el caso."""
+    doc = await _doctor(db_session, "Medicina general")
+    pid = await _patient(client, ["Medicina general"], allergies="Penicilina")
+    cid = (
+        await client.post(f"{PREFIX}/consultations", json={"patient_id": pid})
+    ).json()["id"]
+
+    resp = await client.get(f"{PREFIX}/consultations/panel", headers=auth_headers(doc.id))
+    assert resp.status_code == 200, resp.text
+    row = next(c for c in resp.json()["waiting"] if c["id"] == cid)
+    assert row["patient"]["allergies"] == "Penicilina"
+    # Sigue SIN nombre: las alergias se suman al card anónimo, no lo destapan.
+    assert "full_name" not in row["patient"]
 
 
 # --- cierre / no-show ---
@@ -142,14 +189,9 @@ async def test_close_consultation_creates_event(client: AsyncClient) -> None:
     assert any(e["event_type"] == "closed" for e in events)
 
 
-# --- heartbeat (público) ---
-
-
-async def test_patient_heartbeat(client: AsyncClient) -> None:
-    cid = await _consultation(client, ["Medicina general"])
-    resp = await client.post(f"{PREFIX}/consultations/{cid}/heartbeat")
-    assert resp.status_code == 200
-    assert resp.json()["patient_last_seen_at"] is not None
+# El test del heartbeat se eliminó con el endpoint: era el único escritor de
+# `patient_last_seen_at` y no lo llamaba ningún cliente. La presencia del paciente la
+# resuelve Realtime Presence, que se cubre en los e2e (paciente-en-linea, presence).
 
 
 # --- entered-call (público, idempotente): reemplaza la RPC mark_patient_entered_call ---

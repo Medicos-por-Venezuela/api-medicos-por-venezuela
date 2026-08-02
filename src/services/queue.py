@@ -13,13 +13,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import NotFoundError
 from src.models.consultation import Consultation
-from src.models.patient import Patient
-from src.models.specialty import Specialty
-from src.services.specialties import can_attend_consultation, matches_consultation
 
-# Ventana de presencia: el paciente está "presente" si su heartbeat es < 5 min
-# (igual que PRESENCE_WINDOW_MS en panel-medico.tsx).
-PRESENCE_WINDOW = timedelta(minutes=5)
+# La ventana de presencia y `_is_present` se eliminaron con `attend_next`: leían
+# `patient_last_seen_at`, columna que dejó de escribirse cuando la presencia del paciente pasó
+# a Realtime Presence (lib/patientPresence.tsx). El panel muestra quién está en sala con el
+# badge "● En sala", que sale de ese canal y no de la base.
 
 
 async def list_queue(session: AsyncSession, limit: int = 100) -> list[Consultation]:
@@ -31,11 +29,6 @@ async def list_queue(session: AsyncSession, limit: int = 100) -> list[Consultati
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
-
-
-def _is_present(consultation: Consultation, now: datetime) -> bool:
-    last = consultation.patient_last_seen_at
-    return last is not None and (now - last) < PRESENCE_WINDOW
 
 
 async def _lock_waiting(session: AsyncSession, consultation_id: uuid.UUID) -> Consultation | None:
@@ -73,60 +66,11 @@ async def take_consultation(
     return await _assign(session, consultation, assigned_doctor_id)
 
 
-async def attend_next(
-    session: AsyncSession,
-    assigned_doctor_id: uuid.UUID,
-    specialty: str | None = None,
-    is_admin: bool = False,
-) -> Consultation:
-    """Selecciona y toma el siguiente paciente (réplica de attendNext del frontend):
-
-    1. Elegibles por `can_attend_consultation` (admin atiende todo). El matching es por la
-       ESPECIALIDAD solicitada (consultations.specialty_id — el registro del paciente siempre
-       la setea); category/needs quedan de fallback para consultas viejas sin especialidad.
-    2. Preferir presentes (heartbeat < 5 min); si ninguno, caer a todos los elegibles.
-    3. Preferir match de especialidad; si no, el más antiguo (FIFO).
-    4. Toma atómica de ese caso (with_for_update nowait).
-    """
-    # Candidatos en espera + needs_tags del paciente + nombre de la especialidad, FIFO.
-    stmt = (
-        select(Consultation, Patient.needs_tags, Specialty.name)
-        .join(Patient, Consultation.patient_id == Patient.id)
-        .outerjoin(Specialty, Consultation.specialty_id == Specialty.id)
-        .where(Consultation.status == "waiting")
-        .order_by(Consultation.queued_at.asc())
-    )
-    rows = (await session.execute(stmt)).all()
-
-    eligible = [
-        (c, needs, c_spec)
-        for (c, needs, c_spec) in rows
-        if is_admin or can_attend_consultation(specialty, c_spec, c.category, needs)
-    ]
-    if not eligible:
-        raise NotFoundError("No hay pacientes para tu especialidad ahora.")
-
-    now = datetime.now(UTC)
-    present = [row for row in eligible if _is_present(row[0], now)]
-    pool = present if present else eligible
-
-    if is_admin:
-        chosen = pool[0][0]
-    else:
-        chosen = next(
-            (
-                c
-                for (c, needs, c_spec) in pool
-                if matches_consultation(specialty, c_spec, c.category, needs)
-            ),
-            pool[0][0],
-        )
-
-    # Toma atómica del elegido (otro médico pudo habérselo llevado en el ínterin).
-    locked = await _lock_waiting(session, chosen.id)
-    if locked is None:
-        raise NotFoundError("El turno ya no está disponible.")
-    return await _assign(session, locked, assigned_doctor_id)
+# `attend_next` se eliminó: ningún cliente lo llamaba (el panel selecciona en el cliente y
+# llama a POST /consultations/{id}/claim), y su preferencia por "paciente presente" dependía de
+# `patient_last_seen_at`, que ya no escribe nadie desde que la presencia pasó a Realtime
+# Presence. La regla de especialidad que era su única parte viva vive ahora en
+# `consultations.claim_consultation` y en `get_panel`, que sí están en uso.
 
 
 async def release_stale(session: AsyncSession, older_than_minutes: int) -> int:

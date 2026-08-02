@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 from src.core.errors import (
     BadRequestError,
     ConflictError,
+    ForbiddenError,
     NotFoundError,
     UnprocessableError,
 )
@@ -22,7 +23,7 @@ from src.schemas.consultation import ConsultationCreate, ConsultationUpdate
 from src.schemas.consultation_event import ConsultationEventCreate
 from src.services import audit
 from src.services.jitsi import new_room_url
-from src.services.specialties import compute_priority
+from src.services.specialties import can_attend_consultation, compute_priority
 
 # Estados en los que la consulta sigue "viva" para el heartbeat del paciente.
 _HEARTBEAT_OPEN_STATUSES = {"waiting", "in_progress"}
@@ -411,13 +412,32 @@ async def claim_consultation(
     consultation_id: uuid.UUID,
     doctor_user_id: uuid.UUID,
     via_whatsapp: bool = False,
+    doctor_specialty: str | None = None,
+    is_admin: bool = False,
 ) -> Consultation:
     """Toma una consulta en espera para el médico autenticado.
 
     Claim ATÓMICO: el UPDATE solo matchea mientras `assigned_doctor_id IS NULL`, así que si
     otro médico la tomó primero afecta 0 filas y se responde 409. La condición de carrera la
-    resuelve la base (un único ganador), no un read-then-write en la app."""
+    resuelve la base (un único ganador), no un read-then-write en la app.
+
+    Valida la especialidad: la separación psicología <-> salud física es una regla de negocio,
+    y este endpoint es el ÚNICO camino real para tomar un caso. Que el panel ya filtre la lista
+    no basta — un POST directo se saltaba el filtro por completo."""
     consultation = await get_consultation(session, consultation_id)  # 404 si no existe
+    if not is_admin:
+        specialty_name = None
+        if consultation.specialty_id:
+            specialty = await session.get(Specialty, consultation.specialty_id)
+            specialty_name = specialty.name if specialty else None
+        patient = await session.get(Patient, consultation.patient_id)
+        if not can_attend_consultation(
+            doctor_specialty,
+            specialty_name,
+            consultation.category,
+            patient.needs_tags if patient else None,
+        ):
+            raise ForbiddenError("Este caso no corresponde a tu especialidad.")
     now = datetime.now(UTC)
     stmt = (
         update(Consultation)
@@ -462,11 +482,20 @@ async def claim_consultation(
 async def get_panel(
     session: AsyncSession,
     doctor_user_id: uuid.UUID,
+    doctor_specialty: str | None = None,
+    is_admin: bool = False,
 ) -> tuple[list[Consultation], list[Consultation], int]:
-    """Datos del panel médico en una pasada: cola de espera (TODA consulta sin asignar en un
-    estado abierto — el médico las ve en tiempo real para atender de una vez, sin esperar), las
-    consultas abiertas del propio médico y cuántas ha cerrado. El paciente viene precargado
-    (`selectinload`) para el card de cada fila."""
+    """Datos del panel médico en una pasada: cola de espera ACOTADA a lo que este médico puede
+    atender, las consultas abiertas del propio médico y cuántas ha cerrado. El paciente viene
+    precargado (`selectinload`) para el card de cada fila.
+
+    El filtro por especialidad se aplica AQUÍ, en el servidor: antes se devolvía la cola entera
+    y el recorte era cosmético en el cliente, así que un psicólogo veía (y podía tomar) la
+    cédula, el teléfono y el motivo de un caso de medicina general. La regla es la misma que ya
+    usaba la elegibilidad (`can_attend_consultation`), y `claim_consultation` la revalida: el
+    filtro de una lista nunca es un control de acceso por sí solo.
+
+    El admin sigue viendo la cola completa. El orden es FIFO (más antiguo primero)."""
     waiting_stmt = (
         select(Consultation)
         .options(selectinload(Consultation.patient), selectinload(Consultation.specialty_ref))
@@ -494,20 +523,30 @@ async def get_panel(
         )
     )
     waiting = list((await session.execute(waiting_stmt)).scalars().all())
+    if not is_admin:
+        # En Python y no en SQL a propósito: la regla combina el nombre de la especialidad con
+        # category/needs_tags (fallback de consultas viejas), y es la MISMA función que valida
+        # el claim. Duplicarla en SQL sería la forma de que las dos se desincronicen. La cola
+        # sin asignar es corta, así que el coste es irrelevante.
+        waiting = [
+            c
+            for c in waiting
+            if can_attend_consultation(
+                doctor_specialty,
+                c.specialty_ref.name if c.specialty_ref else None,
+                c.category,
+                c.patient.needs_tags if c.patient else None,
+            )
+        ]
     mine = list((await session.execute(mine_stmt)).scalars().all())
     my_closed = (await session.execute(closed_stmt)).scalar_one()
     return waiting, mine, my_closed
 
 
-async def heartbeat(session: AsyncSession, consultation_id: uuid.UUID) -> Consultation:
-    """Marca presencia del paciente (mark_patient_waiting): actualiza
-    patient_last_seen_at solo si la consulta sigue en espera o en progreso."""
-    consultation = await get_consultation(session, consultation_id)
-    if consultation.status in _HEARTBEAT_OPEN_STATUSES:
-        consultation.patient_last_seen_at = datetime.now(UTC)
-        await session.commit()
-        await session.refresh(consultation)
-    return consultation
+# `heartbeat` se eliminó: era el único escritor de `patient_last_seen_at` y no lo llamaba
+# ningún cliente. La presencia del paciente en sala la resuelve Realtime Presence
+# (lib/patientPresence.tsx), que la reemplazó precisamente para no hacer un UPDATE cada 15 s
+# por paciente en espera. La columna se conserva: tiene datos históricos de producción.
 
 
 async def mark_entered_call(session: AsyncSession, consultation_id: uuid.UUID) -> Consultation:
