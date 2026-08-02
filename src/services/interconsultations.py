@@ -87,6 +87,13 @@ async def create_interconsultation(
         },
     )
 
+    # SIN ESTE COMMIT la interconsulta NO se guarda. `get_db` cierra la sesión al terminar el
+    # request y eso hace ROLLBACK: el `flush()` de arriba manda el INSERT y rellena `inter.id`,
+    # así que la API respondía 201 con un id de verdad mientras la fila se descartaba. Se detectó
+    # en producción con `select count(*) from interconsultations` = 0 y respuestas 201 correctas.
+    await session.commit()
+    await session.refresh(inter)
+
     return _to_response(inter, await _invited_name(session, invited_doctor_id))
 
 
