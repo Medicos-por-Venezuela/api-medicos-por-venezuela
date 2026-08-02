@@ -5,6 +5,8 @@ El `client` va autenticado como admin; cuando se necesita un médico con especia
 concreta (matching), se firma un JWT para un perfil doctor insertado en la sesión.
 """
 
+import uuid
+
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,6 +35,15 @@ async def _patient(client: AsyncClient, needs: list[str], allergies: str | None 
 async def _consultation(client: AsyncClient, needs: list[str]) -> str:
     pid = await _patient(client, needs)
     return (await client.post(f"{PREFIX}/consultations", json={"patient_id": pid})).json()["id"]
+
+
+async def _consultation_and_room_headers(
+    client: AsyncClient, needs: list[str]
+) -> tuple[str, dict[str, str]]:
+    """Consulta + la cabecera con su token de sala, como la recibe el paciente al registrarse."""
+    pid = await _patient(client, needs)
+    body = (await client.post(f"{PREFIX}/consultations", json={"patient_id": pid})).json()
+    return body["id"], {"X-Consultation-Token": body["access_token"]}
 
 
 async def _doctor(db_session: AsyncSession, specialty: str, role: str = "doctor") -> Profile:
@@ -194,42 +205,98 @@ async def test_close_consultation_creates_event(client: AsyncClient) -> None:
 # resuelve Realtime Presence, que se cubre en los e2e (paciente-en-linea, presence).
 
 
-# --- entered-call (público, idempotente): reemplaza la RPC mark_patient_entered_call ---
+# --- entered-call (idempotente, sin sesión pero con token de sala) ---
 
 
 async def test_mark_entered_call_sets_once(client: AsyncClient) -> None:
-    cid = await _consultation(client, ["Medicina general"])
-    resp = await client.post(f"{PREFIX}/consultations/{cid}/entered-call")
+    cid, room = await _consultation_and_room_headers(client, ["Medicina general"])
+    resp = await client.post(f"{PREFIX}/consultations/{cid}/entered-call", headers=room)
     assert resp.status_code == 200
     first = resp.json()["entered_call_at"]
     assert first is not None
 
     # Idempotente: una segunda llamada no cambia entered_call_at.
-    resp2 = await client.post(f"{PREFIX}/consultations/{cid}/entered-call")
+    resp2 = await client.post(f"{PREFIX}/consultations/{cid}/entered-call", headers=room)
     assert resp2.status_code == 200
     assert resp2.json()["entered_call_at"] == first
 
 
-# --- sala de video (idempotente, pública) ---
+# --- sala de video (idempotente, sin sesión pero con token de sala) ---
 
 
 async def test_video_room_idempotent_and_conflict(client: AsyncClient) -> None:
-    cid = await _consultation(client, ["Medicina general"])
+    cid, room = await _consultation_and_room_headers(client, ["Medicina general"])
 
-    first = await client.post(f"{PREFIX}/consultations/{cid}/video-room")
+    first = await client.post(f"{PREFIX}/consultations/{cid}/video-room", headers=room)
     assert first.status_code == 200
     url = first.json()["video_room_url"]
     assert url.startswith("https://") and "/vamed-" in url
 
     # Idempotente: misma URL.
-    second = await client.post(f"{PREFIX}/consultations/{cid}/video-room")
+    second = await client.post(f"{PREFIX}/consultations/{cid}/video-room", headers=room)
     assert second.json()["video_room_url"] == url
 
     # Una consulta tomada (in_progress) y sin sala -> 409.
-    cid2 = await _consultation(client, ["Medicina general"])
+    cid2, room2 = await _consultation_and_room_headers(client, ["Medicina general"])
     await client.post(f"{PREFIX}/queue/{cid2}/take")
-    conflict = await client.post(f"{PREFIX}/consultations/{cid2}/video-room")
+    conflict = await client.post(f"{PREFIX}/consultations/{cid2}/video-room", headers=room2)
     assert conflict.status_code == 409
+
+
+# --- Token de acceso a la sala (hallazgo M3) ---
+
+
+async def test_sala_sin_token_responde_401(client: AsyncClient) -> None:
+    """Conocer el id de la consulta ya no basta para pedir la sala: ESE era el hallazgo."""
+    cid, _ = await _consultation_and_room_headers(client, ["Medicina general"])
+
+    assert (await client.post(f"{PREFIX}/consultations/{cid}/video-room")).status_code == 401
+    assert (await client.post(f"{PREFIX}/consultations/{cid}/entered-call")).status_code == 401
+
+
+async def test_token_de_otra_consulta_no_sirve(client: AsyncClient) -> None:
+    """Anti-IDOR con credencial legítima: el token va atado a SU consulta por el claim `sub`.
+    Sin esa comprobación, cualquier paciente abriría la sala de cualquier otro."""
+    _, room_a = await _consultation_and_room_headers(client, ["Medicina general"])
+    cid_b, _ = await _consultation_and_room_headers(client, ["Medicina general"])
+
+    resp = await client.post(f"{PREFIX}/consultations/{cid_b}/video-room", headers=room_a)
+    assert resp.status_code == 401
+
+
+async def test_token_expirado_no_sirve(client: AsyncClient, monkeypatch) -> None:
+    """La caducidad es el punto entero del cambio: una URL filtrada deja de funcionar."""
+    from src.core import consultation_token
+    from src.core.config import settings as app_settings
+
+    cid, _ = await _consultation_and_room_headers(client, ["Medicina general"])
+    monkeypatch.setattr(app_settings, "CONSULTATION_TOKEN_TTL_HOURS", -1)  # ya nacido caducado
+    expired = {"X-Consultation-Token": consultation_token.issue(uuid.UUID(cid))}
+
+    resp = await client.post(f"{PREFIX}/consultations/{cid}/video-room", headers=expired)
+    assert resp.status_code == 401
+
+
+async def test_cutover_flag_deja_pasar_sin_token(client: AsyncClient, monkeypatch) -> None:
+    """Con CONSULTATION_TOKEN_REQUIRED=false el endpoint tolera la ausencia de token: es la
+    ventana entre el deploy del backend y el del frontend. Con la bandera en false M3 NO está
+    cerrado — por eso el default es true y la bandera es temporal."""
+    from src.core.config import settings as app_settings
+
+    cid, _ = await _consultation_and_room_headers(client, ["Medicina general"])
+    monkeypatch.setattr(app_settings, "CONSULTATION_TOKEN_REQUIRED", False)
+
+    resp = await client.post(f"{PREFIX}/consultations/{cid}/video-room")
+    assert resp.status_code == 200
+
+
+async def test_el_token_no_se_filtra_en_los_listados(client: AsyncClient) -> None:
+    """Solo POST /consultations entrega el token. Si `ConsultationResponse` lo llevara, cada
+    listado del panel repartiría credenciales de sala."""
+    cid, _ = await _consultation_and_room_headers(client, ["Medicina general"])
+
+    detail = (await client.get(f"{PREFIX}/consultations/{cid}")).json()
+    assert "access_token" not in detail
 
 
 # --- acciones de perfil ---
