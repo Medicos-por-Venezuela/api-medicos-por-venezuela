@@ -246,25 +246,32 @@ async def test_video_room_idempotent_and_conflict(client: AsyncClient) -> None:
 # --- Token de acceso a la sala (hallazgo M3) ---
 
 
-async def test_sala_sin_token_responde_401(client: AsyncClient) -> None:
-    """Conocer el id de la consulta ya no basta para pedir la sala: ESE era el hallazgo."""
+async def test_sala_sin_token_responde_401(client: AsyncClient, anon_client: AsyncClient) -> None:
+    """Conocer el id de la consulta ya no basta para pedir la sala: ESE era el hallazgo.
+    Va con `anon_client` porque `client` es admin y entraría por la puerta de staff."""
     cid, _ = await _consultation_and_room_headers(client, ["Medicina general"])
 
-    assert (await client.post(f"{PREFIX}/consultations/{cid}/video-room")).status_code == 401
-    assert (await client.post(f"{PREFIX}/consultations/{cid}/entered-call")).status_code == 401
+    sala = await anon_client.post(f"{PREFIX}/consultations/{cid}/video-room")
+    entrada = await anon_client.post(f"{PREFIX}/consultations/{cid}/entered-call")
+    assert sala.status_code == 401
+    assert entrada.status_code == 401
 
 
-async def test_token_de_otra_consulta_no_sirve(client: AsyncClient) -> None:
+async def test_token_de_otra_consulta_no_sirve(
+    client: AsyncClient, anon_client: AsyncClient
+) -> None:
     """Anti-IDOR con credencial legítima: el token va atado a SU consulta por el claim `sub`.
     Sin esa comprobación, cualquier paciente abriría la sala de cualquier otro."""
     _, room_a = await _consultation_and_room_headers(client, ["Medicina general"])
     cid_b, _ = await _consultation_and_room_headers(client, ["Medicina general"])
 
-    resp = await client.post(f"{PREFIX}/consultations/{cid_b}/video-room", headers=room_a)
+    resp = await anon_client.post(f"{PREFIX}/consultations/{cid_b}/video-room", headers=room_a)
     assert resp.status_code == 401
 
 
-async def test_token_expirado_no_sirve(client: AsyncClient, monkeypatch) -> None:
+async def test_token_expirado_no_sirve(
+    client: AsyncClient, anon_client: AsyncClient, monkeypatch
+) -> None:
     """La caducidad es el punto entero del cambio: una URL filtrada deja de funcionar."""
     from src.core import consultation_token
     from src.core.config import settings as app_settings
@@ -273,8 +280,36 @@ async def test_token_expirado_no_sirve(client: AsyncClient, monkeypatch) -> None
     monkeypatch.setattr(app_settings, "CONSULTATION_TOKEN_TTL_HOURS", -1)  # ya nacido caducado
     expired = {"X-Consultation-Token": consultation_token.issue(uuid.UUID(cid))}
 
-    resp = await client.post(f"{PREFIX}/consultations/{cid}/video-room", headers=expired)
+    resp = await anon_client.post(f"{PREFIX}/consultations/{cid}/video-room", headers=expired)
     assert resp.status_code == 401
+
+
+async def test_staff_abre_la_sala_sin_token_de_paciente(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El médico crea la sala desde el panel cuando el caso llegó sin ella, y NO tiene el token
+    del paciente. Exigirle uno lo dejaba fuera de la consulta que está atendiendo."""
+    doc = await _doctor(db_session, "Medicina general")
+    cid, _ = await _consultation_and_room_headers(client, ["Medicina general"])
+
+    resp = await client.post(
+        f"{PREFIX}/consultations/{cid}/video-room", headers=auth_headers(doc.id)
+    )
+    assert resp.status_code == 200, resp.text
+
+
+async def test_sesion_de_paciente_no_abre_la_sala_de_otro(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """La puerta de staff es SOLO para staff: una cuenta de paciente autenticada no sustituye al
+    token, o el atajo se convertiria en el agujero que M3 venía a cerrar."""
+    patient_user = await _doctor(db_session, None, role="patient")
+    cid, _ = await _consultation_and_room_headers(client, ["Medicina general"])
+
+    resp = await client.post(
+        f"{PREFIX}/consultations/{cid}/video-room", headers=auth_headers(patient_user.id)
+    )
+    assert resp.status_code == 401, resp.text
 
 
 async def test_cutover_flag_deja_pasar_sin_token(client: AsyncClient, monkeypatch) -> None:

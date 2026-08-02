@@ -28,6 +28,7 @@ from src.core.ratelimit import limiter
 from src.core.security import (
     Principal,
     get_current_principal,
+    get_optional_principal,
     require_permission,
 )
 from src.db.session import get_db
@@ -81,10 +82,18 @@ _CONSULTATION_TOKEN_HEADER = "X-Consultation-Token"
 async def require_consultation_token(
     consultation_id: uuid.UUID,
     x_consultation_token: str | None = Header(default=None, alias=_CONSULTATION_TOKEN_HEADER),
+    principal: Principal | None = Depends(get_optional_principal),
 ) -> None:
-    """Exige un token de sala vigente y emitido para ESTA consulta (hallazgo M3).
+    """Exige el token de sala de ESTA consulta (hallazgo M3) **o** una sesión de staff.
+
+    Estos endpoints los usan DOS clientes: el paciente anónimo, que llega por link y solo tiene
+    el token, y el médico desde el panel, que tiene sesión pero NO el token del paciente (ver
+    panel-medico.tsx: crea la sala si el caso llegó sin ella). Exigir solo el token dejaba al
+    médico fuera de la consulta que está atendiendo.
 
     401 y no 403: el llamante es anónimo por diseño, no es que le falten permisos."""
+    if principal is not None and principal.is_staff:
+        return
     if consultation_token.is_valid_for(x_consultation_token, consultation_id):
         return
     logger.warning("SEC:consultation_token_invalid consultation_id=%s", consultation_id)

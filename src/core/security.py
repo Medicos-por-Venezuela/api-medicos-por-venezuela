@@ -160,6 +160,20 @@ async def get_current_principal(
     )
 
 
+async def get_optional_principal(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    db: AsyncSession = Depends(get_db),
+) -> Principal | None:
+    """Como `get_current_principal`, pero devuelve None en vez de 401 si no hay sesión.
+
+    Para endpoints que sirven a DOS clientes: el paciente anónimo (que se identifica con otra
+    credencial) y el staff autenticado. Un token presente pero inválido sigue siendo 401 — que
+    no haya sesión es distinto de traer una rota."""
+    if credentials is None:
+        return None
+    return await get_current_principal(credentials, db)
+
+
 async def require_staff(
     principal: Principal = Depends(get_current_principal),
 ) -> Principal:
