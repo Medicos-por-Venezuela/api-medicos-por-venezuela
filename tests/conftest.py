@@ -77,6 +77,23 @@ async def client(
 
 
 @pytest_asyncio.fixture
+async def anon_client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
+    """Cliente SIN sesión, para los endpoints que sirven al paciente anónimo.
+
+    `client` va autenticado como admin, así que no sirve para probar que algo se rechaza sin
+    credenciales: pasaría por la puerta de staff y el test daría un falso verde."""
+
+    async def _override_get_db() -> AsyncGenerator[AsyncSession, None]:
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_get_db
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+    app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
 async def live_client() -> AsyncGenerator[AsyncClient, None]:
     """Cliente sin override: cada request usa su propia sesión/conexión real."""
     transport = ASGITransport(app=app)
