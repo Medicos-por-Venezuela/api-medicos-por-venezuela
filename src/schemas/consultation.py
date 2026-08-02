@@ -12,6 +12,7 @@ from src.models.consultation import CONSULTATION_STATUSES
 __all__ = [
     "CONSULTATION_STATUSES",
     "ConsultationCreate",
+    "ConsultationCreatedResponse",
     "ConsultationUpdate",
     "ConsultationResponse",
     "ConsultationDetailPatient",
@@ -233,6 +234,18 @@ class ConsultationDetailResponse(ConsultationResponse):
     `patient`, para no dispararla en lazy-load). El router puebla `patient` explícitamente."""
 
     patient: ConsultationDetailPatient | None = None
+
+
+class ConsultationCreatedResponse(ConsultationResponse):
+    """Respuesta de POST /consultations: la consulta MÁS el token de acceso a su sala.
+
+    El token se entrega aquí y solo aquí — es la única vez que el paciente anónimo puede
+    recibirlo, porque no tiene sesión con la que volver a pedirlo. El frontend lo lleva en la
+    URL de /sala-espera en lugar del `cid` crudo. Deliberadamente NO va en
+    `ConsultationResponse`: los listados del panel no deben repartir credenciales de sala.
+    """
+
+    access_token: str
 
 
 class ConsultationPatientResponse(BaseModel):

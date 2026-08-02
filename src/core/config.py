@@ -77,6 +77,22 @@ class Settings(BaseSettings):
     SUPABASE_URL: str = "http://127.0.0.1:54321"
     SUPABASE_SERVICE_ROLE_KEY: str = "dev-insecure-service-role-key-change-me"
 
+    # --- Token de acceso a la sala del paciente anónimo (hallazgo M3) ---
+    # Secreto PROPIO, distinto del de Supabase a propósito (ver src/core/consultation_token.py).
+    # En producción es OBLIGATORIO definirlo por entorno; el default solo sirve en local.
+    CONSULTATION_TOKEN_SECRET: str = "dev-insecure-consultation-token-secret-change-me"
+    # 24 h: cubre de sobra la espera real (incluida una cola que quede de un día para otro) y
+    # convierte una URL filtrada en algo inservible al día siguiente. Más corto arriesga dejar
+    # fuera de su propia sala a un paciente anónimo, que no tiene forma de re-emitir el token.
+    CONSULTATION_TOKEN_TTL_HOURS: int = 24
+    # ponytail: interruptor de cutover, no una opción permanente. El backend y el frontend se
+    # despliegan por separado (EC2 y Amplify), así que exigir el token de golpe deja sin sala a
+    # los pacientes durante la ventana entre ambos deploys. Secuencia: desplegar el backend con
+    # esto en `false` -> desplegar el frontend que ya manda el token -> ponerlo en `true`.
+    # Techo conocido: mientras esté en `false`, M3 NO está cerrado (basta el id, como antes).
+    # Borrar esta bandera y el `if` de require_consultation_token una vez hecho el cutover.
+    CONSULTATION_TOKEN_REQUIRED: bool = True
+
     # --- Resiliencia de la cola ---
     # Minutos tras los cuales una consulta 'in_progress' sin cerrar se considera
     # estancada y se devuelve a 'waiting' (la libera para otro médico).
