@@ -32,6 +32,7 @@ logger = logging.getLogger("mpv.api")
 _IS_PROD = settings.ENVIRONMENT == "production"
 _INSECURE_JWT_DEFAULT = "dev-insecure-jwt-secret-change-me"
 _INSECURE_SERVICE_ROLE_DEFAULT = "dev-insecure-service-role-key-change-me"
+_INSECURE_CONSULTATION_TOKEN_DEFAULT = "dev-insecure-consultation-token-secret-change-me"
 
 
 @asynccontextmanager
@@ -49,6 +50,11 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
         )
     # Deja los orígenes CORS efectivos en los logs de arranque: cuando un front rebota por CORS,
     # se ve de una si su origen está (o no) en la lista, sin adivinar desde el .env.
+    if _IS_PROD and settings.CONSULTATION_TOKEN_SECRET == _INSECURE_CONSULTATION_TOKEN_DEFAULT:
+        raise RuntimeError(
+            "CONSULTATION_TOKEN_SECRET tiene el valor por defecto inseguro. Configúralo en "
+            "producción: con él se firman los accesos a las salas de los pacientes anónimos."
+        )
     # El default de BACKEND_CORS_ORIGINS es "*" y el middleware va con allow_credentials=True:
     # si la env no se setea en prod, se aceptarían credenciales desde cualquier origen.
     if _IS_PROD and "*" in settings.cors_origins:
