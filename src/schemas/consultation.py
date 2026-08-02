@@ -295,6 +295,9 @@ class PanelWaitingPatient(BaseModel):
     age_range: str | None = None
     needs_tags: list[str] | None = None
     description: str | None = None
+    # Las alergias se piden en el registro y son dato clínico de decisión: el médico las
+    # necesita ANTES de tomar el caso, no después. Van sin nombre, como el resto de la fila.
+    allergies: str | None = None
 
 
 class PanelPatient(PanelWaitingPatient):

@@ -120,7 +120,12 @@ async def consultation_panel(
     """Todo lo que el panel del médico necesita en una llamada: la cola de espera (casos sin
     asignar), las consultas abiertas del propio médico y cuántas ha cerrado. Reemplaza las
     lecturas directas a Supabase del panel."""
-    waiting, mine, my_closed = await consultations_service.get_panel(db, principal.id)
+    waiting, mine, my_closed = await consultations_service.get_panel(
+        db,
+        principal.id,
+        doctor_specialty=principal.specialty,
+        is_admin=principal.is_admin,
+    )
     return ConsultationPanelResponse(
         waiting=[PanelWaitingItem.model_validate(c) for c in waiting],
         mine=[PanelConsultationItem.model_validate(c) for c in mine],
@@ -357,6 +362,7 @@ async def consultation_chain(
     summary="Tomar una consulta en espera (claim atómico)",
     responses={
         **_NOT_FOUND,
+        403: {"description": "El caso no corresponde a la especialidad del médico."},
         409: {"description": "La consulta ya fue tomada por otro médico."},
     },
 )
@@ -370,23 +376,14 @@ async def claim_consultation(
     responde 409 (nunca dos médicos sobre el mismo paciente). `via_whatsapp` marca atención
     por WhatsApp (sin sala de video)."""
     consultation = await consultations_service.claim_consultation(
-        db, consultation_id, doctor_user_id=principal.id, via_whatsapp=payload.via_whatsapp
+        db,
+        consultation_id,
+        doctor_user_id=principal.id,
+        via_whatsapp=payload.via_whatsapp,
+        doctor_specialty=principal.specialty,
+        is_admin=principal.is_admin,
     )
     return ConsultationResponse.model_validate(consultation)
-
-
-@router.post(
-    "/{consultation_id}/heartbeat",
-    response_model=ConsultationResponse,
-    summary="Heartbeat de presencia del paciente (público)",
-    responses=_NOT_FOUND,
-)
-async def patient_heartbeat(
-    consultation_id: uuid.UUID, db: AsyncSession = Depends(get_db)
-) -> ConsultationResponse:
-    """Marca que el paciente sigue en la sala de espera (`patient_last_seen_at`).
-    Solo tiene efecto si la consulta está en `waiting` o `in_progress`."""
-    return await consultations_service.heartbeat(db, consultation_id)
 
 
 @router.post(

@@ -79,39 +79,6 @@ async def take_consultation(
 
 
 @router.post(
-    "/attend-next",
-    response_model=ConsultationResponse,
-    summary="Atender al siguiente paciente (selección + toma atómica)",
-    responses={
-        200: {"description": "Siguiente caso elegible asignado al médico."},
-        404: {"description": "No hay pacientes elegibles en la cola para esa especialidad."},
-        409: {"description": "El caso elegido fue tomado por otro médico en este instante."},
-    },
-)
-async def attend_next(
-    db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_permission("queue.take")),
-) -> ConsultationResponse:
-    """Réplica de **"Atender al siguiente"**: el backend elige el caso según
-    elegibilidad (`can_attend`), presencia (heartbeat < 5 min), match de la
-    especialidad del médico y antigüedad (FIFO), y lo asigna de forma **atómica**.
-    El admin atiende cualquier caso elegible.
-    """
-    try:
-        return await queue_service.attend_next(
-            db,
-            assigned_doctor_id=principal.id,
-            specialty=principal.specialty,
-            is_admin=principal.is_admin,
-        )
-    except DBAPIError as exc:
-        if not is_lock_not_available(exc):
-            raise
-        await db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_LOCK_DETAIL) from None
-
-
-@router.post(
     "/release-stale",
     response_model=QueueReleaseResponse,
     summary="Liberar consultas estancadas (resiliencia, admin)",
