@@ -1,11 +1,24 @@
 """Pruebas de los guards de arranque que fallan rápido en producción con configuración
-insegura: `SUPABASE_SERVICE_ROLE_KEY` por defecto (mismo patrón que el de
-`SUPABASE_JWT_SECRET`, ya existente) y `BACKEND_CORS_ORIGINS` en '*', que con
-allow_credentials=True aceptaría credenciales desde cualquier origen."""
+insegura: `SUPABASE_SERVICE_ROLE_KEY` y `CONSULTATION_TOKEN_SECRET` con su valor por defecto
+(mismo patrón que el de `SUPABASE_JWT_SECRET`, ya existente) y `BACKEND_CORS_ORIGINS` en '*',
+que con allow_credentials=True aceptaría credenciales desde cualquier origen."""
 
 import pytest
 
 import src.main as main_module
+
+
+def _prod_secrets(monkeypatch) -> None:
+    """Deja los secretos con valores 'de producción' para llegar al guard que se está probando.
+
+    Los guards corren en cascada y abortan en el primero que falla, así que un test que quiera
+    ejercitar el de CORS tiene que pasar antes los de secretos."""
+    monkeypatch.setattr(
+        main_module.settings, "SUPABASE_SERVICE_ROLE_KEY", "un-service-role-key-real-de-produccion"
+    )
+    monkeypatch.setattr(
+        main_module.settings, "CONSULTATION_TOKEN_SECRET", "un-secreto-real-de-produccion"
+    )
 
 
 async def test_lifespan_falla_en_prod_si_service_role_key_default(monkeypatch) -> None:
@@ -23,9 +36,7 @@ async def test_lifespan_falla_en_prod_si_service_role_key_default(monkeypatch) -
 
 async def test_lifespan_ok_en_prod_con_service_role_key_configurado(monkeypatch) -> None:
     monkeypatch.setattr(main_module, "_IS_PROD", True)
-    monkeypatch.setattr(
-        main_module.settings, "SUPABASE_SERVICE_ROLE_KEY", "un-service-role-key-real-de-produccion"
-    )
+    _prod_secrets(monkeypatch)
     # En prod tambien hay que dar origenes CORS explicitos, o salta el guard de abajo.
     monkeypatch.setattr(
         main_module.settings, "BACKEND_CORS_ORIGINS", "https://medicosporvenezuela.org"
@@ -37,9 +48,7 @@ async def test_lifespan_ok_en_prod_con_service_role_key_configurado(monkeypatch)
 
 async def test_lifespan_falla_en_prod_si_cors_es_wildcard(monkeypatch) -> None:
     monkeypatch.setattr(main_module, "_IS_PROD", True)
-    monkeypatch.setattr(
-        main_module.settings, "SUPABASE_SERVICE_ROLE_KEY", "un-service-role-key-real-de-produccion"
-    )
+    _prod_secrets(monkeypatch)
     monkeypatch.setattr(main_module.settings, "BACKEND_CORS_ORIGINS", "*")
 
     with pytest.raises(RuntimeError, match="BACKEND_CORS_ORIGINS"):
@@ -50,14 +59,31 @@ async def test_lifespan_falla_en_prod_si_cors_es_wildcard(monkeypatch) -> None:
 async def test_lifespan_falla_en_prod_si_el_wildcard_va_entre_otros_origenes(monkeypatch) -> None:
     """El '*' cuela igual aunque venga acompañado: la lista se valida entera, no solo si es '*'."""
     monkeypatch.setattr(main_module, "_IS_PROD", True)
-    monkeypatch.setattr(
-        main_module.settings, "SUPABASE_SERVICE_ROLE_KEY", "un-service-role-key-real-de-produccion"
-    )
+    _prod_secrets(monkeypatch)
     monkeypatch.setattr(
         main_module.settings, "BACKEND_CORS_ORIGINS", "https://medicosporvenezuela.org,*"
     )
 
     with pytest.raises(RuntimeError, match="BACKEND_CORS_ORIGINS"):
+        async with main_module.lifespan(main_module.app):
+            pass
+
+
+async def test_lifespan_falla_en_prod_si_el_secreto_del_token_de_sala_es_default(
+    monkeypatch,
+) -> None:
+    """Con el secreto por defecto cualquiera podría firmarse su propio acceso a cualquier sala."""
+    monkeypatch.setattr(main_module, "_IS_PROD", True)
+    monkeypatch.setattr(
+        main_module.settings, "SUPABASE_SERVICE_ROLE_KEY", "un-service-role-key-real-de-produccion"
+    )
+    monkeypatch.setattr(
+        main_module.settings,
+        "CONSULTATION_TOKEN_SECRET",
+        main_module._INSECURE_CONSULTATION_TOKEN_DEFAULT,
+    )
+
+    with pytest.raises(RuntimeError, match="CONSULTATION_TOKEN_SECRET"):
         async with main_module.lifespan(main_module.app):
             pass
 

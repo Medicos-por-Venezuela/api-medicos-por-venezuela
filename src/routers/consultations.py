@@ -1,16 +1,28 @@
 """Capa HTTP (delgada) para consultations y sus eventos.
 
 Autorización (replica las RLS):
-- Crear consulta / heartbeat / sala de video: público (auto-servicio del paciente anónimo).
+- Crear consulta: sin sesión (auto-servicio del paciente anónimo), con rate limit.
+- Sala de video / entered-call: sin sesión pero con el token de acceso de ESA consulta.
 - Leer: staff ve todo; un paciente autenticado solo ve lo suyo (anti-IDOR).
 - Actualizar / cerrar / eventos: staff. Eliminar: admin.
 """
 
+import logging
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    status,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core import consultation_token
 from src.core.config import settings
 from src.core.ratelimit import limiter
 from src.core.security import (
@@ -25,6 +37,7 @@ from src.schemas.consultation import (
     ConsultationClaimRequest,
     ConsultationCloseRequest,
     ConsultationCreate,
+    ConsultationCreatedResponse,
     ConsultationDetailResponse,
     ConsultationPanelResponse,
     ConsultationPatientResponse,
@@ -43,6 +56,8 @@ from src.schemas.consultation_event import (
 from src.services import consultations as consultations_service
 from src.services import notifications
 
+logger = logging.getLogger("mpv.api")
+
 router = APIRouter(prefix="/consultations", tags=["consultations"])
 tag_metadata = [
     {
@@ -52,6 +67,35 @@ tag_metadata = [
 ]
 
 _NOT_FOUND = {404: {"description": "Consulta no encontrada."}}
+_TOKEN_RESPONSES = {
+    401: {"description": "Falta el token de acceso a la sala o no es válido para esta consulta."},
+    429: {"description": "Demasiadas peticiones desde esta IP (rate limit)."},
+}
+
+# Cabecera y no query param: en la cabecera el token no queda en los logs del servidor ni en el
+# `Referer`. Sigue viajando en la URL hasta el frontend (el paciente llega por link), pero de
+# ahí al backend ya no.
+_CONSULTATION_TOKEN_HEADER = "X-Consultation-Token"
+
+
+async def require_consultation_token(
+    consultation_id: uuid.UUID,
+    x_consultation_token: str | None = Header(default=None, alias=_CONSULTATION_TOKEN_HEADER),
+) -> None:
+    """Exige un token de sala vigente y emitido para ESTA consulta (hallazgo M3).
+
+    401 y no 403: el llamante es anónimo por diseño, no es que le falten permisos."""
+    if consultation_token.is_valid_for(x_consultation_token, consultation_id):
+        return
+    logger.warning("SEC:consultation_token_invalid consultation_id=%s", consultation_id)
+    if not settings.CONSULTATION_TOKEN_REQUIRED:
+        # Ventana de cutover: se loguea pero se deja pasar, para no dejar sin sala al frontend
+        # viejo mientras se despliegan backend y frontend por separado. Ver la nota en config.
+        return
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Token de acceso a la consulta ausente, expirado o de otra consulta.",
+    )
 
 
 @router.get(
@@ -88,7 +132,7 @@ async def list_consultations(
 
 @router.post(
     "",
-    response_model=ConsultationResponse,
+    response_model=ConsultationCreatedResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Crear consulta (público)",
     responses={
@@ -100,11 +144,19 @@ async def list_consultations(
 @limiter.limit(settings.PUBLIC_WRITE_RATE_LIMIT)
 async def create_consultation(
     request: Request, payload: ConsultationCreate, db: AsyncSession = Depends(get_db)
-) -> ConsultationResponse:
+) -> ConsultationCreatedResponse:
     """Crea una consulta en espera. El `code` lo genera la base de datos (trigger).
 
+    Devuelve además el `access_token` de la sala: es la ÚNICA vez que se entrega, porque el
+    paciente anónimo no tiene sesión con la que volver a pedirlo. El frontend lo lleva en la
+    URL de /sala-espera en lugar del id crudo.
+
     `request` es obligatorio para slowapi (lee la IP del cliente), aunque no se use aquí."""
-    return await consultations_service.create_consultation(db, payload)
+    consultation = await consultations_service.create_consultation(db, payload)
+    return ConsultationCreatedResponse(
+        **ConsultationResponse.model_validate(consultation).model_dump(),
+        access_token=consultation_token.issue(consultation.id),
+    )
 
 
 # NOTA: debe ir ANTES de "/{consultation_id}" o FastAPI intenta parsear "panel" como UUID (422).
@@ -389,29 +441,42 @@ async def claim_consultation(
 @router.post(
     "/{consultation_id}/entered-call",
     response_model=ConsultationResponse,
-    summary="Marcar que el paciente entró a la videollamada (idempotente, público)",
-    responses=_NOT_FOUND,
+    summary="Marcar que el paciente entró a la videollamada (idempotente, sin sesión)",
+    responses={**_NOT_FOUND, **_TOKEN_RESPONSES},
 )
+@limiter.limit(settings.PUBLIC_WRITE_RATE_LIMIT)
 async def mark_entered_call(
-    consultation_id: uuid.UUID, db: AsyncSession = Depends(get_db)
+    request: Request,
+    consultation_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_consultation_token),
 ) -> ConsultationResponse:
     """Registra `entered_call_at` una sola vez, si la consulta está en `waiting`/`in_progress`.
-    Reemplaza la RPC mark_patient_entered_call. Público: el paciente en la sala puede no estar
-    autenticado (llega por link con el `cid`)."""
+    Reemplaza la RPC mark_patient_entered_call. Sin sesión: el paciente en la sala puede no
+    estar autenticado, pero debe presentar el token de acceso de SU consulta."""
     return await consultations_service.mark_entered_call(db, consultation_id)
 
 
 @router.post(
     "/{consultation_id}/video-room",
     response_model=ConsultationResponse,
-    summary="Generar/obtener la sala de video (idempotente, público)",
-    responses={**_NOT_FOUND, 409: {"description": "La consulta no está en espera."}},
+    summary="Generar/obtener la sala de video (idempotente, sin sesión)",
+    responses={
+        **_NOT_FOUND,
+        **_TOKEN_RESPONSES,
+        409: {"description": "La consulta no está en espera."},
+    },
 )
+@limiter.limit(settings.PUBLIC_WRITE_RATE_LIMIT)
 async def ensure_video_room(
-    consultation_id: uuid.UUID, db: AsyncSession = Depends(get_db)
+    request: Request,
+    consultation_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_consultation_token),
 ) -> ConsultationResponse:
-    """Genera la sala Jitsi si no existe (solo en estado `waiting`); si ya existe,
-    devuelve la misma URL (idempotente)."""
+    """Genera la sala Jitsi si no existe (solo en estado `waiting`); si ya existe, devuelve la
+    misma URL (idempotente). Exige el token de acceso de ESA consulta: devolver la URL de una
+    videoconsulta médica a quien solo conozca el id era el hallazgo M3."""
     return await consultations_service.ensure_video_room(db, consultation_id)
 
 
