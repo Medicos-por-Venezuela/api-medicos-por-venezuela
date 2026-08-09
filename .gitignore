@@ -34,6 +34,14 @@ backups/
 *.dump
 *.sql.gz
 
+# Artefactos de fuzzing de la API (schemathesis). Guardan las peticiones y respuestas REALES
+# contra la base local, que es un backup de producción: los crashes contienen nombres, correos,
+# cédulas y teléfonos de pacientes y médicos. Misma regla que backups/ — NUNCA versionar.
+.schemathesis/
+
+# Export de dependencias generado con `uv export` (derivado de pyproject.toml + uv.lock).
+req.txt
+
 # Claude Code (versiona CLAUDE.md y .claude/rules; ignora solo lo local)
 .claude/settings.local.json
 .claude/*.local.json
