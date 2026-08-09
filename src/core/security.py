@@ -37,6 +37,7 @@ def effective_role(roles: frozenset[str]) -> str | None:
     """El rol de mayor prioridad del set RBAC efectivo, o None si el set está vacío."""
     return next((r for r in _ROLE_PRIORITY if r in roles), None)
 
+
 # auto_error=False: gestionamos nosotros el 401 (mensaje uniforme).
 _bearer = HTTPBearer(auto_error=False)
 

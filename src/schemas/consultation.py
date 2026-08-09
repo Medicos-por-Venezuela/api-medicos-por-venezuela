@@ -69,7 +69,11 @@ class ConsultationCreate(BaseModel):
     patient_id: uuid.UUID
     priority: str = Field("normal", max_length=20)
     category: str | None = Field(default=None, max_length=100)
-    specialty_id: uuid.UUID | None = None
+    # OBLIGATORIO: `consultations.specialty_id` ES el matching de la cola. Cuando era opcional
+    # entraban filas sin especialidad y el backend caía a un mapa de nombres hardcodeado que se
+    # desincronizaba del catálogo; ese mapa se eliminó y las filas históricas se rellenaron con
+    # una migración, así que la columna no puede volver a quedar vacía por la puerta de entrada.
+    specialty_id: uuid.UUID
     chief_complaint: str | None = Field(default=None, max_length=500)
     referred_specialty: str | None = Field(default=None, max_length=100)
     platform_used: str | None = Field(default=None, max_length=50)

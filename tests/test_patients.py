@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.patient import Patient
 from src.models.profile import Profile
-from tests._helpers import auth_headers, make_profile
+from tests._helpers import any_specialty_id, auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -90,9 +90,7 @@ async def test_list_update_delete_patient(
     assert (await client.delete(f"{PREFIX}/patients/{patient_id}")).status_code == 204
     assert (await client.get(f"{PREFIX}/patients/{patient_id}")).status_code == 404
     # Soft delete: la fila sigue en la BD con deleted_at, no se borró (trazabilidad).
-    row = (
-        await db_session.execute(select(Patient).where(Patient.id == patient_id))
-    ).scalar_one()
+    row = (await db_session.execute(select(Patient).where(Patient.id == patient_id))).scalar_one()
     assert row.deleted_at is not None
     # Y ya no aparece en el listado.
     relisted = await client.get(f"{PREFIX}/patients", params={"limit": 100})
@@ -305,7 +303,11 @@ async def test_registro_completo_adulto_y_menor_primera_vez(client: AsyncClient)
 
     consulta = await client.post(
         f"{PREFIX}/consultations",
-        json={"patient_id": menor_id, "chief_complaint": "Fiebre"},
+        json={
+            "patient_id": menor_id,
+            "chief_complaint": "Fiebre",
+            "specialty_id": await any_specialty_id(client),
+        },
     )
     assert consulta.status_code == 201, consulta.text
     assert consulta.json()["patient_id"] == menor_id

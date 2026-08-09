@@ -113,7 +113,7 @@ async def create_consultation(session: AsyncSession, data: ConsultationCreate) -
     patient = await session.get(Patient, data.patient_id)
     if patient is None:
         raise BadRequestError("El paciente referenciado (patient_id) no existe.")
-    if data.specialty_id is not None and await session.get(Specialty, data.specialty_id) is None:
+    if await session.get(Specialty, data.specialty_id) is None:
         raise BadRequestError("La especialidad referenciada (specialty_id) no existe.")
     # code lo asigna SIEMPRE el trigger generate_consultation_code en la base.
     consultation = Consultation(**data.model_dump())

@@ -11,7 +11,7 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.profile import Profile
-from tests._helpers import auth_headers, make_profile
+from tests._helpers import any_specialty_id, auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -34,7 +34,12 @@ async def _patient(client: AsyncClient, needs: list[str], allergies: str | None 
 
 async def _consultation(client: AsyncClient, needs: list[str]) -> str:
     pid = await _patient(client, needs)
-    return (await client.post(f"{PREFIX}/consultations", json={"patient_id": pid})).json()["id"]
+    return (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": pid, "specialty_id": await any_specialty_id(client)},
+        )
+    ).json()["id"]
 
 
 async def _consultation_and_room_headers(
@@ -42,7 +47,12 @@ async def _consultation_and_room_headers(
 ) -> tuple[str, dict[str, str]]:
     """Consulta + la cabecera con su token de sala, como la recibe el paciente al registrarse."""
     pid = await _patient(client, needs)
-    body = (await client.post(f"{PREFIX}/consultations", json={"patient_id": pid})).json()
+    body = (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": pid, "specialty_id": await any_specialty_id(client)},
+        )
+    ).json()
     return body["id"], {"X-Consultation-Token": body["access_token"]}
 
 
@@ -65,9 +75,7 @@ async def _consultation_with_specialty(
     pid = await _patient(client, needs)
     sid = await _specialty_id(client, specialty_name)
     return (
-        await client.post(
-            f"{PREFIX}/consultations", json={"patient_id": pid, "specialty_id": sid}
-        )
+        await client.post(f"{PREFIX}/consultations", json={"patient_id": pid, "specialty_id": sid})
     ).json()["id"]
 
 
@@ -148,9 +156,7 @@ async def test_caso_de_psicologia_reservado_por_specialty_id(
     assert took.json()["id"] == cid_psi
 
 
-async def test_admin_ve_y_toma_toda_la_cola(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_admin_ve_y_toma_toda_la_cola(client: AsyncClient, db_session: AsyncSession) -> None:
     """El admin no queda acotado por especialidad: sigue viendo la cola entera."""
     cid_psi = await _consultation_with_specialty(client, ["Medicina general"], "Psicología")
     admin = await _doctor(db_session, "Medicina general", role="admin")
@@ -170,7 +176,10 @@ async def test_la_cola_del_panel_expone_las_alergias(
     doc = await _doctor(db_session, "Medicina general")
     pid = await _patient(client, ["Medicina general"], allergies="Penicilina")
     cid = (
-        await client.post(f"{PREFIX}/consultations", json={"patient_id": pid})
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": pid, "specialty_id": await any_specialty_id(client)},
+        )
     ).json()["id"]
 
     resp = await client.get(f"{PREFIX}/consultations/panel", headers=auth_headers(doc.id))
