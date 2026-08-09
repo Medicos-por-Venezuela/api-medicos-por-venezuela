@@ -9,27 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.session import get_db
 from src.main import app
 from src.models.profile import Profile
-from src.services.specialties import can_attend, compute_priority, matches_specialty
+from src.services.specialties import can_attend, compute_priority
 from tests._helpers import auth_headers, make_profile
 
 PREFIX = "/api/v1"
-
-
-# --- matches_specialty ---
-
-
-def test_matches_general_is_wildcard() -> None:
-    assert matches_specialty("Medicina general", None, ["Lesión física"]) is True
-
-
-def test_matches_by_need() -> None:
-    assert matches_specialty("Psicología", None, ["Apoyo emocional"]) is True
-    assert matches_specialty("Traumatología", None, ["Lesión física"]) is True
-
-
-def test_matches_false_when_unrelated() -> None:
-    assert matches_specialty("Cardiología", None, ["Lesión física"]) is False
-    assert matches_specialty(None, None, ["x"]) is False
 
 
 # --- can_attend ---
@@ -93,7 +76,7 @@ async def test_specialties_catalog_endpoint(db_session: AsyncSession) -> None:
     body = resp.json()
     assert "Medicina general" in body["specialties"]
     assert "Apoyo emocional" in body["reserved_needs"]
-    assert body["specialty_needs"]["Medicina general"] == ["*"]
+    assert "specialty_needs" not in body  # el mapa legacy ya no se expone
 
 
 # --- CRUD specialties ---
