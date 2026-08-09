@@ -19,15 +19,18 @@ _PROF_RE = re.compile(r"xajax_tableProfesion\('(.*?)'\)", re.DOTALL)
 _EMPTY_VALUES = {'""', "[]", ""}
 
 
+def _fallo(error: str) -> SacsVerificationResponse:
+    """Respuesta de "no verificado" con el motivo. Fail-closed: todo camino que no confirma
+    la cédula pasa por aquí."""
+    return SacsVerificationResponse(encontrado=False, error=error)
+
+
 async def verificar_sacs(cedula: str) -> SacsVerificationResponse:
     """Consulta el SACS y retorna si la cédula corresponde a un profesional de salud."""
     cedula = cedula.upper().strip()
 
     if not _CEDULA_RE.match(cedula):
-        return SacsVerificationResponse(
-            encontrado=False,
-            error="Formato inválido. Usa V-12345678 o E-12345678",
-        )
+        return _fallo("Formato inválido. Usa V-12345678 o E-12345678")
 
     timestamp = int(time.time() * 1000)
     payload = f"xajax=getPrfsnalByCed&xajaxr={timestamp}&xajaxargs[]={cedula}"
@@ -47,35 +50,29 @@ async def verificar_sacs(cedula: str) -> SacsVerificationResponse:
         logger.warning(
             "SACS HTTP error status=%s cedula_prefix=%s", exc.response.status_code, cedula[:2]
         )
-        return SacsVerificationResponse(
-            encontrado=False, error=f"Error HTTP del SACS: {exc.response.status_code}"
-        )
+        return _fallo(f"Error HTTP del SACS: {exc.response.status_code}")
     except httpx.RequestError as exc:
         logger.warning("SACS connection error type=%s", type(exc).__name__)
-        return SacsVerificationResponse(encontrado=False, error="Error de conexión con el SACS")
+        return _fallo("Error de conexión con el SACS")
 
     xml_text = response.text
     user_match = _USER_RE.search(xml_text)
     prof_match = _PROF_RE.search(xml_text)
 
     if not user_match or not prof_match:
-        return SacsVerificationResponse(encontrado=False, error="Respuesta inesperada del SACS")
+        return _fallo("Respuesta inesperada del SACS")
 
     user_raw = user_match.group(1)
     prof_raw = prof_match.group(1)
 
     if user_raw in _EMPTY_VALUES or prof_raw in _EMPTY_VALUES:
-        return SacsVerificationResponse(
-            encontrado=False, error="La cédula no está registrada en el SACS"
-        )
+        return _fallo("La cédula no está registrada en el SACS")
 
     try:
         user_data = json.loads(user_raw)
         profesion_data = json.loads(prof_raw)
     except json.JSONDecodeError:
-        return SacsVerificationResponse(
-            encontrado=False, error="Error al parsear la respuesta del SACS"
-        )
+        return _fallo("Error al parsear la respuesta del SACS")
 
     if not profesion_data:
         return SacsVerificationResponse(
