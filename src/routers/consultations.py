@@ -32,6 +32,7 @@ from src.core.security import (
     require_permission,
 )
 from src.db.session import get_db
+from src.models.consultation import Consultation
 from src.models.patient import Patient
 from src.schemas.consultation import (
     ChainItem,
@@ -77,6 +78,16 @@ _TOKEN_RESPONSES = {
 # `Referer`. Sigue viajando en la URL hasta el frontend (el paciente llega por link), pero de
 # ahí al backend ya no.
 _CONSULTATION_TOKEN_HEADER = "X-Consultation-Token"
+
+
+async def _queue_appointment_email(
+    background_tasks: BackgroundTasks, db: AsyncSession, child: Consultation
+) -> None:
+    """Encola el email "cita agendada" al paciente. Best-effort y fuera de la request: si el
+    paciente no tiene email, `appointment_email_args` devuelve None y no se encola nada."""
+    args = await notifications.appointment_email_args(db, child)
+    if args:
+        background_tasks.add_task(notifications.send_appointment_email, **args)
 
 
 async def require_consultation_token(
@@ -343,10 +354,7 @@ async def schedule_follow_up(
         actor_user_id=principal.id,
         actor_is_admin=principal.is_admin,
     )
-    # Email "cita agendada" al paciente (best-effort, fuera de la request).
-    args = await notifications.appointment_email_args(db, child)
-    if args:
-        background_tasks.add_task(notifications.send_appointment_email, **args)
+    await _queue_appointment_email(background_tasks, db, child)
     return child
 
 
@@ -376,10 +384,7 @@ async def refer_to_specialist(
         actor_user_id=principal.id,
         actor_is_admin=principal.is_admin,
     )
-    # Email "cita agendada" al paciente (best-effort, fuera de la request).
-    args = await notifications.appointment_email_args(db, child)
-    if args:
-        background_tasks.add_task(notifications.send_appointment_email, **args)
+    await _queue_appointment_email(background_tasks, db, child)
     # Email "te refirieron una cita" al especialista (si lo tiene habilitado; opt-out).
     ref_text = (
         "Un colega te refirió un paciente para una cita.\n\n"

@@ -188,6 +188,51 @@ async def close_consultation(
     return consultation
 
 
+def _ensure_future(scheduled_at: datetime) -> None:
+    """Una cita solo se agenda hacia adelante (regla común a seguimiento y referencia)."""
+    if scheduled_at <= datetime.now(UTC):
+        raise UnprocessableError("La fecha de la cita debe ser futura.")
+
+
+async def _add_scheduled_child(
+    session: AsyncSession,
+    parent: Consultation,
+    *,
+    scheduled_at: datetime,
+    assigned_doctor_id: uuid.UUID | None,
+    internal_note: str | None,
+    event_note: str,
+    actor_user_id: uuid.UUID | None,
+) -> Consultation:
+    """Crea la consulta HIJA agendada que continúa la cadena del padre (mismo paciente,
+    especialidad, motivo y prioridad) más su evento `scheduled`. Lo comparten 'agendar
+    seguimiento' (mismo médico) y 'agendar con especialista' (otro médico), que solo difieren
+    en a quién se asigna y qué queda escrito. `code` lo pone el trigger de la BD."""
+    child = Consultation(
+        patient_id=parent.patient_id,
+        assigned_doctor_id=assigned_doctor_id,
+        specialty_id=parent.specialty_id,
+        chief_complaint=parent.chief_complaint,
+        category=parent.category,
+        priority=parent.priority,
+        status="scheduled",
+        scheduled_at=scheduled_at,
+        parent_consultation_id=parent.id,
+        internal_note=internal_note,
+    )
+    session.add(child)
+    await session.flush()
+    session.add(
+        ConsultationEvent(
+            consultation_id=child.id,
+            event_type="scheduled",
+            created_by=actor_user_id,
+            note=event_note,
+        )
+    )
+    return child
+
+
 async def schedule_follow_up(
     session: AsyncSession,
     *,
@@ -202,8 +247,7 @@ async def schedule_follow_up(
     la cadena (mismo paciente, mismo médico). Todo en una transacción. Ver el módulo Agenda."""
     parent = await get_consultation(session, parent_id)
     _ensure_can_manage(parent, actor_user_id, actor_is_admin)
-    if scheduled_at <= datetime.now(UTC):
-        raise UnprocessableError("La fecha de la cita debe ser futura.")
+    _ensure_future(scheduled_at)
 
     # 1) Cerrar el padre (firmado).
     parent.status = "closed"
@@ -221,27 +265,15 @@ async def schedule_follow_up(
         )
     )
 
-    # 2) Crear la hija agendada (continúa la cadena). `code` lo pone el trigger de la BD.
-    child = Consultation(
-        patient_id=parent.patient_id,
-        assigned_doctor_id=parent.assigned_doctor_id,
-        specialty_id=parent.specialty_id,
-        chief_complaint=parent.chief_complaint,
-        category=parent.category,
-        priority=parent.priority,
-        status="scheduled",
+    # 2) Crear la hija agendada, con el MISMO médico (continúa la cadena).
+    child = await _add_scheduled_child(
+        session,
+        parent,
         scheduled_at=scheduled_at,
-        parent_consultation_id=parent.id,
-    )
-    session.add(child)
-    await session.flush()
-    session.add(
-        ConsultationEvent(
-            consultation_id=child.id,
-            event_type="scheduled",
-            created_by=actor_user_id,
-            note=f"Seguimiento agendado para {scheduled_at.isoformat()}",
-        )
+        assigned_doctor_id=parent.assigned_doctor_id,
+        internal_note=None,
+        event_note=f"Seguimiento agendado para {scheduled_at.isoformat()}",
+        actor_user_id=actor_user_id,
     )
     await audit.log_action(
         session,
@@ -273,8 +305,7 @@ async def schedule_referral(
     Distinto de 'Agendar seguimiento' (mismo médico) y de una Interconsulta (en vivo, limitada)."""
     parent = await get_consultation(session, parent_id)
     _ensure_can_manage(parent, actor_user_id, actor_is_admin)
-    if scheduled_at <= datetime.now(UTC):
-        raise UnprocessableError("La fecha de la cita debe ser futura.")
+    _ensure_future(scheduled_at)
     if invited_doctor_id == parent.assigned_doctor_id:
         raise ConflictError("El especialista debe ser otro médico (usa 'Agendar seguimiento').")
     invited = await session.get(Profile, invited_doctor_id)
@@ -296,27 +327,16 @@ async def schedule_referral(
 
     # 2) Crear la hija agendada asignada al especialista (continúa la cadena). El motivo va en
     #    internal_note para que el referido lo vea; las notas previas van por el chain.
-    child = Consultation(
-        patient_id=parent.patient_id,
-        assigned_doctor_id=invited_doctor_id,
-        specialty_id=parent.specialty_id,
-        chief_complaint=parent.chief_complaint,
-        category=parent.category,
-        priority=parent.priority,
-        status="scheduled",
+    child = await _add_scheduled_child(
+        session,
+        parent,
         scheduled_at=scheduled_at,
-        parent_consultation_id=parent.id,
+        assigned_doctor_id=invited_doctor_id,
         internal_note=reason,
-    )
-    session.add(child)
-    await session.flush()
-    session.add(
-        ConsultationEvent(
-            consultation_id=child.id,
-            event_type="scheduled",
-            created_by=actor_user_id,
-            note=f"Referencia a especialista agendada para {scheduled_at.isoformat()}: {reason}",
-        )
+        event_note=(
+            f"Referencia a especialista agendada para {scheduled_at.isoformat()}: {reason}"
+        ),
+        actor_user_id=actor_user_id,
     )
     await audit.log_action(
         session,
@@ -392,18 +412,12 @@ async def get_chain(session: AsyncSession, consultation_id: uuid.UUID) -> list[C
             continue
         seen.add(node.id)
         chain.append(node)
-        children = (
-            (
-                await session.execute(
-                    select(Consultation)
-                    .where(Consultation.parent_consultation_id == node.id)
-                    .order_by(Consultation.created_at.asc())
-                )
-            )
-            .scalars()
-            .all()
+        children_stmt = (
+            select(Consultation)
+            .where(Consultation.parent_consultation_id == node.id)
+            .order_by(Consultation.created_at.asc())
         )
-        queue.extend(children)
+        queue.extend((await session.scalars(children_stmt)).all())
     return chain
 
 

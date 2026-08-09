@@ -32,6 +32,7 @@ _DOCTOR_PROFILE_ROLES = {"doctor", "specialist"}
 # de verdad del KPI doctors_online del dashboard admin (el pool de médicos ya usa Presence).
 ONLINE_WINDOW = timedelta(minutes=3)
 
+
 def _normalize(text: str) -> str:
     """minúsculas y sin acentos: 'Médico' -> 'medico', 'Psicólogo' -> 'psicologo'."""
     decomposed = unicodedata.normalize("NFD", text.lower())
@@ -324,12 +325,11 @@ async def _my_doctor_profile(session: AsyncSession, user_id: uuid.UUID) -> Profi
     return profile
 
 
-def _me_from_doctor(
-    user_id: uuid.UUID,
-    doctor: Doctor,
-    specialty_name: str | None,
-    professional_type_name: str | None,
+async def _me_from_doctor_row(
+    session: AsyncSession, user_id: uuid.UUID, doctor: Doctor
 ) -> DoctorMeResponse:
+    """Perfil propio a partir de la ficha `doctors`, resolviendo los nombres de especialidad
+    y tipo profesional."""
     return DoctorMeResponse(
         source="doctor",
         user_id=user_id,
@@ -338,22 +338,10 @@ def _me_from_doctor(
         full_name=doctor.full_name,
         license=doctor.license,
         specialty_id=doctor.specialty_id,
-        specialty=specialty_name,
+        specialty=await _specialty_name(session, doctor.specialty_id),
         professional_type_id=doctor.professional_type_id,
-        professional_type=professional_type_name,
+        professional_type=await _professional_type_name(session, doctor.professional_type_id),
         verified=doctor.verified,
-    )
-
-
-async def _me_from_doctor_row(
-    session: AsyncSession, user_id: uuid.UUID, doctor: Doctor
-) -> DoctorMeResponse:
-    """`_me_from_doctor` resolviendo los nombres de especialidad y tipo profesional."""
-    return _me_from_doctor(
-        user_id,
-        doctor,
-        await _specialty_name(session, doctor.specialty_id),
-        await _professional_type_name(session, doctor.professional_type_id),
     )
 
 

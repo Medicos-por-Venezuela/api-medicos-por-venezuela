@@ -15,6 +15,12 @@ logger = logging.getLogger("mpv.api")
 _FPV_URL = "https://api.sistema.fpv.org.ve/api/v1/psicologos_public"
 
 
+def _fallo(error: str) -> PsicologoVerificationResponse:
+    """Respuesta de "no verificado" con el motivo. Fail-closed: todo camino que no confirma
+    la cédula pasa por aquí."""
+    return PsicologoVerificationResponse(encontrado=False, error=error)
+
+
 async def verificar_psicologo(cedula: str) -> PsicologoVerificationResponse:
     """Consulta la FPV y retorna si la cédula corresponde a un psicólogo colegiado."""
     # La API espera la cédula sin prefijo (solo dígitos); normalizamos por robustez.
@@ -26,29 +32,21 @@ async def verificar_psicologo(cedula: str) -> PsicologoVerificationResponse:
             response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         logger.warning("FPV HTTP error status=%s", exc.response.status_code)
-        return PsicologoVerificationResponse(
-            encontrado=False, error=f"Error HTTP de la FPV: {exc.response.status_code}"
-        )
+        return _fallo(f"Error HTTP de la FPV: {exc.response.status_code}")
     except httpx.RequestError as exc:
         logger.warning("FPV connection error type=%s", type(exc).__name__)
-        return PsicologoVerificationResponse(
-            encontrado=False, error="Error de conexión con la FPV"
-        )
+        return _fallo("Error de conexión con la FPV")
 
     try:
         payload = response.json()
     except ValueError:
-        return PsicologoVerificationResponse(
-            encontrado=False, error="Respuesta inesperada de la FPV"
-        )
+        return _fallo("Respuesta inesperada de la FPV")
 
     data = payload.get("data") or {}
     items = data.get("items", []) if isinstance(data, dict) else []
 
     if not items:
-        return PsicologoVerificationResponse(
-            encontrado=False, error="La cédula no está registrada en la FPV"
-        )
+        return _fallo("La cédula no está registrada en la FPV")
 
     item = items[0]
     return PsicologoVerificationResponse(
