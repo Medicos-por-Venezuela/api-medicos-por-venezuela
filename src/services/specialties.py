@@ -50,6 +50,14 @@ NEEDS: list[str] = [
 ]
 
 # Especialidad -> necesidades que cubre ('*' = todo). (lib/utils.ts: SPECIALTY_NEEDS).
+#
+# ⚠️ La clave es el NOMBRE de la especialidad tal como quedó guardado en `users.specialty`, y en
+# producción conviven DOS familias de nombres: los cortos de la lista hardcodeada vieja
+# ("Pediatría", 272 médicos) y los del catálogo `specialties` actual ("Pediatría y
+# subespecialidades", que es lo que escribe `_sync_user_from_doctor` al registrarse hoy).
+# Por eso ambos nombres están mapeados: renombrar las claves al catálogo dejaría sin matching a
+# los ~495 médicos que tienen el nombre corto, y no mapear el del catálogo deja sin matching a
+# todo el que se registre a partir de ahora. Ver test_specialty_needs_cubre_el_catalogo.
 SPECIALTY_NEEDS: dict[str, list[str]] = {
     "Medicina general": ["*"],
     "Medicina interna": [
@@ -74,6 +82,32 @@ SPECIALTY_NEEDS: dict[str, list[str]] = {
     "Geriatría": ["Enfermedad crónica", "Medicina general"],
     "Reumatología": ["Enfermedad crónica"],
     "Otra": ["*"],
+    # --- Nombres del catálogo `specialties` que son la MISMA especialidad renombrada ---
+    # Cubren exactamente lo mismo que su nombre corto de arriba; no son criterios clínicos
+    # nuevos, son el mismo concepto escrito como lo guarda hoy la base.
+    "Pediatría y subespecialidades": ["Niño / pediatría"],
+    "Traumatología y ortopedia": ["Lesión física"],
+    "Cirugía General y Digestivo": ["Lesión física"],
+    "Fisiatría y rehabilitacion": ["Lesión física"],
+    "Ginecología / obstetricia": ["Embarazo"],
+    # Fusión de 'Ginecología' + 'Obstetricia' + 'Ginecología / obstetricia' (migración
+    # 20260809_174845_merge_ginecologia_obstetricia). Los tres nombres viejos se dejan arriba a
+    # propósito: cubren la ventana entre desplegar este código y correr la migración en prod, y
+    # después simplemente no los tiene ninguna fila.
+    "Ginecología y Obstetricia": ["Embarazo"],
+}
+
+# Especialidades del catálogo SIN mapeo de necesidades, a propósito: no existían en la lista vieja
+# y decidir qué necesidad cubre cada una es criterio clínico, no un renombre. Sin entrada solo
+# pierden la PREFERENCIA de orden en consultas legacy (sin `specialty_id`); la elegibilidad no se
+# ve afectada, así que ningún caso se queda sin atender. Al mapear alguna, quítala de aquí.
+SPECIALTIES_SIN_NEEDS: set[str] = {
+    "Cirugía plástica",
+    "Dermatología",
+    "Infectologia",
+    "Nefrología",
+    "Neumologia y Cirugía de torax",
+    "Urologia",
 }
 
 # Necesidades reservadas a salud mental (nunca caen en médicos generales).

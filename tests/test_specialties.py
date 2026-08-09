@@ -4,12 +4,20 @@ import uuid
 from collections.abc import AsyncGenerator
 
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.session import get_db
 from src.main import app
 from src.models.profile import Profile
-from src.services.specialties import can_attend, compute_priority, matches_specialty
+from src.models.specialty import Specialty
+from src.services.specialties import (
+    SPECIALTIES_SIN_NEEDS,
+    SPECIALTY_NEEDS,
+    can_attend,
+    compute_priority,
+    matches_specialty,
+)
 from tests._helpers import auth_headers, make_profile
 
 PREFIX = "/api/v1"
@@ -255,3 +263,49 @@ async def test_super_admin_can_manage_specialties(
         f"{PREFIX}/specialties", json=_payload(), headers=auth_headers(super_admin.id)
     )
     assert created.status_code == 201, created.text
+
+
+async def test_specialty_needs_cubre_el_catalogo(db_session: AsyncSession) -> None:
+    """El catálogo real y `SPECIALTY_NEEDS` no pueden desincronizarse en silencio.
+
+    La clave del mapa es el nombre que queda en `users.specialty`, y el backend escribe ahí el
+    nombre del catálogo. Cuando el catálogo se renombró ('Pediatría' -> 'Pediatría y
+    subespecialidades') el mapa se quedó atrás y `matches_specialty` empezó a devolver False
+    para esos médicos, sin que nada fallara. Este test convierte esa deriva en un fallo:
+    cada especialidad del catálogo debe estar mapeada o declarada explícitamente sin mapeo.
+    """
+    # Solo el catálogo VIVO: una especialidad dada de baja ya no la puede tener ningún médico,
+    # así que no exige mapeo.
+    nombres = set(
+        (await db_session.execute(select(Specialty.name).where(Specialty.deleted_at.is_(None))))
+        .scalars()
+        .all()
+    )
+    sin_declarar = nombres - set(SPECIALTY_NEEDS) - SPECIALTIES_SIN_NEEDS
+    assert not sin_declarar, (
+        f"Especialidades del catálogo sin decidir: {sorted(sin_declarar)}. "
+        "Añádelas a SPECIALTY_NEEDS (y al espejo lib/utils.ts del frontend) o, si cubrirlas "
+        "es criterio clínico pendiente, decláralas en SPECIALTIES_SIN_NEEDS."
+    )
+    # Lo declarado sin mapeo debe existir de verdad en el catálogo (si no, sobra).
+    fantasmas = SPECIALTIES_SIN_NEEDS - nombres
+    assert not fantasmas, (
+        f"SPECIALTIES_SIN_NEEDS lista nombres que ya no existen: {sorted(fantasmas)}"
+    )
+
+
+def test_matches_nombres_renombrados_del_catalogo() -> None:
+    """Los nombres largos del catálogo matchean igual que sus nombres cortos legacy.
+
+    Ambas familias conviven en `users.specialty`: los médicos viejos tienen 'Pediatría' y los
+    que se registran hoy 'Pediatría y subespecialidades'. Las dos deben atender el mismo caso.
+    """
+    for corto, largo in [
+        ("Pediatría", "Pediatría y subespecialidades"),
+        ("Traumatología", "Traumatología y ortopedia"),
+        ("Cirugía", "Cirugía General y Digestivo"),
+        ("Fisiatría", "Fisiatría y rehabilitacion"),
+    ]:
+        needs = SPECIALTY_NEEDS[corto]
+        assert SPECIALTY_NEEDS[largo] == needs, f"{largo} debe cubrir lo mismo que {corto}"
+        assert matches_specialty(largo, None, needs) is True

@@ -90,9 +90,7 @@ async def test_list_update_delete_patient(
     assert (await client.delete(f"{PREFIX}/patients/{patient_id}")).status_code == 204
     assert (await client.get(f"{PREFIX}/patients/{patient_id}")).status_code == 404
     # Soft delete: la fila sigue en la BD con deleted_at, no se borró (trazabilidad).
-    row = (
-        await db_session.execute(select(Patient).where(Patient.id == patient_id))
-    ).scalar_one()
+    row = (await db_session.execute(select(Patient).where(Patient.id == patient_id))).scalar_one()
     assert row.deleted_at is not None
     # Y ya no aparece en el listado.
     relisted = await client.get(f"{PREFIX}/patients", params={"limit": 100})
@@ -318,3 +316,45 @@ async def test_registro_completo_adulto_y_menor_primera_vez(client: AsyncClient)
     listado_adulto = await client.get(f"{PREFIX}/consultations", params={"patient_id": adulto_id})
     assert listado_adulto.status_code == 200
     assert listado_adulto.json() == []
+
+
+async def test_list_patients_tolera_email_historico_invalido(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Regresión: un email mal formado en UNA fila no puede tumbar el listado ENTERO.
+
+    `PatientResponse.email` era `EmailStr` y FastAPI valida también la respuesta, así que la
+    fila que producción arrastra desde la época de Supabase directo (el navegador escribía
+    `patients` con la anon key, sin validar formato) hacía que `GET /patients` devolviera 500
+    y el panel admin se quedara sin lista. Se inserta por ORM a propósito: por la API es
+    imposible crearla (PatientCreate.email sigue siendo EmailStr).
+    """
+    legacy = Patient(
+        id=uuid.uuid4(),
+        full_name="Paciente Legacy",
+        phone_whatsapp="+58412000009",
+        affected_zone="Caracas",
+        email="manuel fegona 29",  # sin '@': inválido para EmailStr
+        consent=True,
+    )
+    db_session.add(legacy)
+    await db_session.flush()
+
+    listed = await client.get(f"{PREFIX}/patients", params={"limit": 100})
+    assert listed.status_code == 200, listed.text
+    fila = next((p for p in listed.json() if p["id"] == str(legacy.id)), None)
+    assert fila is not None, "la fila con email inválido debe listarse, no romper la respuesta"
+    assert fila["email"] == "manuel fegona 29"  # se devuelve tal cual, sin reescribir el dato
+
+    # La ENTRADA sigue exigiendo formato válido: el 422 es el que debe seguir ocurriendo.
+    rechazado = await client.post(
+        f"{PREFIX}/patients",
+        json={
+            "full_name": "Email Invalido",
+            "phone_whatsapp": "+58412000010",
+            "affected_zone": "Caracas",
+            "email": "manuel fegona 29",
+            "consent": True,
+        },
+    )
+    assert rechazado.status_code == 422, rechazado.text
