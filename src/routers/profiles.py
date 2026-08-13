@@ -84,7 +84,7 @@ async def finalize_role(
         db,
         principal.id,
         role=payload.role,
-        specialty=payload.specialty,
+        specialty_id=payload.specialty_id,
         country=payload.country,
         medical_license=payload.medical_license,
         whatsapp_number=payload.whatsapp_number,

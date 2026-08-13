@@ -8,9 +8,11 @@ concreta (matching), se firma un JWT para un perfil doctor insertado en la sesi�
 import uuid
 
 from httpx import AsyncClient
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.profile import Profile
+from src.models.specialty import Specialty
 from tests._helpers import any_specialty_id, auth_headers, make_profile
 
 PREFIX = "/api/v1"
@@ -56,8 +58,26 @@ async def _consultation_and_room_headers(
     return body["id"], {"X-Consultation-Token": body["access_token"]}
 
 
-async def _doctor(db_session: AsyncSession, specialty: str, role: str = "doctor") -> Profile:
-    doc = make_profile(role=role, specialty=specialty)
+async def _doctor(
+    db_session: AsyncSession, specialty: str | None, role: str = "doctor"
+) -> Profile:
+    """Médico con la especialidad resuelta a FK.
+
+    Poner solo el nombre ya no basta: la elegibilidad se decide con `users.specialty_id`, no con
+    el texto. Un médico con nombre pero sin FK es, para las reglas, un médico sin especialidad.
+    """
+    doc = make_profile(role=role)
+    if specialty is not None:
+        row = (
+            await db_session.execute(
+                select(Specialty).where(
+                    func.lower(Specialty.name) == specialty.lower(),
+                    Specialty.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one()
+        doc.specialty_id = row.id
+        doc.specialty = row.name
     db_session.add(doc)
     await db_session.flush()
     return doc
@@ -94,7 +114,7 @@ async def _panel_waiting_ids(client: AsyncClient, doctor_id) -> list[str]:
 async def test_claim_asigna_caso_de_su_especialidad(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    doc = await _doctor(db_session, "Traumatología")
+    doc = await _doctor(db_session, "Traumatología y ortopedia")
     cid = await _consultation(client, ["Lesión física"])  # -> category 'Lesión física'
 
     resp = await client.post(
@@ -374,7 +394,11 @@ async def test_finalize_role_once(client: AsyncClient, db_session: AsyncSession)
     ok = await client.post(
         f"{PREFIX}/profiles/me/finalize-role",
         headers=auth_headers(placeholder.id),
-        json={"role": "doctor", "specialty": "Cardiología", "country": "Venezuela"},
+        json={
+            "role": "doctor",
+            "specialty_id": await _specialty_id(client, "Cardiología"),
+            "country": "Venezuela",
+        },
     )
     assert ok.status_code == 200, ok.text
     assert ok.json()["role"] == "doctor"

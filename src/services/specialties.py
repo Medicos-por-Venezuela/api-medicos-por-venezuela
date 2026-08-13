@@ -26,24 +26,34 @@ class SpecialtyFlags:
     mental_health_only: bool = False
 
 
-async def flags_for_specialty_name(session: AsyncSession, name: str | None) -> SpecialtyFlags:
-    """Flags de la especialidad de un MÉDICO, resueltos por nombre contra el catálogo.
+async def flags_for_specialty_id(
+    session: AsyncSession, specialty_id: uuid.UUID | None
+) -> SpecialtyFlags:
+    """Flags de la especialidad de un MÉDICO, resueltos por su FK (`users.specialty_id`).
 
-    `users.specialty` guarda el nombre y no un FK, así que este es el único punto donde la regla
-    todavía depende de una cadena. Si no resuelve (médico sin especialidad, o con un nombre que
-    ya no está en el catálogo) devuelve todo en False, que es fail-closed en la dirección que
-    importa: sin `is_mental_health` NO puede tomar un caso de salud mental.
+    Por id y no por nombre: renombrar una especialidad en el catálogo no puede cambiar quién
+    puede atender qué. Si el médico no tiene especialidad devuelve todo en False, que es
+    fail-closed en la dirección que importa: sin `is_mental_health` NO puede tomar un caso de
+    salud mental.
     """
-    if not name:
+    if specialty_id is None:
         return SpecialtyFlags()
     row = (
         await session.execute(
             select(Specialty.is_mental_health, Specialty.mental_health_only).where(
-                func.lower(Specialty.name) == name.lower(), Specialty.deleted_at.is_(None)
+                Specialty.id == specialty_id
             )
         )
     ).first()
     return SpecialtyFlags(*row) if row else SpecialtyFlags()
+
+
+async def name_for_id(session: AsyncSession, specialty_id: uuid.UUID | None) -> str | None:
+    """Nombre del catálogo para una especialidad. Lo usan los escritores de `users.specialty`,
+    que es una copia desnormalizada: el nombre SIEMPRE sale de la fila, nunca del cliente."""
+    if specialty_id is None:
+        return None
+    return await session.scalar(select(Specialty.name).where(Specialty.id == specialty_id))
 
 
 def can_attend_consultation(

@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.errors import BadRequestError, NotFoundError
 from src.models.profile import Profile
 from src.services import audit
+from src.services import specialties as specialties_service
 
 # set_my_role solo permite finalizar como paciente o médico (nunca escalar).
 _SELF_ROLES = {"patient", "doctor"}
@@ -94,7 +95,7 @@ async def finalize_role(
     session: AsyncSession,
     profile_id: uuid.UUID,
     role: str,
-    specialty: str | None = None,
+    specialty_id: uuid.UUID | None = None,
     country: str | None = None,
     medical_license: str | None = None,
     whatsapp_number: str | None = None,
@@ -109,7 +110,9 @@ async def finalize_role(
 
     profile.role = role
     if role == "doctor":
-        profile.specialty = specialty
+        # La FK manda; el nombre es su copia, resuelta del catálogo y nunca tomada del cliente.
+        profile.specialty_id = specialty_id
+        profile.specialty = await specialties_service.name_for_id(session, specialty_id)
         profile.country = country
         profile.medical_license = medical_license
         profile.whatsapp_number = whatsapp_number

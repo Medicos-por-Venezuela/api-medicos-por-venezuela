@@ -24,6 +24,7 @@ from src.schemas.doctor import DoctorCreate, DoctorMeResponse, DoctorSelfUpdate,
 from src.services import audit
 from src.services import psicologo as psicologo_service
 from src.services import sacs as sacs_service
+from src.services import specialties as specialties_service
 
 # Roles de `users` que corresponden a un médico (legacy `specialist` -> doctor).
 _DOCTOR_PROFILE_ROLES = {"doctor", "specialist"}
@@ -92,12 +93,9 @@ async def _sync_user_from_doctor(session: AsyncSession, doctor: Doctor) -> None:
     user = await session.get(Profile, doctor.user_id)
     if user is None:
         return
-    specialty_name = None
-    if doctor.specialty_id:
-        specialty_name = await session.scalar(
-            select(Specialty.name).where(Specialty.id == doctor.specialty_id)
-        )
-    user.specialty = specialty_name
+    # La FK manda; el nombre es su copia desnormalizada. Nunca uno sin el otro.
+    user.specialty_id = doctor.specialty_id
+    user.specialty = await specialties_service.name_for_id(session, doctor.specialty_id)
     user.country = doctor.country_of_residence
     user.medical_license = doctor.license
     user.whatsapp_number = doctor.phone
@@ -445,6 +443,7 @@ async def _update_my_profile_row(
     if "license" in fields:
         profile.medical_license = fields["license"]
     if "specialty_id" in fields:
+        profile.specialty_id = fields["specialty_id"]
         profile.specialty = await _specialty_name(session, fields["specialty_id"])
     await session.commit()
     await session.refresh(profile)

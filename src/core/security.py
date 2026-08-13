@@ -50,7 +50,8 @@ class Principal(BaseModel):
     role: str  # profiles.role (legado; se conserva por compatibilidad)
     active: bool
     verified: bool
-    specialty: str | None = None
+    specialty_id: uuid.UUID | None = None  # FK al catálogo: con esto se resuelven las reglas
+    specialty: str | None = None  # nombre desnormalizado, solo para mostrar
     roles: frozenset[str] = frozenset()  # roles RBAC efectivos (user_roles o fallback)
     permissions: frozenset[str] = frozenset()  # permisos efectivos (unión de sus roles)
 
@@ -155,6 +156,7 @@ async def get_current_principal(
         role=profile.role,
         active=profile.active,
         verified=profile.verified,
+        specialty_id=profile.specialty_id,
         specialty=profile.specialty,
         roles=roles,
         permissions=permissions,

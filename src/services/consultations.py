@@ -26,7 +26,7 @@ from src.services.jitsi import new_room_url
 from src.services.specialties import (
     can_attend_consultation,
     compute_priority,
-    flags_for_specialty_name,
+    flags_for_specialty_id,
 )
 
 # Estados en los que la consulta sigue "viva" para el heartbeat del paciente.
@@ -430,7 +430,7 @@ async def claim_consultation(
     consultation_id: uuid.UUID,
     doctor_user_id: uuid.UUID,
     via_whatsapp: bool = False,
-    doctor_specialty: str | None = None,
+    doctor_specialty_id: uuid.UUID | None = None,
     is_admin: bool = False,
 ) -> Consultation:
     """Toma una consulta en espera para el médico autenticado.
@@ -448,7 +448,7 @@ async def claim_consultation(
         # lista de nombres: renombrar una especialidad ya no puede abrirla en silencio.
         caso = await session.get(Specialty, consultation.specialty_id)
         if not can_attend_consultation(
-            doctor=await flags_for_specialty_name(session, doctor_specialty),
+            doctor=await flags_for_specialty_id(session, doctor_specialty_id),
             consultation_is_mental_health=bool(caso and caso.is_mental_health),
         ):
             raise ForbiddenError("Este caso no corresponde a tu especialidad.")
@@ -496,7 +496,7 @@ async def claim_consultation(
 async def get_panel(
     session: AsyncSession,
     doctor_user_id: uuid.UUID,
-    doctor_specialty: str | None = None,
+    doctor_specialty_id: uuid.UUID | None = None,
     is_admin: bool = False,
 ) -> tuple[list[Consultation], list[Consultation], int]:
     """Datos del panel médico en una pasada: cola de espera ACOTADA a lo que este médico puede
@@ -543,7 +543,7 @@ async def get_panel(
         # es corta, así que el coste es irrelevante.
         # Una sola consulta para los flags del médico; los del caso vienen con `specialty_ref`,
         # que ya se precarga arriba (sin N+1).
-        doctor_flags = await flags_for_specialty_name(session, doctor_specialty)
+        doctor_flags = await flags_for_specialty_id(session, doctor_specialty_id)
         waiting = [
             c
             for c in waiting
