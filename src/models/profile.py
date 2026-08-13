@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, String, text
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
@@ -24,6 +24,11 @@ class Profile(Base):
     email: Mapped[str | None] = mapped_column(String, unique=True, nullable=True)
     full_name: Mapped[str] = mapped_column(String, nullable=False)
     role: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'doctor'"))
+    # `specialty_id` es la fuente de verdad para las reglas de la cola; `specialty` es solo la
+    # copia desnormalizada del nombre, para mostrar y buscar. Siempre se escriben juntas.
+    specialty_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("specialties.id", ondelete="SET NULL"), nullable=True
+    )
     specialty: Mapped[str | None] = mapped_column(String, nullable=True)
     medical_license: Mapped[str | None] = mapped_column(String, nullable=True)
     country: Mapped[str | None] = mapped_column(String, nullable=True)

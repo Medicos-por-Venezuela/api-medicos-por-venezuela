@@ -23,7 +23,11 @@ from src.schemas.consultation import ConsultationCreate, ConsultationUpdate
 from src.schemas.consultation_event import ConsultationEventCreate
 from src.services import audit
 from src.services.jitsi import new_room_url
-from src.services.specialties import can_attend_consultation, compute_priority
+from src.services.specialties import (
+    can_attend_consultation,
+    compute_priority,
+    flags_for_specialty_id,
+)
 
 # Estados en los que la consulta sigue "viva" para el heartbeat del paciente.
 _HEARTBEAT_OPEN_STATUSES = {"waiting", "in_progress"}
@@ -426,7 +430,7 @@ async def claim_consultation(
     consultation_id: uuid.UUID,
     doctor_user_id: uuid.UUID,
     via_whatsapp: bool = False,
-    doctor_specialty: str | None = None,
+    doctor_specialty_id: uuid.UUID | None = None,
     is_admin: bool = False,
 ) -> Consultation:
     """Toma una consulta en espera para el médico autenticado.
@@ -440,16 +444,12 @@ async def claim_consultation(
     no basta — un POST directo se saltaba el filtro por completo."""
     consultation = await get_consultation(session, consultation_id)  # 404 si no existe
     if not is_admin:
-        specialty_name = None
-        if consultation.specialty_id:
-            specialty = await session.get(Specialty, consultation.specialty_id)
-            specialty_name = specialty.name if specialty else None
-        patient = await session.get(Patient, consultation.patient_id)
+        # La reserva de salud mental sale del catálogo (columnas de `specialties`), no de una
+        # lista de nombres: renombrar una especialidad ya no puede abrirla en silencio.
+        caso = await session.get(Specialty, consultation.specialty_id)
         if not can_attend_consultation(
-            doctor_specialty,
-            specialty_name,
-            consultation.category,
-            patient.needs_tags if patient else None,
+            doctor=await flags_for_specialty_id(session, doctor_specialty_id),
+            consultation_is_mental_health=bool(caso and caso.is_mental_health),
         ):
             raise ForbiddenError("Este caso no corresponde a tu especialidad.")
     now = datetime.now(UTC)
@@ -496,7 +496,7 @@ async def claim_consultation(
 async def get_panel(
     session: AsyncSession,
     doctor_user_id: uuid.UUID,
-    doctor_specialty: str | None = None,
+    doctor_specialty_id: uuid.UUID | None = None,
     is_admin: bool = False,
 ) -> tuple[list[Consultation], list[Consultation], int]:
     """Datos del panel médico en una pasada: cola de espera ACOTADA a lo que este médico puede
@@ -538,18 +538,20 @@ async def get_panel(
     )
     waiting = list((await session.execute(waiting_stmt)).scalars().all())
     if not is_admin:
-        # En Python y no en SQL a propósito: la regla combina el nombre de la especialidad con
-        # category/needs_tags (fallback de consultas viejas), y es la MISMA función que valida
-        # el claim. Duplicarla en SQL sería la forma de que las dos se desincronicen. La cola
-        # sin asignar es corta, así que el coste es irrelevante.
+        # En Python y no en SQL a propósito: es la MISMA función que valida el claim, y
+        # duplicarla en SQL sería la forma de que las dos se desincronicen. La cola sin asignar
+        # es corta, así que el coste es irrelevante.
+        # Una sola consulta para los flags del médico; los del caso vienen con `specialty_ref`,
+        # que ya se precarga arriba (sin N+1).
+        doctor_flags = await flags_for_specialty_id(session, doctor_specialty_id)
         waiting = [
             c
             for c in waiting
             if can_attend_consultation(
-                doctor_specialty,
-                c.specialty_ref.name if c.specialty_ref else None,
-                c.category,
-                c.patient.needs_tags if c.patient else None,
+                doctor=doctor_flags,
+                consultation_is_mental_health=bool(
+                    c.specialty_ref and c.specialty_ref.is_mental_health
+                ),
             )
         ]
     mine = list((await session.execute(mine_stmt)).scalars().all())

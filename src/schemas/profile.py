@@ -32,6 +32,7 @@ class ProfileResponse(ProfileBase):
     email: str | None = None
 
     id: uuid.UUID
+    specialty_id: uuid.UUID | None = None
     last_seen_at: datetime | None = None
     created_at: datetime
     # Contexto de médico resuelto en el mismo /auth/me (evita una segunda llamada a /doctors/me
@@ -68,7 +69,10 @@ class ProfileFinalizeRoleRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     role: str = Field(..., pattern="^(patient|doctor)$")
-    specialty: str | None = None
+    # El id del catálogo, no el nombre: el nombre que guarda `users.specialty` lo resuelve el
+    # backend desde esta FK. Que el cliente eligiera la cadena era como entraban al sistema
+    # nombres de especialidad que el catálogo ya no tenía.
+    specialty_id: uuid.UUID | None = None
     country: str | None = None
     medical_license: str | None = None
     whatsapp_number: str | None = None

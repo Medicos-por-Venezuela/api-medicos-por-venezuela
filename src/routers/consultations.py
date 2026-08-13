@@ -195,7 +195,7 @@ async def consultation_panel(
     waiting, mine, my_closed = await consultations_service.get_panel(
         db,
         principal.id,
-        doctor_specialty=principal.specialty,
+        doctor_specialty_id=principal.specialty_id,
         is_admin=principal.is_admin,
     )
     return ConsultationPanelResponse(
@@ -446,7 +446,7 @@ async def claim_consultation(
         consultation_id,
         doctor_user_id=principal.id,
         via_whatsapp=payload.via_whatsapp,
-        doctor_specialty=principal.specialty,
+        doctor_specialty_id=principal.specialty_id,
         is_admin=principal.is_admin,
     )
     return ConsultationResponse.model_validate(consultation)
