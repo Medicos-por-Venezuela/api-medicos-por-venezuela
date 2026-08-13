@@ -35,14 +35,26 @@ jobs:
 
   # ⚠️ NO hay job que EJECUTE la suite, y no es un olvido.
   #
-  # Los tests necesitan Postgres, y levantar uno en CI exige aplicar las migraciones desde cero.
-  # Se probó (2026-08-13) y NO funciona: aplicar las 38 migraciones sobre una base vacía produce
-  # un esquema DISTINTO del que existe en local/producción. La primera diferencia encontrada es
-  # que `000_core_schema.sql` crea `public.profiles.id -> auth.users(id)` (profiles_id_fkey) y la
-  # base real no la tiene — se eliminó en algún momento sin dejar migración. Corrigiendo solo esa,
-  # la suite pasa de 196 errores a 67 fallos, así que hay más divergencias.
+  # Los tests necesitan Postgres. Se probó (2026-08-13) levantar uno vacío y aplicar las 38
+  # migraciones: aplican TODAS y correctamente. Lo que falla es la suite contra ese esquema.
   #
-  # Arreglarlo de verdad es cerrar esa brecha (decidir qué esquema es el correcto y añadir las
-  # migraciones que falten), no parchear el CI. Mientras tanto la suite se corre en local:
+  # El motivo NO es que las migraciones estén mal — reproducen el esquema de producción bien.
+  # Es al revés: el entorno LOCAL no lo reproduce. `backup_supabase.sh` vuelca solo
+  # `--schema=public`, así que el dump no trae `auth`, y `load_local.sh` restaura con
+  # `--disable-triggers` justamente porque las FKs hacia `auth.users` no se pueden recrear.
+  # Resultado: la base local NO tiene `profiles_id_fkey` (public.users.id -> auth.users.id),
+  # que producción SÍ tiene (está en supabase_schema.sql, que es lo que creó prod).
+  #
+  # Y ahí está el problema real: `make_profile()` inserta en `public.users` con un uuid propio y
+  # sin fila en `auth.users`. Eso pasa en local porque le falta la FK, y falla contra un esquema
+  # fiel — 196 errores de ForeignKeyViolation. Es decir, la suite está verde gracias a un HUECO
+  # del entorno local, no porque el código lo aguante contra el esquema de verdad.
+  #
+  # Antes de meter la suite en CI hay que decidir qué hacer con eso: que los helpers de test creen
+  # su fila en `auth.users`, o asumir que local y CI corren sin esa FK a propósito y dejarlo
+  # documentado. Corrigiendo solo esa diferencia quedaban 67 fallos más sin diagnosticar, que
+  # pueden ser de la misma familia.
+  #
+  # Mientras tanto la suite se corre en local:
   #   uv run pytest --cov=src --cov-report=term-missing --asyncio-mode=auto
   # Referencia al día de hoy: 269 passed / 0 failed, cobertura 96%.
