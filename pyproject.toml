@@ -23,7 +23,12 @@ dev = [
     "pytest>=8.3.4",
     "pytest-asyncio>=0.25.2",
     "pytest-cov>=6.0.0",
-    "ruff>=0.9.2",
+    # Version EXACTA a proposito: un formateador con rango abierto hace que local y CI no
+    # coincidan. Paso de verdad (2026-08-13): local tenia 0.15.20 y CI resolvio 0.16.3, donde el
+    # formateo de Markdown dejo de ser experimental -> CI reformateaba los .md de .claude/rules y
+    # el job caia, con el mismo comando dando resultados distintos en cada sitio.
+    # Al subir esta version hay que correr `uv run ruff format .` y commitear lo que cambie.
+    "ruff==0.16.3",
 ]
 
 [build-system]
