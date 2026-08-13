@@ -7,11 +7,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class SpecialtyCatalogResponse(BaseModel):
-    """Matching catalog used by the frontend and queue logic."""
+    """Catálogo de necesidades y la reserva de salud mental.
+
+    Ya NO expone `specialty_needs`: ese mapa "necesidad -> especialidad que la cubre" se eliminó
+    del backend. Era el fallback de las consultas anteriores a `consultations.specialty_id`, no lo
+    usaba ninguna lógica de la cola, y al estar cacheado por NOMBRE se desincronizaba del catálogo
+    real cada vez que se renombraba una especialidad."""
 
     specialties: list[str]
     needs: list[str]
-    specialty_needs: dict[str, list[str]]
     reserved_needs: dict[str, list[str]]
 
 

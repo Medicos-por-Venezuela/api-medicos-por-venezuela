@@ -45,14 +45,13 @@ async def list_specialties(
 @router.get(
     "/catalog",
     response_model=SpecialtyCatalogResponse,
-    summary="Catálogo de necesidades y reglas de matching",
+    summary="Catálogo de necesidades y reserva de salud mental",
 )
 async def get_catalog() -> SpecialtyCatalogResponse:
-    """Devuelve las reglas estáticas de matching que usa la cola."""
+    """Devuelve el catálogo de necesidades y qué especialidades las tienen reservadas."""
     return SpecialtyCatalogResponse(
         specialties=specialties_service.SPECIALTIES,
         needs=specialties_service.NEEDS,
-        specialty_needs=specialties_service.SPECIALTY_NEEDS,
         reserved_needs=specialties_service.RESERVED_NEEDS,
     )
 

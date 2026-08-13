@@ -337,13 +337,17 @@ async def test_panel_devuelve_espera_mias_y_cerradas(
     )
     # Una consulta con especialidad explícita: el panel debe traer el NOMBRE resuelto
     # (es la columna con la que matchea el médico en el frontend).
+    # La especialidad se toma DEL catálogo, sin hardcodear un nombre: los nombres se renombran
+    # (fue 'Pediatría' -> 'Pediatría y subespecialidades') y el test reventaba con StopIteration
+    # por un cambio de datos, no de comportamiento. Se excluye salud mental porque este médico
+    # no tiene especialidad y un caso psi solo lo puede tomar Psicología/Psiquiatría.
     specs = (await client.get(f"{PREFIX}/specialties")).json()
-    pediatria = next(s["id"] for s in specs if s["name"] == "Pediatría")
+    spec = next(s for s in specs if s["name"] not in ("Psicología", "Psiquiatría"))
     patient_id = await _create_patient(client)
     cid_spec = (
         await client.post(
             f"{PREFIX}/consultations",
-            json={"patient_id": patient_id, "specialty_id": pediatria},
+            json={"patient_id": patient_id, "specialty_id": spec["id"]},
         )
     ).json()["id"]
 
@@ -362,7 +366,7 @@ async def test_panel_devuelve_espera_mias_y_cerradas(
     assert "full_name" not in item["patient"]
     assert item["specialty"] is None  # sin specialty_id: el matching cae al legacy
     item_spec = next(c for c in data["waiting"] if c["id"] == cid_spec)
-    assert item_spec["specialty"] == "Pediatría"
+    assert item_spec["specialty"] == spec["name"]  # el panel resuelve el NOMBRE, no el id
     # Mis consultas (ya tomadas por el médico) SÍ traen el nombre del paciente.
     mine_item = next(c for c in data["mine"] if c["id"] == cid_mine)
     assert mine_item["patient"]["full_name"] == "Paciente Consulta"

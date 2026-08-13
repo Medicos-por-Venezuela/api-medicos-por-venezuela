@@ -49,33 +49,6 @@ NEEDS: list[str] = [
     "Otra",
 ]
 
-# Especialidad -> necesidades que cubre ('*' = todo). (lib/utils.ts: SPECIALTY_NEEDS).
-SPECIALTY_NEEDS: dict[str, list[str]] = {
-    "Medicina general": ["*"],
-    "Medicina interna": [
-        "Medicina general",
-        "Enfermedad crónica",
-        "Medicamentos",
-        "Primeros auxilios",
-    ],
-    "Pediatría": ["Niño / pediatría"],
-    "Traumatología": ["Lesión física"],
-    "Ginecología": ["Embarazo"],
-    "Obstetricia": ["Embarazo"],
-    "Cardiología": ["Enfermedad crónica"],
-    "Psicología": ["Apoyo emocional", "Crisis de ansiedad"],
-    "Psiquiatría": ["Apoyo emocional", "Crisis de ansiedad"],
-    "Neurología": ["Enfermedad crónica"],
-    "Cirugía": ["Lesión física"],
-    "Oncología": ["Enfermedad crónica"],
-    "Oncología médica": ["Enfermedad crónica"],
-    "Fisiatría": ["Lesión física"],
-    "Cuidados paliativos y manejo del dolor": ["Enfermedad crónica"],
-    "Geriatría": ["Enfermedad crónica", "Medicina general"],
-    "Reumatología": ["Enfermedad crónica"],
-    "Otra": ["*"],
-}
-
 # Necesidades reservadas a salud mental (nunca caen en médicos generales).
 RESERVED_NEEDS: dict[str, list[str]] = {
     "Apoyo emocional": ["Psicología", "Psiquiatría"],
@@ -88,20 +61,6 @@ _PRIORITY_REVIEW_TAGS = {"Lesión física", "Embarazo", "Niño / pediatría"}
 
 def _values(category: str | None, needs_tags: list[str] | None) -> list[str]:
     return [v for v in [category, *(needs_tags or [])] if v]
-
-
-def matches_specialty(
-    specialty: str | None, category: str | None, needs_tags: list[str] | None
-) -> bool:
-    """True si la consulta (category + needs_tags) alinea con la especialidad."""
-    if not specialty:
-        return False
-    covered = SPECIALTY_NEEDS.get(specialty)
-    if not covered:
-        return False
-    if "*" in covered:
-        return True
-    return any(v in covered for v in _values(category, needs_tags))
 
 
 def can_attend(specialty: str | None, category: str | None, needs_tags: list[str] | None) -> bool:
@@ -122,22 +81,14 @@ def can_attend(specialty: str | None, category: str | None, needs_tags: list[str
     return True
 
 
-# El registro del paciente ahora pide la especialidad y la guarda en consultations.specialty_id:
-# esa columna ES el matching. category/needs_tags quedan como fallback para consultas viejas.
+# El matching de un caso con un médico es `consultations.specialty_id` — la columna, no un mapa
+# de nombres. El diccionario `SPECIALTY_NEEDS` que traducía "necesidad del paciente -> especialidad
+# que la cubre" se eliminó: era el fallback de las consultas anteriores a esa columna, no lo
+# llamaba ninguna lógica de la cola (solo se serializaba para que el frontend ordenara), y al
+# estar cacheado por NOMBRE se desincronizó del catálogo real en cuanto una especialidad se
+# renombró. Lo que SÍ sigue vivo aquí es `RESERVED_NEEDS`: es autorización (la reserva de salud
+# mental) para las consultas sin `specialty_id`, y la aplican `get_panel` y `claim_consultation`.
 _PSYCH_SPECIALTIES = {"Psicología", "Psiquiatría"}
-
-
-def matches_consultation(
-    specialty: str | None,
-    consultation_specialty: str | None,
-    category: str | None,
-    needs_tags: list[str] | None,
-) -> bool:
-    """Match de preferencia: igualdad exacta con la especialidad solicitada por el paciente;
-    fallback al matching legacy (category/needs) solo para consultas sin specialty_id."""
-    if consultation_specialty:
-        return specialty == consultation_specialty
-    return matches_specialty(specialty, category, needs_tags)
 
 
 def can_attend_consultation(
