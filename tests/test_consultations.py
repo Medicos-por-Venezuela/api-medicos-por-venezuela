@@ -418,7 +418,9 @@ async def test_panel_devuelve_espera_mias_y_cerradas(
     # El paciente viene anidado (zona, síntomas para elegir el caso) pero SIN `full_name`.
     item = next(c for c in data["waiting"] if c["id"] == cid_waiting)
     assert "full_name" not in item["patient"]
-    assert item["specialty"] is None  # sin specialty_id: el matching cae al legacy
+    # `specialty_id` es obligatorio al crear, asi que el panel SIEMPRE resuelve el nombre; ya no
+    # existe el caso "sin especialidad" que caia al matching legacy.
+    assert item["specialty"] is not None
     item_spec = next(c for c in data["waiting"] if c["id"] == cid_spec)
     assert item_spec["specialty"] == spec["name"]  # el panel resuelve el NOMBRE, no el id
     # Mis consultas (ya tomadas por el médico) SÍ traen el nombre del paciente.

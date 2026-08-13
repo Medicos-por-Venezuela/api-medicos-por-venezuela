@@ -6,19 +6,6 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-class SpecialtyCatalogResponse(BaseModel):
-    """Catálogo de necesidades y la reserva de salud mental.
-
-    Ya NO expone `specialty_needs`: ese mapa "necesidad -> especialidad que la cubre" se eliminó
-    del backend. Era el fallback de las consultas anteriores a `consultations.specialty_id`, no lo
-    usaba ninguna lógica de la cola, y al estar cacheado por NOMBRE se desincronizaba del catálogo
-    real cada vez que se renombraba una especialidad."""
-
-    specialties: list[str]
-    needs: list[str]
-    reserved_needs: dict[str, list[str]]
-
-
 def _clean_name(value: object) -> str:
     if not isinstance(value, str):
         raise ValueError("name must be a string")
@@ -31,6 +18,10 @@ def _clean_name(value: object) -> str:
 class SpecialtyBase(BaseModel):
     name: str = Field(..., min_length=2, max_length=120)
     status: str = Field(default="active", pattern="^(active|inactive)$")
+    # Reserva de salud mental. Editable por admin (`catalogs.manage`): dar de alta una
+    # especialidad de salud mental nueva no debe requerir un despliegue.
+    is_mental_health: bool = False
+    mental_health_only: bool = False
 
     @field_validator("name", mode="before")
     @classmethod
@@ -47,6 +38,8 @@ class SpecialtyUpdate(BaseModel):
 
     name: str | None = Field(default=None, min_length=2, max_length=120)
     status: str | None = Field(default=None, pattern="^(active|inactive)$")
+    is_mental_health: bool | None = None
+    mental_health_only: bool | None = None
 
     @field_validator("name", mode="before")
     @classmethod

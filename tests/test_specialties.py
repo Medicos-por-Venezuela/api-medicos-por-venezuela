@@ -4,32 +4,78 @@ import uuid
 from collections.abc import AsyncGenerator
 
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.session import get_db
 from src.main import app
 from src.models.profile import Profile
-from src.services.specialties import can_attend, compute_priority
+from src.models.specialty import Specialty
+from src.services.specialties import (
+    SpecialtyFlags,
+    can_attend_consultation,
+    compute_priority,
+    flags_for_specialty_name,
+)
 from tests._helpers import auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
 
-# --- can_attend ---
+# --- reserva de salud mental (flags del catálogo) ---
 
 
-def test_reserved_need_blocks_general_doctor() -> None:
-    assert can_attend("Medicina general", None, ["Crisis de ansiedad"]) is False
-    assert can_attend("Psiquiatría", None, ["Crisis de ansiedad"]) is True
+PSICOLOGO = SpecialtyFlags(is_mental_health=True, mental_health_only=True)
+PSIQUIATRA = SpecialtyFlags(is_mental_health=True, mental_health_only=False)
+GENERAL = SpecialtyFlags()
 
 
-def test_psychology_only_takes_psych_cases() -> None:
-    assert can_attend("Psicología", None, ["Lesión física"]) is False
-    assert can_attend("Psicología", None, ["Apoyo emocional"]) is True
+def test_caso_de_salud_mental_solo_para_quien_la_atiende() -> None:
+    assert can_attend_consultation(doctor=GENERAL, consultation_is_mental_health=True) is False
+    assert can_attend_consultation(doctor=PSICOLOGO, consultation_is_mental_health=True) is True
+    assert can_attend_consultation(doctor=PSIQUIATRA, consultation_is_mental_health=True) is True
 
 
-def test_can_attend_physical_general() -> None:
-    assert can_attend("Medicina general", None, ["Lesión física"]) is True
+def test_psicologo_no_toma_casos_de_salud_fisica() -> None:
+    """Psicología SOLO atiende salud mental (no es médico); Psiquiatría sí puede lo físico."""
+    assert can_attend_consultation(doctor=PSICOLOGO, consultation_is_mental_health=False) is False
+    assert can_attend_consultation(doctor=PSIQUIATRA, consultation_is_mental_health=False) is True
+    assert can_attend_consultation(doctor=GENERAL, consultation_is_mental_health=False) is True
+
+
+async def test_flags_salen_del_catalogo_no_de_una_lista_de_nombres(
+    db_session: AsyncSession,
+) -> None:
+    """La reserva la define la COLUMNA, así que renombrar la especialidad no la rompe.
+
+    Antes la regla eran los literales `{"Psicología", "Psiquiatría"}`: un renombre del catálogo
+    la abría en silencio y un caso de salud mental pasaba a poder tomarlo cualquiera.
+    """
+    psico = (
+        await db_session.execute(
+            select(Specialty).where(
+                func.lower(Specialty.name) == "psicología", Specialty.deleted_at.is_(None)
+            )
+        )
+    ).scalar_one()
+    assert psico.is_mental_health is True
+    assert psico.mental_health_only is True
+
+    # Se renombra y los flags siguen mandando.
+    psico.name = "Psicología clínica y de la salud"
+    await db_session.flush()
+    flags = await flags_for_specialty_name(db_session, "Psicología clínica y de la salud")
+    assert flags.is_mental_health is True
+    assert can_attend_consultation(doctor=flags, consultation_is_mental_health=True) is True
+
+
+async def test_especialidad_desconocida_es_fail_closed(db_session: AsyncSession) -> None:
+    """Un nombre que no está en el catálogo no puede tomar casos de salud mental."""
+    flags = await flags_for_specialty_name(db_session, "Una que no existe")
+    assert flags == SpecialtyFlags()
+    assert can_attend_consultation(doctor=flags, consultation_is_mental_health=True) is False
+    # Sin especialidad tampoco, y no hace falta ni consultar la base.
+    assert await flags_for_specialty_name(db_session, None) == SpecialtyFlags()
 
 
 # --- compute_priority ---
@@ -66,17 +112,6 @@ async def test_specialties_list_is_public(db_session: AsyncSession) -> None:
     assert resp.status_code == 200
     names = [item["name"] for item in resp.json()]
     assert "Medicina general" in names
-
-
-async def test_specialties_catalog_endpoint(db_session: AsyncSession) -> None:
-    async for public_client in _public_client(db_session):
-        resp = await public_client.get(f"{PREFIX}/specialties/catalog")
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert "Medicina general" in body["specialties"]
-    assert "Apoyo emocional" in body["reserved_needs"]
-    assert "specialty_needs" not in body  # el mapa legacy ya no se expone
 
 
 # --- CRUD specialties ---
