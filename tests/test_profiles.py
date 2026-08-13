@@ -48,9 +48,7 @@ async def test_list_profiles_multi_role_active_and_total(
     assert body["total"] >= len(body["items"])
 
     # active=false → solo revocados.
-    only_revoked = await client.get(
-        f"{PREFIX}/profiles", params={"active": "false", "limit": 100}
-    )
+    only_revoked = await client.get(f"{PREFIX}/profiles", params={"active": "false", "limit": 100})
     ids = {p["id"] for p in only_revoked.json()["items"]}
     assert str(revocado.id) in ids and str(activo.id) not in ids
 

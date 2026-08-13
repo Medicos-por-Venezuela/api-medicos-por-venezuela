@@ -180,9 +180,7 @@ class Settings(BaseSettings):
     def cors_origins(self) -> list[str]:
         # rstrip("/") tolera barras finales: el navegador manda el header Origin SIN barra, así
         # que un "https://x/" en la env rompía el match exacto de CORS en silencio (sin ACAO).
-        return [
-            s for o in self.BACKEND_CORS_ORIGINS.split(",") if (s := o.strip().rstrip("/"))
-        ]
+        return [s for o in self.BACKEND_CORS_ORIGINS.split(",") if (s := o.strip().rstrip("/"))]
 
 
 @lru_cache

@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.profile import Profile
 from src.services import calendar as calendar_service
-from tests._helpers import auth_headers, make_profile
+from tests._helpers import any_specialty_id, auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -27,7 +27,11 @@ async def _open_consultation(client: AsyncClient, doctor_id) -> str:
     cid = (
         await client.post(
             f"{PREFIX}/consultations",
-            json={"patient_id": p.json()["id"], "chief_complaint": "Dolor"},
+            json={
+                "patient_id": p.json()["id"],
+                "chief_complaint": "Dolor",
+                "specialty_id": await any_specialty_id(client),
+            },
         )
     ).json()["id"]
     r = await client.post(
@@ -53,9 +57,7 @@ async def test_calendar_url_generates_and_persists_token(
     assert body["ics_url"].endswith(".ics")
     assert body["webcal_url"].startswith("webcal://")
 
-    token = await db_session.scalar(
-        select(Profile.calendar_token).where(Profile.id == doc.id)
-    )
+    token = await db_session.scalar(select(Profile.calendar_token).where(Profile.id == doc.id))
     assert token is not None
 
 
@@ -75,9 +77,9 @@ async def test_ics_feed_lists_scheduled_events(
         )
     ).json()
 
-    url = (
-        await client.get(f"{PREFIX}/agenda/calendar-url", headers=auth_headers(doc.id))
-    ).json()["ics_url"]
+    url = (await client.get(f"{PREFIX}/agenda/calendar-url", headers=auth_headers(doc.id))).json()[
+        "ics_url"
+    ]
     tok = _token_from_url(url)
 
     r = await client.get(f"{PREFIX}/agenda/{tok}.ics")
@@ -100,9 +102,7 @@ async def test_rotate_revokes_old_token(client: AsyncClient, db_session: AsyncSe
     )
     tok2 = _token_from_url(
         (
-            await client.post(
-                f"{PREFIX}/agenda/calendar-url/rotate", headers=auth_headers(doc.id)
-            )
+            await client.post(f"{PREFIX}/agenda/calendar-url/rotate", headers=auth_headers(doc.id))
         ).json()["ics_url"]
     )
     assert tok1 != tok2

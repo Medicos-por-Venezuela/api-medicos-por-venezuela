@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.patient import Patient
 from src.models.profile import Profile
-from tests._helpers import auth_headers, make_profile
+from tests._helpers import any_specialty_id, auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -303,7 +303,11 @@ async def test_registro_completo_adulto_y_menor_primera_vez(client: AsyncClient)
 
     consulta = await client.post(
         f"{PREFIX}/consultations",
-        json={"patient_id": menor_id, "chief_complaint": "Fiebre"},
+        json={
+            "patient_id": menor_id,
+            "chief_complaint": "Fiebre",
+            "specialty_id": await any_specialty_id(client),
+        },
     )
     assert consulta.status_code == 201, consulta.text
     assert consulta.json()["patient_id"] == menor_id

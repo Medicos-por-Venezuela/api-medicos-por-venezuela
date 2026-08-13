@@ -26,7 +26,9 @@ async def test_send_mail_envia_con_token(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(mail_service, "_client", lambda: FakeClient())
 
     ok = await mail_service.send_mail(
-        "a@example.com", "Recordatorio de consulta", "Tu consulta es mañana.",
+        "a@example.com",
+        "Recordatorio de consulta",
+        "Tu consulta es mañana.",
         category="recordatorio",
     )
     assert ok is True
