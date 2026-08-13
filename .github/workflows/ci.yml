@@ -15,10 +15,13 @@ jobs:
         with:
           enable-cache: true
 
+      # `--extra dev`: ruff y pytest están en `[project.optional-dependencies] dev`, y `uv sync`
+      # a secas NO instala extras — solo las dependencias de runtime. Sin esto el job muere en el
+      # primer paso con "Failed to spawn: ruff".
       # Sin `--locked`: `uv.lock` está gitignored a propósito (ver .gitignore), así que en un
       # checkout limpio no existe y la resolución se hace desde pyproject.toml.
       - name: Instalar dependencias
-        run: uv sync
+        run: uv sync --extra dev
 
       - name: Ruff (lint)
         run: uv run ruff check .
