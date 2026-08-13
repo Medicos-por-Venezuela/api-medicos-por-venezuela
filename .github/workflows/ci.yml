@@ -15,13 +15,16 @@ jobs:
         with:
           enable-cache: true
 
+      # `--locked`: instala EXACTAMENTE lo que dice `uv.lock` y falla si el lock no está al día
+      # con pyproject.toml. Sin él, cada corrida resolvía por su cuenta y el resultado dependía
+      # de qué versiones hubiera publicadas ese día — pasó de verdad: el runner cogió ruff 0.16.3
+      # mientras en local había 0.15.20, y el mismo comando daba veredictos distintos.
+      # Si este paso falla por el lock, la solución es correr `uv lock` y commitear el resultado.
+      #
       # `--extra dev`: ruff y pytest están en `[project.optional-dependencies] dev`, y `uv sync`
-      # a secas NO instala extras — solo las dependencias de runtime. Sin esto el job muere en el
-      # primer paso con "Failed to spawn: ruff".
-      # Sin `--locked`: `uv.lock` está gitignored a propósito (ver .gitignore), así que en un
-      # checkout limpio no existe y la resolución se hace desde pyproject.toml.
+      # a secas NO instala extras — solo las dependencias de runtime.
       - name: Instalar dependencias
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
 
       - name: Ruff (lint)
         run: uv run ruff check .
