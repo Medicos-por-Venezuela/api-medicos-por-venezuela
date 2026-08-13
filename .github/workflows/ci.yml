@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  pull_request:
+    # `dev` es la rama de integración: todo entra por PR ahí y solo después va a `main`.
+    branches: [main, dev]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Sin `--locked`: `uv.lock` está gitignored a propósito (ver .gitignore), así que en un
+      # checkout limpio no existe y la resolución se hace desde pyproject.toml.
+      - name: Instalar dependencias
+        run: uv sync
+
+      - name: Ruff (lint)
+        run: uv run ruff check .
+
+      - name: Ruff (formato)
+        run: uv run ruff format --check .
+
+      # No corre la suite: solo IMPORTA todos los módulos de test y src, y arma el árbol de
+      # pruebas. Es barato y sin base de datos, y aun así atrapa lo que más se rompe entre PRs:
+      # imports rotos, errores de sintaxis, fixtures que ya no existen y firmas de helpers que
+      # cambiaron. Debe recoger los 269 tests.
+      - name: Pytest (colección, sin base de datos)
+        run: uv run pytest --collect-only -q --no-cov
+
+  # ⚠️ NO hay job que EJECUTE la suite, y no es un olvido.
+  #
+  # Los tests necesitan Postgres, y levantar uno en CI exige aplicar las migraciones desde cero.
+  # Se probó (2026-08-13) y NO funciona: aplicar las 38 migraciones sobre una base vacía produce
+  # un esquema DISTINTO del que existe en local/producción. La primera diferencia encontrada es
+  # que `000_core_schema.sql` crea `public.profiles.id -> auth.users(id)` (profiles_id_fkey) y la
+  # base real no la tiene — se eliminó en algún momento sin dejar migración. Corrigiendo solo esa,
+  # la suite pasa de 196 errores a 67 fallos, así que hay más divergencias.
+  #
+  # Arreglarlo de verdad es cerrar esa brecha (decidir qué esquema es el correcto y añadir las
+  # migraciones que falten), no parchear el CI. Mientras tanto la suite se corre en local:
+  #   uv run pytest --cov=src --cov-report=term-missing --asyncio-mode=auto
+  # Referencia al día de hoy: 269 passed / 0 failed, cobertura 96%.
