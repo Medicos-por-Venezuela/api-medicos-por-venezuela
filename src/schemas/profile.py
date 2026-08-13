@@ -24,6 +24,13 @@ class ProfileBase(BaseModel):
 class ProfileResponse(ProfileBase):
     model_config = ConfigDict(from_attributes=True)
 
+    # `str` y no `EmailStr` en la salida: FastAPI valida la respuesta, así que una sola fila con
+    # un email histórico mal formado tumbaría el listado completo con 500 (le pasó a
+    # PatientResponse). Hoy `users` está limpia, pero la validación de salida no debe poder
+    # convertir un dato viejo en una caída. La entrada la sigue validando ProfileFinalizeRole/
+    # UserCreate.
+    email: str | None = None
+
     id: uuid.UUID
     last_seen_at: datetime | None = None
     created_at: datetime
