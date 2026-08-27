@@ -43,6 +43,31 @@ mapéala a los roles en `role_permissions`, y protege el endpoint con `require_p
 detalle). Para código nuevo usa **siempre** `require_permission`, no estos flags.
 
 - `set_my_role` solo permite `patient`/`doctor` (NUNCA escalar a admin desde el cliente).
+- **Elegir rol NO concede acceso.** `finalize_role` (y su RPC gemela `set_my_role`) fijan el rol
+  y nada más: no tocan `active`/`verified`. Antes los ponían en `true`, así que una cuenta
+  revocada con `role_chosen=false` (el estado de un alta OAuth) se **reactivaba sola** con una
+  petición, anulando la revocación del admin. Toda operación que un usuario puede invocar sobre
+  sí mismo debe fijar SOLO lo que le corresponde; si además "de paso" enciende un flag de acceso,
+  es una evasión de baneo esperando a ocurrir.
+
+## 🩺 Gate de credencial médica (quién puede atender)
+El rol `doctor` autoriza la *acción*; **la credencial autoriza a ejercer**. Un médico solo opera
+si `src/services/doctors.py::has_valid_credential` es cierto: ficha en `doctors` no borrada,
+`status = 1`, `verified = true` **y** con `cedula` y `license` registradas.
+
+- Lo aplica `get_current_principal` en un solo sitio: si el principal ejerce como médico
+  (`DOCTOR_ROLES`) y no es admin, se le **vacían los permisos** (`permissions = frozenset()`) y
+  `credential_verified` queda en False. Mismo efecto que una cuenta revocada, pero conserva el
+  rol para que el frontend sepa a dónde mandarlo. **No** añadas checks de credencial por endpoint:
+  centralizado no se olvida ninguno (lección del sub-recurso `/events` en IDOR).
+- `verified` se pone en `true` solo por dos vías: el **SACS/FPV** al registrar o al corregir la
+  cédula (fail-closed: servicio caído o no encontrado ⇒ `false`), o la **aprobación manual de un
+  admin** (`PATCH /doctors/{id}` con `verified: true`, que queda en `audit_log`).
+- Marcar `verified` no basta si falta la cédula o la licencia: las filas legacy backfilleadas
+  nacieron con `verified=true` sin haber pasado nunca por el SACS.
+- **Lo que el gate NO debe bloquear:** `/doctors/me` (ver y completar la propia ficha) y
+  `/auth/me*`. Son la vía de salida del limbo; si las cierras, el médico queda en una trampa sin
+  salida. Van por `get_current_principal`, no por `require_permission`.
 
 ## 🧾 Auditoría inmutable (no repudio)
 Toda acción sensible (asignar/revocar rol, y las que se agreguen) se registra en `audit_log` vía

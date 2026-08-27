@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.profile import Profile
 from src.models.specialty import Specialty
-from tests._helpers import any_specialty_id, auth_headers, make_profile
+from tests._helpers import any_specialty_id, auth_headers, make_doctor_row, make_profile
 
 PREFIX = "/api/v1"
 
@@ -61,10 +61,12 @@ async def _consultation_and_room_headers(
 async def _doctor(
     db_session: AsyncSession, specialty: str | None, role: str = "doctor"
 ) -> Profile:
-    """Médico con la especialidad resuelta a FK.
+    """Médico operativo: especialidad resuelta a FK **y** ficha habilitada en `doctors`.
 
-    Poner solo el nombre ya no basta: la elegibilidad se decide con `users.specialty_id`, no con
-    el texto. Un médico con nombre pero sin FK es, para las reglas, un médico sin especialidad.
+    Son dos requisitos que se acumulan. La elegibilidad se decide con `users.specialty_id`, no con
+    el texto: un médico con nombre pero sin FK es, para las reglas, un médico sin especialidad. Y
+    sin ficha verificada en `doctors`, el gate de credencial lo deja sin permisos aunque conserve
+    el rol. Un admin no lleva ficha: no atiende.
     """
     doc = make_profile(role=role)
     if specialty is not None:
@@ -80,6 +82,9 @@ async def _doctor(
         doc.specialty = row.name
     db_session.add(doc)
     await db_session.flush()
+    if role != "admin":
+        db_session.add(make_doctor_row(doc.id))
+        await db_session.flush()
     return doc
 
 
@@ -403,6 +408,9 @@ async def test_finalize_role_once(client: AsyncClient, db_session: AsyncSession)
     assert ok.status_code == 200, ok.text
     assert ok.json()["role"] == "doctor"
     assert ok.json()["role_chosen"] is True
+    # Elegir rol fija el rol y NADA más: no concede verificación (ni acceso, ver el test
+    # de la cuenta revocada de abajo).
+    assert ok.json()["verified"] is False
 
     audit_resp = await client.get(f"{PREFIX}/audit-log", params={"action": "profile.role_chosen"})
     entry = next(e for e in audit_resp.json() if e["resource_id"] == str(placeholder.id))
@@ -416,6 +424,37 @@ async def test_finalize_role_once(client: AsyncClient, db_session: AsyncSession)
         json={"role": "patient"},
     )
     assert again.status_code == 400
+
+
+async def test_finalize_role_no_reactiva_cuenta_revocada(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Regresión (evasión de baneo): una cuenta revocada por un admin (`active=false`) con el
+    rol aún sin elegir —el estado de un alta OAuth de Google— NO puede reactivarse sola
+    finalizando su rol. `finalize-role` responde 403 y no toca `active`/`verified`."""
+    revoked = make_profile(role="patient")
+    revoked.role_chosen = False
+    revoked.active = False
+    db_session.add(revoked)
+    await db_session.flush()
+
+    resp = await client.post(
+        f"{PREFIX}/profiles/me/finalize-role",
+        headers=auth_headers(revoked.id),
+        # `specialty_id` (FK), no el nombre: el endpoint tiene extra="forbid" desde que la
+        # especialidad se resuelve por catálogo. Con el nombre daba 422 y el 403 no se probaba.
+        json={
+            "role": "doctor",
+            "specialty_id": await _specialty_id(client, "Cardiología"),
+            "country": "Venezuela",
+        },
+    )
+    assert resp.status_code == 403, resp.text
+
+    await db_session.refresh(revoked)
+    assert revoked.active is False
+    assert revoked.role_chosen is False
+    assert revoked.role == "patient"
 
 
 async def test_finalize_role_rejects_invalid_role(client: AsyncClient) -> None:

@@ -11,7 +11,7 @@ from src.models.consultation import Consultation
 from src.models.patient import Patient
 from src.models.profile import Profile
 from src.models.specialty import Specialty
-from tests._helpers import any_specialty_id, auth_headers, make_profile
+from tests._helpers import add_doctor, any_specialty_id, auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -329,9 +329,8 @@ async def test_claim_es_atomico_solo_gana_un_medico(
 ) -> None:
     """Dos médicos toman el mismo caso: el primero 200, el segundo 409 (nunca ambos)."""
     cid = await _create_waiting_consultation(client)
-    d1, d2 = make_profile(role="doctor"), make_profile(role="doctor")
-    db_session.add_all([d1, d2])
-    await db_session.flush()
+    d1 = await add_doctor(db_session)
+    d2 = await add_doctor(db_session)
 
     r1 = await client.post(
         f"{PREFIX}/consultations/{cid}/claim", json={}, headers=auth_headers(d1.id)
@@ -350,9 +349,7 @@ async def test_claim_via_whatsapp_marca_el_flag(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     cid = await _create_waiting_consultation(client)
-    doc = make_profile(role="doctor")
-    db_session.add(doc)
-    await db_session.flush()
+    doc = await add_doctor(db_session)
 
     resp = await client.post(
         f"{PREFIX}/consultations/{cid}/claim",
@@ -380,9 +377,7 @@ async def test_claim_requiere_permiso_queue_take(
 async def test_panel_devuelve_espera_mias_y_cerradas(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    doc = make_profile(role="doctor")
-    db_session.add(doc)
-    await db_session.flush()
+    doc = await add_doctor(db_session)
 
     cid_waiting = await _create_waiting_consultation(client)
     cid_mine = await _create_waiting_consultation(client)
@@ -465,10 +460,8 @@ async def _consultation_assigned_to(
 async def test_doctor_no_puede_editar_ni_cerrar_consulta_ajena(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    dr_a = make_profile(role="doctor")
-    dr_b = make_profile(role="doctor")
-    db_session.add_all([dr_a, dr_b])
-    await db_session.flush()
+    dr_a = await add_doctor(db_session)
+    dr_b = await add_doctor(db_session)
     cid = await _consultation_assigned_to(client, db_session, str(dr_b.id))
 
     headers_a = auth_headers(dr_a.id)
@@ -486,10 +479,8 @@ async def test_doctor_no_puede_editar_ni_cerrar_consulta_ajena(
 async def test_doctor_no_puede_reasignar_a_terceros(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    dr_a = make_profile(role="doctor")
-    dr_c = make_profile(role="doctor")
-    db_session.add_all([dr_a, dr_c])
-    await db_session.flush()
+    dr_a = await add_doctor(db_session)
+    dr_c = await add_doctor(db_session)
     patient_id = await _create_patient(client)
     cid = (
         await client.post(
@@ -549,9 +540,7 @@ async def test_doctor_no_puede_editar_doctor_id(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     """doctor_id (ficha del médico) es server-only: un no-admin no lo edita por PATCH."""
-    dr_a = make_profile(role="doctor")
-    db_session.add(dr_a)
-    await db_session.flush()
+    dr_a = await add_doctor(db_session)
     patient_id = await _create_patient(client)
     cid = (
         await client.post(
@@ -573,10 +562,8 @@ async def test_doctor_no_puede_inyectar_eventos_en_consulta_ajena(
 ) -> None:
     """Anti-IDOR en eventos: el historial del caso solo lo escribe el médico asignado
     (o un admin) — sin esto, cualquier doctor podía fabricar un evento 'closed' falso."""
-    dr_a = make_profile(role="doctor")
-    dr_b = make_profile(role="doctor")
-    db_session.add_all([dr_a, dr_b])
-    await db_session.flush()
+    dr_a = await add_doctor(db_session)
+    dr_b = await add_doctor(db_session)
     cid = await _consultation_assigned_to(client, db_session, str(dr_b.id))
 
     payload = {"consultation_id": cid, "event_type": "closed", "note": "evento intruso"}
@@ -602,9 +589,7 @@ async def test_doctor_no_puede_inyectar_eventos_en_consulta_ajena(
 async def test_admin_puede_gestionar_consulta_ajena(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    dr_b = make_profile(role="doctor")
-    db_session.add(dr_b)
-    await db_session.flush()
+    dr_b = await add_doctor(db_session)
     cid = await _consultation_assigned_to(client, db_session, str(dr_b.id))
 
     # El client del fixture es admin: puede editar y cerrar consultas de otros.
@@ -646,9 +631,7 @@ async def test_consultation_list_includes_patient_and_doctor_names(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     patient_id = await _create_patient(client)
-    doctor_profile = make_profile(role="doctor")
-    db_session.add(doctor_profile)
-    await db_session.flush()
+    doctor_profile = await add_doctor(db_session)
 
     cid = (
         await client.post(
@@ -703,9 +686,7 @@ async def test_consultation_list_hides_pii_from_patient_viewer(
     """Guarda contra un futuro drift de `ConsultationPatientResponse`: si algún día
     se le agregan `patient_name`/`assigned_doctor_name`, este test debe fallar."""
     patient_id = await _create_patient(client)
-    doctor_profile = make_profile(role="doctor")
-    db_session.add(doctor_profile)
-    await db_session.flush()
+    doctor_profile = await add_doctor(db_session)
 
     cid = (
         await client.post(

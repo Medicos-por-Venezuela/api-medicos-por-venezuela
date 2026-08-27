@@ -6,7 +6,7 @@ from datetime import date, timedelta
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.errors import BadRequestError, NotFoundError
+from src.core.errors import BadRequestError, ForbiddenError, NotFoundError
 from src.models.doctor import Doctor
 from src.models.profile import Profile
 from src.services import audit
@@ -125,10 +125,19 @@ async def finalize_role(
     whatsapp_number: str | None = None,
 ) -> Profile:
     """Finaliza el rol del propio usuario una sola vez (réplica de set_my_role):
-    solo `patient`/`doctor`, solo si `role_chosen` aún es false."""
+    solo `patient`/`doctor`, solo si `role_chosen` aún es false.
+
+    ⚠️ Elegir rol NO concede acceso: este servicio **nunca** toca `active`/`verified`.
+    Las cuentas nacen con ambos en true (trigger `handle_new_auth_user`), así que fijarlos
+    aquí era redundante y permitía a una cuenta revocada (`active=false`, típica de un alta
+    OAuth sin rol a la que un admin le quitó el acceso) reactivarse sola con una sola
+    petición, anulando la revocación. Además, una cuenta revocada no finaliza nada: 403.
+    """
     if role not in _SELF_ROLES:
         raise BadRequestError("Rol inválido. Solo se permite 'patient' o 'doctor'.")
     profile = await get_profile(session, profile_id)
+    if not profile.active:
+        raise ForbiddenError("Cuenta revocada.")
     if profile.role_chosen:
         raise BadRequestError("El rol ya fue elegido y no puede cambiarse.")
 
@@ -140,8 +149,6 @@ async def finalize_role(
         profile.country = country
         profile.medical_license = medical_license
         profile.whatsapp_number = whatsapp_number
-    profile.verified = True
-    profile.active = True
     profile.role_chosen = True
     await audit.log_action(
         session,
