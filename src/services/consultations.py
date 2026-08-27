@@ -23,7 +23,11 @@ from src.schemas.consultation import ConsultationCreate, ConsultationUpdate
 from src.schemas.consultation_event import ConsultationEventCreate
 from src.services import audit
 from src.services.jitsi import new_room_url
-from src.services.specialties import can_attend_consultation, compute_priority
+from src.services.specialties import (
+    can_attend_consultation,
+    compute_priority,
+    flags_for_specialty_id,
+)
 
 # Estados en los que la consulta sigue "viva" para el heartbeat del paciente.
 _HEARTBEAT_OPEN_STATUSES = {"waiting", "in_progress"}
@@ -113,7 +117,7 @@ async def create_consultation(session: AsyncSession, data: ConsultationCreate) -
     patient = await session.get(Patient, data.patient_id)
     if patient is None:
         raise BadRequestError("El paciente referenciado (patient_id) no existe.")
-    if data.specialty_id is not None and await session.get(Specialty, data.specialty_id) is None:
+    if await session.get(Specialty, data.specialty_id) is None:
         raise BadRequestError("La especialidad referenciada (specialty_id) no existe.")
     # code lo asigna SIEMPRE el trigger generate_consultation_code en la base.
     consultation = Consultation(**data.model_dump())
@@ -188,6 +192,51 @@ async def close_consultation(
     return consultation
 
 
+def _ensure_future(scheduled_at: datetime) -> None:
+    """Una cita solo se agenda hacia adelante (regla común a seguimiento y referencia)."""
+    if scheduled_at <= datetime.now(UTC):
+        raise UnprocessableError("La fecha de la cita debe ser futura.")
+
+
+async def _add_scheduled_child(
+    session: AsyncSession,
+    parent: Consultation,
+    *,
+    scheduled_at: datetime,
+    assigned_doctor_id: uuid.UUID | None,
+    internal_note: str | None,
+    event_note: str,
+    actor_user_id: uuid.UUID | None,
+) -> Consultation:
+    """Crea la consulta HIJA agendada que continúa la cadena del padre (mismo paciente,
+    especialidad, motivo y prioridad) más su evento `scheduled`. Lo comparten 'agendar
+    seguimiento' (mismo médico) y 'agendar con especialista' (otro médico), que solo difieren
+    en a quién se asigna y qué queda escrito. `code` lo pone el trigger de la BD."""
+    child = Consultation(
+        patient_id=parent.patient_id,
+        assigned_doctor_id=assigned_doctor_id,
+        specialty_id=parent.specialty_id,
+        chief_complaint=parent.chief_complaint,
+        category=parent.category,
+        priority=parent.priority,
+        status="scheduled",
+        scheduled_at=scheduled_at,
+        parent_consultation_id=parent.id,
+        internal_note=internal_note,
+    )
+    session.add(child)
+    await session.flush()
+    session.add(
+        ConsultationEvent(
+            consultation_id=child.id,
+            event_type="scheduled",
+            created_by=actor_user_id,
+            note=event_note,
+        )
+    )
+    return child
+
+
 async def schedule_follow_up(
     session: AsyncSession,
     *,
@@ -202,8 +251,7 @@ async def schedule_follow_up(
     la cadena (mismo paciente, mismo médico). Todo en una transacción. Ver el módulo Agenda."""
     parent = await get_consultation(session, parent_id)
     _ensure_can_manage(parent, actor_user_id, actor_is_admin)
-    if scheduled_at <= datetime.now(UTC):
-        raise UnprocessableError("La fecha de la cita debe ser futura.")
+    _ensure_future(scheduled_at)
 
     # 1) Cerrar el padre (firmado).
     parent.status = "closed"
@@ -221,27 +269,15 @@ async def schedule_follow_up(
         )
     )
 
-    # 2) Crear la hija agendada (continúa la cadena). `code` lo pone el trigger de la BD.
-    child = Consultation(
-        patient_id=parent.patient_id,
-        assigned_doctor_id=parent.assigned_doctor_id,
-        specialty_id=parent.specialty_id,
-        chief_complaint=parent.chief_complaint,
-        category=parent.category,
-        priority=parent.priority,
-        status="scheduled",
+    # 2) Crear la hija agendada, con el MISMO médico (continúa la cadena).
+    child = await _add_scheduled_child(
+        session,
+        parent,
         scheduled_at=scheduled_at,
-        parent_consultation_id=parent.id,
-    )
-    session.add(child)
-    await session.flush()
-    session.add(
-        ConsultationEvent(
-            consultation_id=child.id,
-            event_type="scheduled",
-            created_by=actor_user_id,
-            note=f"Seguimiento agendado para {scheduled_at.isoformat()}",
-        )
+        assigned_doctor_id=parent.assigned_doctor_id,
+        internal_note=None,
+        event_note=f"Seguimiento agendado para {scheduled_at.isoformat()}",
+        actor_user_id=actor_user_id,
     )
     await audit.log_action(
         session,
@@ -273,8 +309,7 @@ async def schedule_referral(
     Distinto de 'Agendar seguimiento' (mismo médico) y de una Interconsulta (en vivo, limitada)."""
     parent = await get_consultation(session, parent_id)
     _ensure_can_manage(parent, actor_user_id, actor_is_admin)
-    if scheduled_at <= datetime.now(UTC):
-        raise UnprocessableError("La fecha de la cita debe ser futura.")
+    _ensure_future(scheduled_at)
     if invited_doctor_id == parent.assigned_doctor_id:
         raise ConflictError("El especialista debe ser otro médico (usa 'Agendar seguimiento').")
     invited = await session.get(Profile, invited_doctor_id)
@@ -296,27 +331,16 @@ async def schedule_referral(
 
     # 2) Crear la hija agendada asignada al especialista (continúa la cadena). El motivo va en
     #    internal_note para que el referido lo vea; las notas previas van por el chain.
-    child = Consultation(
-        patient_id=parent.patient_id,
-        assigned_doctor_id=invited_doctor_id,
-        specialty_id=parent.specialty_id,
-        chief_complaint=parent.chief_complaint,
-        category=parent.category,
-        priority=parent.priority,
-        status="scheduled",
+    child = await _add_scheduled_child(
+        session,
+        parent,
         scheduled_at=scheduled_at,
-        parent_consultation_id=parent.id,
+        assigned_doctor_id=invited_doctor_id,
         internal_note=reason,
-    )
-    session.add(child)
-    await session.flush()
-    session.add(
-        ConsultationEvent(
-            consultation_id=child.id,
-            event_type="scheduled",
-            created_by=actor_user_id,
-            note=f"Referencia a especialista agendada para {scheduled_at.isoformat()}: {reason}",
-        )
+        event_note=(
+            f"Referencia a especialista agendada para {scheduled_at.isoformat()}: {reason}"
+        ),
+        actor_user_id=actor_user_id,
     )
     await audit.log_action(
         session,
@@ -392,18 +416,12 @@ async def get_chain(session: AsyncSession, consultation_id: uuid.UUID) -> list[C
             continue
         seen.add(node.id)
         chain.append(node)
-        children = (
-            (
-                await session.execute(
-                    select(Consultation)
-                    .where(Consultation.parent_consultation_id == node.id)
-                    .order_by(Consultation.created_at.asc())
-                )
-            )
-            .scalars()
-            .all()
+        children_stmt = (
+            select(Consultation)
+            .where(Consultation.parent_consultation_id == node.id)
+            .order_by(Consultation.created_at.asc())
         )
-        queue.extend(children)
+        queue.extend((await session.scalars(children_stmt)).all())
     return chain
 
 
@@ -412,7 +430,7 @@ async def claim_consultation(
     consultation_id: uuid.UUID,
     doctor_user_id: uuid.UUID,
     via_whatsapp: bool = False,
-    doctor_specialty: str | None = None,
+    doctor_specialty_id: uuid.UUID | None = None,
     is_admin: bool = False,
 ) -> Consultation:
     """Toma una consulta en espera para el médico autenticado.
@@ -426,16 +444,12 @@ async def claim_consultation(
     no basta — un POST directo se saltaba el filtro por completo."""
     consultation = await get_consultation(session, consultation_id)  # 404 si no existe
     if not is_admin:
-        specialty_name = None
-        if consultation.specialty_id:
-            specialty = await session.get(Specialty, consultation.specialty_id)
-            specialty_name = specialty.name if specialty else None
-        patient = await session.get(Patient, consultation.patient_id)
+        # La reserva de salud mental sale del catálogo (columnas de `specialties`), no de una
+        # lista de nombres: renombrar una especialidad ya no puede abrirla en silencio.
+        caso = await session.get(Specialty, consultation.specialty_id)
         if not can_attend_consultation(
-            doctor_specialty,
-            specialty_name,
-            consultation.category,
-            patient.needs_tags if patient else None,
+            doctor=await flags_for_specialty_id(session, doctor_specialty_id),
+            consultation_is_mental_health=bool(caso and caso.is_mental_health),
         ):
             raise ForbiddenError("Este caso no corresponde a tu especialidad.")
     now = datetime.now(UTC)
@@ -482,7 +496,7 @@ async def claim_consultation(
 async def get_panel(
     session: AsyncSession,
     doctor_user_id: uuid.UUID,
-    doctor_specialty: str | None = None,
+    doctor_specialty_id: uuid.UUID | None = None,
     is_admin: bool = False,
 ) -> tuple[list[Consultation], list[Consultation], int]:
     """Datos del panel médico en una pasada: cola de espera ACOTADA a lo que este médico puede
@@ -524,18 +538,20 @@ async def get_panel(
     )
     waiting = list((await session.execute(waiting_stmt)).scalars().all())
     if not is_admin:
-        # En Python y no en SQL a propósito: la regla combina el nombre de la especialidad con
-        # category/needs_tags (fallback de consultas viejas), y es la MISMA función que valida
-        # el claim. Duplicarla en SQL sería la forma de que las dos se desincronicen. La cola
-        # sin asignar es corta, así que el coste es irrelevante.
+        # En Python y no en SQL a propósito: es la MISMA función que valida el claim, y
+        # duplicarla en SQL sería la forma de que las dos se desincronicen. La cola sin asignar
+        # es corta, así que el coste es irrelevante.
+        # Una sola consulta para los flags del médico; los del caso vienen con `specialty_ref`,
+        # que ya se precarga arriba (sin N+1).
+        doctor_flags = await flags_for_specialty_id(session, doctor_specialty_id)
         waiting = [
             c
             for c in waiting
             if can_attend_consultation(
-                doctor_specialty,
-                c.specialty_ref.name if c.specialty_ref else None,
-                c.category,
-                c.patient.needs_tags if c.patient else None,
+                doctor=doctor_flags,
+                consultation_is_mental_health=bool(
+                    c.specialty_ref and c.specialty_ref.is_mental_health
+                ),
             )
         ]
     mine = list((await session.execute(mine_stmt)).scalars().all())

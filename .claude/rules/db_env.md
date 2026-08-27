@@ -37,7 +37,7 @@
       await session.rollback()
       raise HTTPException(
           status_code=409,
-          detail="Este paciente está siendo seleccionado por otro médico en este momento. Inténtalo de nuevo."
+          detail="Este paciente está siendo seleccionado por otro médico en este momento. Inténtalo de nuevo.",
       )
   ```
 

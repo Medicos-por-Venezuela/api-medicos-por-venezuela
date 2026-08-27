@@ -8,10 +8,12 @@ concreta (matching), se firma un JWT para un perfil doctor insertado en la sesi�
 import uuid
 
 from httpx import AsyncClient
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.profile import Profile
-from tests._helpers import auth_headers, make_profile
+from src.models.specialty import Specialty
+from tests._helpers import any_specialty_id, auth_headers, make_doctor_row, make_profile
 
 PREFIX = "/api/v1"
 
@@ -34,7 +36,12 @@ async def _patient(client: AsyncClient, needs: list[str], allergies: str | None 
 
 async def _consultation(client: AsyncClient, needs: list[str]) -> str:
     pid = await _patient(client, needs)
-    return (await client.post(f"{PREFIX}/consultations", json={"patient_id": pid})).json()["id"]
+    return (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": pid, "specialty_id": await any_specialty_id(client)},
+        )
+    ).json()["id"]
 
 
 async def _consultation_and_room_headers(
@@ -42,14 +49,42 @@ async def _consultation_and_room_headers(
 ) -> tuple[str, dict[str, str]]:
     """Consulta + la cabecera con su token de sala, como la recibe el paciente al registrarse."""
     pid = await _patient(client, needs)
-    body = (await client.post(f"{PREFIX}/consultations", json={"patient_id": pid})).json()
+    body = (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": pid, "specialty_id": await any_specialty_id(client)},
+        )
+    ).json()
     return body["id"], {"X-Consultation-Token": body["access_token"]}
 
 
-async def _doctor(db_session: AsyncSession, specialty: str, role: str = "doctor") -> Profile:
-    doc = make_profile(role=role, specialty=specialty)
+async def _doctor(
+    db_session: AsyncSession, specialty: str | None, role: str = "doctor"
+) -> Profile:
+    """Médico operativo: especialidad resuelta a FK **y** ficha habilitada en `doctors`.
+
+    Son dos requisitos que se acumulan. La elegibilidad se decide con `users.specialty_id`, no con
+    el texto: un médico con nombre pero sin FK es, para las reglas, un médico sin especialidad. Y
+    sin ficha verificada en `doctors`, el gate de credencial lo deja sin permisos aunque conserve
+    el rol. Un admin no lleva ficha: no atiende.
+    """
+    doc = make_profile(role=role)
+    if specialty is not None:
+        row = (
+            await db_session.execute(
+                select(Specialty).where(
+                    func.lower(Specialty.name) == specialty.lower(),
+                    Specialty.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one()
+        doc.specialty_id = row.id
+        doc.specialty = row.name
     db_session.add(doc)
     await db_session.flush()
+    if role != "admin":
+        db_session.add(make_doctor_row(doc.id))
+        await db_session.flush()
     return doc
 
 
@@ -65,9 +100,7 @@ async def _consultation_with_specialty(
     pid = await _patient(client, needs)
     sid = await _specialty_id(client, specialty_name)
     return (
-        await client.post(
-            f"{PREFIX}/consultations", json={"patient_id": pid, "specialty_id": sid}
-        )
+        await client.post(f"{PREFIX}/consultations", json={"patient_id": pid, "specialty_id": sid})
     ).json()["id"]
 
 
@@ -86,7 +119,7 @@ async def _panel_waiting_ids(client: AsyncClient, doctor_id) -> list[str]:
 async def test_claim_asigna_caso_de_su_especialidad(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    doc = await _doctor(db_session, "Traumatología")
+    doc = await _doctor(db_session, "Traumatología y ortopedia")
     cid = await _consultation(client, ["Lesión física"])  # -> category 'Lesión física'
 
     resp = await client.post(
@@ -148,9 +181,7 @@ async def test_caso_de_psicologia_reservado_por_specialty_id(
     assert took.json()["id"] == cid_psi
 
 
-async def test_admin_ve_y_toma_toda_la_cola(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_admin_ve_y_toma_toda_la_cola(client: AsyncClient, db_session: AsyncSession) -> None:
     """El admin no queda acotado por especialidad: sigue viendo la cola entera."""
     cid_psi = await _consultation_with_specialty(client, ["Medicina general"], "Psicología")
     admin = await _doctor(db_session, "Medicina general", role="admin")
@@ -170,7 +201,10 @@ async def test_la_cola_del_panel_expone_las_alergias(
     doc = await _doctor(db_session, "Medicina general")
     pid = await _patient(client, ["Medicina general"], allergies="Penicilina")
     cid = (
-        await client.post(f"{PREFIX}/consultations", json={"patient_id": pid})
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": pid, "specialty_id": await any_specialty_id(client)},
+        )
     ).json()["id"]
 
     resp = await client.get(f"{PREFIX}/consultations/panel", headers=auth_headers(doc.id))
@@ -365,11 +399,18 @@ async def test_finalize_role_once(client: AsyncClient, db_session: AsyncSession)
     ok = await client.post(
         f"{PREFIX}/profiles/me/finalize-role",
         headers=auth_headers(placeholder.id),
-        json={"role": "doctor", "specialty": "Cardiología", "country": "Venezuela"},
+        json={
+            "role": "doctor",
+            "specialty_id": await _specialty_id(client, "Cardiología"),
+            "country": "Venezuela",
+        },
     )
     assert ok.status_code == 200, ok.text
     assert ok.json()["role"] == "doctor"
     assert ok.json()["role_chosen"] is True
+    # Elegir rol fija el rol y NADA más: no concede verificación (ni acceso, ver el test
+    # de la cuenta revocada de abajo).
+    assert ok.json()["verified"] is False
 
     audit_resp = await client.get(f"{PREFIX}/audit-log", params={"action": "profile.role_chosen"})
     entry = next(e for e in audit_resp.json() if e["resource_id"] == str(placeholder.id))
@@ -383,6 +424,37 @@ async def test_finalize_role_once(client: AsyncClient, db_session: AsyncSession)
         json={"role": "patient"},
     )
     assert again.status_code == 400
+
+
+async def test_finalize_role_no_reactiva_cuenta_revocada(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Regresión (evasión de baneo): una cuenta revocada por un admin (`active=false`) con el
+    rol aún sin elegir —el estado de un alta OAuth de Google— NO puede reactivarse sola
+    finalizando su rol. `finalize-role` responde 403 y no toca `active`/`verified`."""
+    revoked = make_profile(role="patient")
+    revoked.role_chosen = False
+    revoked.active = False
+    db_session.add(revoked)
+    await db_session.flush()
+
+    resp = await client.post(
+        f"{PREFIX}/profiles/me/finalize-role",
+        headers=auth_headers(revoked.id),
+        # `specialty_id` (FK), no el nombre: el endpoint tiene extra="forbid" desde que la
+        # especialidad se resuelve por catálogo. Con el nombre daba 422 y el 403 no se probaba.
+        json={
+            "role": "doctor",
+            "specialty_id": await _specialty_id(client, "Cardiología"),
+            "country": "Venezuela",
+        },
+    )
+    assert resp.status_code == 403, resp.text
+
+    await db_session.refresh(revoked)
+    assert revoked.active is False
+    assert revoked.role_chosen is False
+    assert revoked.role == "patient"
 
 
 async def test_finalize_role_rejects_invalid_role(client: AsyncClient) -> None:

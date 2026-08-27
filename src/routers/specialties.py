@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.security import Principal, require_permission
 from src.db.session import get_db
 from src.schemas.specialty import (
-    SpecialtyCatalogResponse,
     SpecialtyCreate,
     SpecialtyResponse,
     SpecialtyUpdate,
@@ -40,21 +39,6 @@ async def list_specialties(
 ) -> list[SpecialtyResponse]:
     """Lista pública de especialidades activas; no requiere Bearer token."""
     return await specialties_service.list_specialties(db, skip=skip, limit=limit, status="active")
-
-
-@router.get(
-    "/catalog",
-    response_model=SpecialtyCatalogResponse,
-    summary="Catálogo de necesidades y reglas de matching",
-)
-async def get_catalog() -> SpecialtyCatalogResponse:
-    """Devuelve las reglas estáticas de matching que usa la cola."""
-    return SpecialtyCatalogResponse(
-        specialties=specialties_service.SPECIALTIES,
-        needs=specialties_service.NEEDS,
-        specialty_needs=specialties_service.SPECIALTY_NEEDS,
-        reserved_needs=specialties_service.RESERVED_NEEDS,
-    )
 
 
 @router.get(

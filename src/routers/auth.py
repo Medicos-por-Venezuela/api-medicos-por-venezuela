@@ -60,7 +60,13 @@ async def me_permissions(
 ) -> PrincipalPermissionsResponse:
     """Roles y permisos efectivos (unión de todos sus roles activos) del titular del
     JWT — para que el cliente condicione la UI sin adivinar a partir del `role`
-    legado de `GET /auth/me` (que es un único valor, no el set RBAC real)."""
+    legado de `GET /auth/me` (que es un único valor, no el set RBAC real).
+
+    Un médico cuya credencial aún no está verificada llega con `permissions` vacío y
+    `credential_verified: false`: tiene el rol pero no puede atender hasta que el SACS/FPV
+    valide su cédula o un admin apruebe su ficha."""
     return PrincipalPermissionsResponse(
-        roles=sorted(principal.roles), permissions=sorted(principal.permissions)
+        roles=sorted(principal.roles),
+        permissions=sorted(principal.permissions),
+        credential_verified=principal.credential_verified,
     )

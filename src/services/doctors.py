@@ -24,6 +24,7 @@ from src.schemas.doctor import DoctorCreate, DoctorMeResponse, DoctorSelfUpdate,
 from src.services import audit
 from src.services import psicologo as psicologo_service
 from src.services import sacs as sacs_service
+from src.services import specialties as specialties_service
 
 # Roles de `users` que corresponden a un médico (legacy `specialist` -> doctor).
 _DOCTOR_PROFILE_ROLES = {"doctor", "specialist"}
@@ -31,6 +32,7 @@ _DOCTOR_PROFILE_ROLES = {"doctor", "specialist"}
 # Ventana de "online" por last_seen_at (< 3 min). La reutiliza services/stats.py como única fuente
 # de verdad del KPI doctors_online del dashboard admin (el pool de médicos ya usa Presence).
 ONLINE_WINDOW = timedelta(minutes=3)
+
 
 def _normalize(text: str) -> str:
     """minúsculas y sin acentos: 'Médico' -> 'medico', 'Psicólogo' -> 'psicologo'."""
@@ -91,15 +93,44 @@ async def _sync_user_from_doctor(session: AsyncSession, doctor: Doctor) -> None:
     user = await session.get(Profile, doctor.user_id)
     if user is None:
         return
-    specialty_name = None
-    if doctor.specialty_id:
-        specialty_name = await session.scalar(
-            select(Specialty.name).where(Specialty.id == doctor.specialty_id)
-        )
-    user.specialty = specialty_name
+    # La FK manda; el nombre es su copia desnormalizada. Nunca uno sin el otro.
+    user.specialty_id = doctor.specialty_id
+    user.specialty = await specialties_service.name_for_id(session, doctor.specialty_id)
     user.country = doctor.country_of_residence
     user.medical_license = doctor.license
     user.whatsapp_number = doctor.phone
+
+
+async def has_valid_credential(session: AsyncSession, user_id: uuid.UUID) -> bool:
+    """El médico está habilitado para atender: tiene ficha activa en `doctors` con la
+    credencial verificada Y los datos que la sustentan (cédula + licencia).
+
+    Es el gate de acceso de los médicos (lo consulta `get_current_principal`): sin esto
+    la cuenta conserva su rol pero pierde TODOS los permisos, igual que una revocada.
+    Cubre los tres casos de "no debería estar atendiendo":
+      - sin ficha (cuenta de Google que nunca completó su registro),
+      - ficha con `verified=false` (el SACS/FPV la rechazó o no respondió — fail-closed),
+      - ficha marcada verificada pero sin cédula o sin licencia (backfill legacy).
+    `status == 1` excluye además al que se dio de baja (0) y al expulsado (2).
+
+    Se vuelve a `true` cuando el SACS/FPV valida la cédula (al registrarse o al corregirla
+    en `PATCH /doctors/me`) o cuando un admin aprueba la ficha a mano
+    (`PATCH /doctors/{id}` con `verified=true`, que queda en `audit_log`).
+    """
+    stmt = (
+        select(Doctor.id)
+        .where(
+            Doctor.user_id == user_id,
+            Doctor.deleted_at.is_(None),
+            Doctor.status == 1,
+            Doctor.verified.is_(True),
+            Doctor.cedula.is_not(None),
+            Doctor.license.is_not(None),
+            func.btrim(Doctor.license) != "",
+        )
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none() is not None
 
 
 async def list_doctors(
@@ -324,12 +355,11 @@ async def _my_doctor_profile(session: AsyncSession, user_id: uuid.UUID) -> Profi
     return profile
 
 
-def _me_from_doctor(
-    user_id: uuid.UUID,
-    doctor: Doctor,
-    specialty_name: str | None,
-    professional_type_name: str | None,
+async def _me_from_doctor_row(
+    session: AsyncSession, user_id: uuid.UUID, doctor: Doctor
 ) -> DoctorMeResponse:
+    """Perfil propio a partir de la ficha `doctors`, resolviendo los nombres de especialidad
+    y tipo profesional."""
     return DoctorMeResponse(
         source="doctor",
         user_id=user_id,
@@ -338,22 +368,10 @@ def _me_from_doctor(
         full_name=doctor.full_name,
         license=doctor.license,
         specialty_id=doctor.specialty_id,
-        specialty=specialty_name,
+        specialty=await _specialty_name(session, doctor.specialty_id),
         professional_type_id=doctor.professional_type_id,
-        professional_type=professional_type_name,
+        professional_type=await _professional_type_name(session, doctor.professional_type_id),
         verified=doctor.verified,
-    )
-
-
-async def _me_from_doctor_row(
-    session: AsyncSession, user_id: uuid.UUID, doctor: Doctor
-) -> DoctorMeResponse:
-    """`_me_from_doctor` resolviendo los nombres de especialidad y tipo profesional."""
-    return _me_from_doctor(
-        user_id,
-        doctor,
-        await _specialty_name(session, doctor.specialty_id),
-        await _professional_type_name(session, doctor.professional_type_id),
     )
 
 
@@ -457,6 +475,7 @@ async def _update_my_profile_row(
     if "license" in fields:
         profile.medical_license = fields["license"]
     if "specialty_id" in fields:
+        profile.specialty_id = fields["specialty_id"]
         profile.specialty = await _specialty_name(session, fields["specialty_id"])
     await session.commit()
     await session.refresh(profile)

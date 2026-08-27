@@ -20,12 +20,16 @@ from src.core.config import settings
 from src.db.session import get_db
 from src.models.profile import Profile
 from src.services import authz
+from src.services import doctors as doctors_service
 
 logger = logging.getLogger("mpv.api")
 
 # Roles RBAC con acceso de staff / admin.
 STAFF_ROLES = {"doctor", "admin", "super_admin"}
 ADMIN_ROLES = {"admin", "super_admin"}
+# Roles que ejercen como médico y por tanto deben tener credencial verificada para operar
+# (legacy `specialist` incluido). Un admin NO depende de una ficha en `doctors`.
+DOCTOR_ROLES = {"doctor", "specialist"}
 
 # Prioridad para colapsar el multi-rol a UN rol "efectivo" (el más alto gana): lo usa
 # /auth/me para que un dual doctor+super_admin se presente como super_admin, aunque el
@@ -36,6 +40,7 @@ _ROLE_PRIORITY = ("super_admin", "admin", "doctor", "specialist", "patient")
 def effective_role(roles: frozenset[str]) -> str | None:
     """El rol de mayor prioridad del set RBAC efectivo, o None si el set está vacío."""
     return next((r for r in _ROLE_PRIORITY if r in roles), None)
+
 
 # auto_error=False: gestionamos nosotros el 401 (mensaje uniforme).
 _bearer = HTTPBearer(auto_error=False)
@@ -49,13 +54,24 @@ class Principal(BaseModel):
     role: str  # profiles.role (legado; se conserva por compatibilidad)
     active: bool
     verified: bool
-    specialty: str | None = None
+    specialty_id: uuid.UUID | None = None  # FK al catálogo: con esto se resuelven las reglas
+    specialty: str | None = None  # nombre desnormalizado, solo para mostrar
     roles: frozenset[str] = frozenset()  # roles RBAC efectivos (user_roles o fallback)
     permissions: frozenset[str] = frozenset()  # permisos efectivos (unión de sus roles)
+    # Médicos: su ficha en `doctors` está verificada y completa (ver
+    # `doctors.has_valid_credential`). False = registrado pero SIN habilitar para atender,
+    # a la espera de que el SACS/FPV valide su cédula o de que un admin lo apruebe.
+    # Para roles que no ejercen como médico (paciente, admin) es siempre True: no aplica.
+    credential_verified: bool = True
 
     @property
     def is_staff(self) -> bool:
-        return bool(self.roles & STAFF_ROLES) and self.active and self.verified
+        return (
+            bool(self.roles & STAFF_ROLES)
+            and self.active
+            and self.verified
+            and self.credential_verified
+        )
 
     @property
     def is_admin(self) -> bool:
@@ -63,6 +79,8 @@ class Principal(BaseModel):
 
     def has_permission(self, code: str) -> bool:
         # Un usuario revocado (active=false) pierde TODOS los permisos al instante.
+        # El médico sin credencial habilitada llega ya con `permissions` vacío (se le
+        # vacía al construir el Principal), así que no hace falta comprobarlo aquí.
         return self.active and code in self.permissions
 
 
@@ -148,15 +166,27 @@ async def get_current_principal(
             detail="No existe un perfil para este usuario.",
         )
     roles, permissions = await authz.load_authz(db, profile.id, profile.role)
+    # Gate de credencial médica: quien ejerce como médico solo opera si su ficha en
+    # `doctors` está verificada y completa. Si no, conserva el rol (para que el frontend
+    # sepa qué es y pueda mandarlo a completar su cédula) pero se queda SIN permisos —
+    # mismo efecto que una cuenta revocada. Un admin no depende de tener ficha.
+    credential_verified = True
+    if roles & DOCTOR_ROLES and not roles & ADMIN_ROLES:
+        credential_verified = await doctors_service.has_valid_credential(db, profile.id)
+        if not credential_verified:
+            logger.warning("SEC:doctor_unverified user_id=%s", profile.id)
+            permissions = frozenset()
     return Principal(
         id=profile.id,
         email=profile.email,
         role=profile.role,
         active=profile.active,
         verified=profile.verified,
+        specialty_id=profile.specialty_id,
         specialty=profile.specialty,
         roles=roles,
         permissions=permissions,
+        credential_verified=credential_verified,
     )
 
 
@@ -174,10 +204,28 @@ async def get_optional_principal(
     return await get_current_principal(credentials, db)
 
 
+def _forbidden_if_credential_pending(principal: Principal) -> None:
+    """403 con mensaje de dominio si el médico aún no está habilitado para atender.
+
+    Se comprueba ANTES del permiso/rol para no devolver un "no tienes permiso" genérico a
+    quien sí tiene el rol correcto y solo le falta la aprobación: el frontend distingue el
+    caso por este 403 y muestra el estado "pendiente de verificación"."""
+    if not principal.credential_verified:
+        logger.warning("SEC:forbidden user_id=%s reason=credential_pending", principal.id)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Tu credencial profesional aún no está verificada. Completa tu cédula y "
+                "licencia, o espera la aprobación de un administrador."
+            ),
+        )
+
+
 async def require_staff(
     principal: Principal = Depends(get_current_principal),
 ) -> Principal:
     """Exige rol de staff activo y verificado (doctor/specialist/admin/super_admin)."""
+    _forbidden_if_credential_pending(principal)
     if not principal.is_staff:
         logger.warning(
             "SEC:forbidden user_id=%s role=%s active=%s",
@@ -217,6 +265,7 @@ def require_permission(code: str):
     """
 
     async def _require(principal: Principal = Depends(get_current_principal)) -> Principal:
+        _forbidden_if_credential_pending(principal)
         if not principal.has_permission(code):
             logger.warning("SEC:forbidden user_id=%s missing_perm=%s", principal.id, code)
             raise HTTPException(

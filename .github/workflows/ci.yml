@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+    # `dev` es la rama de integración: todo entra por PR ahí y solo después va a `main`.
+    branches: [main, dev]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # `--locked`: instala EXACTAMENTE lo que dice `uv.lock` y falla si el lock no está al día
+      # con pyproject.toml. Sin él, cada corrida resolvía por su cuenta y el resultado dependía
+      # de qué versiones hubiera publicadas ese día — pasó de verdad: el runner cogió ruff 0.16.3
+      # mientras en local había 0.15.20, y el mismo comando daba veredictos distintos.
+      # Si este paso falla por el lock, la solución es correr `uv lock` y commitear el resultado.
+      #
+      # `--extra dev`: ruff y pytest están en `[project.optional-dependencies] dev`, y `uv sync`
+      # a secas NO instala extras — solo las dependencias de runtime.
+      - name: Instalar dependencias
+        run: uv sync --locked --extra dev
+
+      - name: Ruff (lint)
+        run: uv run ruff check .
+
+      - name: Ruff (formato)
+        run: uv run ruff format --check .
+
+      # No corre la suite: solo IMPORTA todos los módulos de test y src, y arma el árbol de
+      # pruebas. Es barato y sin base de datos, y aun así atrapa lo que más se rompe entre PRs:
+      # imports rotos, errores de sintaxis, fixtures que ya no existen y firmas de helpers que
+      # cambiaron. Debe recoger los 269 tests.
+      - name: Pytest (colección, sin base de datos)
+        run: uv run pytest --collect-only -q --no-cov
+
+  # ⚠️ NO hay job que EJECUTE la suite, y no es un olvido.
+  #
+  # Los tests necesitan Postgres. Se probó (2026-08-13) levantar uno vacío y aplicar las 38
+  # migraciones: aplican TODAS y correctamente. Lo que falla es la suite contra ese esquema.
+  #
+  # El motivo NO es que las migraciones estén mal — reproducen el esquema de producción bien.
+  # Es al revés: el entorno LOCAL no lo reproduce. `backup_supabase.sh` vuelca solo
+  # `--schema=public`, así que el dump no trae `auth`, y `load_local.sh` restaura con
+  # `--disable-triggers` justamente porque las FKs hacia `auth.users` no se pueden recrear.
+  # Resultado: la base local NO tiene `profiles_id_fkey` (public.users.id -> auth.users.id),
+  # que producción SÍ tiene (está en supabase_schema.sql, que es lo que creó prod).
+  #
+  # Y ahí está el problema real: `make_profile()` inserta en `public.users` con un uuid propio y
+  # sin fila en `auth.users`. Eso pasa en local porque le falta la FK, y falla contra un esquema
+  # fiel — 196 errores de ForeignKeyViolation. Es decir, la suite está verde gracias a un HUECO
+  # del entorno local, no porque el código lo aguante contra el esquema de verdad.
+  #
+  # Antes de meter la suite en CI hay que decidir qué hacer con eso: que los helpers de test creen
+  # su fila en `auth.users`, o asumir que local y CI corren sin esa FK a propósito y dejarlo
+  # documentado. Corrigiendo solo esa diferencia quedaban 67 fallos más sin diagnosticar, que
+  # pueden ser de la misma familia.
+  #
+  # Mientras tanto la suite se corre en local:
+  #   uv run pytest --cov=src --cov-report=term-missing --asyncio-mode=auto
+  # Referencia al día de hoy: 269 passed / 0 failed, cobertura 96%.

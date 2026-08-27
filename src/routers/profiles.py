@@ -63,8 +63,13 @@ async def list_profiles(
         created_from=created_from,
         created_to=created_to,
     )
+    # `doctor_verified` no sale del ORM (viene del LEFT JOIN), así que se inyecta tras validar.
     return ProfileListResponse(
-        items=[ProfileResponse.model_validate(p) for p in items], total=total
+        items=[
+            ProfileResponse.model_validate(p).model_copy(update={"doctor_verified": verified})
+            for p, verified in items
+        ],
+        total=total,
     )
 
 
@@ -72,7 +77,10 @@ async def list_profiles(
     "/me/finalize-role",
     response_model=ProfileResponse,
     summary="Finalizar el rol del usuario autenticado (patient/doctor)",
-    responses={400: {"description": "Rol inválido o ya elegido."}},
+    responses={
+        400: {"description": "Rol inválido o ya elegido."},
+        403: {"description": "Cuenta revocada (active=false)."},
+    },
 )
 async def finalize_role(
     payload: ProfileFinalizeRoleRequest,
@@ -84,7 +92,7 @@ async def finalize_role(
         db,
         principal.id,
         role=payload.role,
-        specialty=payload.specialty,
+        specialty_id=payload.specialty_id,
         country=payload.country,
         medical_license=payload.medical_license,
         whatsapp_number=payload.whatsapp_number,

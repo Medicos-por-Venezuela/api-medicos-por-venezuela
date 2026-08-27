@@ -4,8 +4,11 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import jwt
+from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
+from src.models.doctor import Doctor
 from src.models.profile import Profile
 
 
@@ -27,7 +30,10 @@ def auth_headers(sub: uuid.UUID | str) -> dict[str, str]:
 
 
 def make_profile(role: str = "doctor", specialty: str | None = None) -> Profile:
-    """Crea (sin persistir) un perfil de staff activo y verificado para pruebas."""
+    """Crea (sin persistir) un perfil de staff activo y verificado para pruebas.
+
+    ⚠️ Para un médico esto NO basta: sin ficha habilitada en `doctors` el principal se
+    queda sin permisos (ver `doctors.has_valid_credential`). Usa `add_doctor`."""
     return Profile(
         id=uuid.uuid4(),
         full_name=f"Test {role}",
@@ -37,3 +43,51 @@ def make_profile(role: str = "doctor", specialty: str | None = None) -> Profile:
         verified=True,
         role_chosen=True,
     )
+
+
+def make_doctor_row(user_id: uuid.UUID, *, verified: bool = True, **overrides) -> Doctor:
+    """Ficha en `doctors` (sin persistir) habilitada para atender: verificada, con cédula
+    y licencia. `overrides` permite romper justo un requisito en los tests del gate."""
+    fields = {
+        # Cédula única por ficha: el índice parcial `uq_doctors_cedula_not_deleted` la exige
+        # y varios tests crean varios médicos en la misma transacción.
+        "cedula": f"V-{uuid.uuid4().int % 10**8:08d}",
+        "full_name": "Test Doctor",
+        "license": "MPPS-12345",
+        "status": 1,
+    }
+    fields.update(overrides)
+    return Doctor(user_id=user_id, verified=verified, **fields)
+
+
+async def add_doctor(
+    session: AsyncSession,
+    role: str = "doctor",
+    specialty: str | None = None,
+    *,
+    verified: bool = True,
+    **doctor_overrides,
+) -> Profile:
+    """Persiste un médico COMPLETO: su cuenta en `users` + su ficha habilitada en `doctors`.
+
+    Es lo que hace falta para que un JWT de médico pase el gate de credencial y conserve
+    sus permisos. Los `doctor_overrides` (o `verified=False`) sirven para construir el
+    médico *no* habilitado en los tests del propio gate."""
+    profile = make_profile(role=role, specialty=specialty)
+    session.add(profile)
+    await session.flush()
+    session.add(make_doctor_row(profile.id, verified=verified, **doctor_overrides))
+    await session.flush()
+    return profile
+
+
+async def any_specialty_id(client: AsyncClient) -> str:
+    """Id de una especialidad del catálogo, para crear consultas en las pruebas.
+
+    `specialty_id` es obligatorio en `ConsultationCreate` (esa columna ES el matching de la cola),
+    así que ya no se puede crear una consulta sin él. Se excluye salud mental a propósito: un caso
+    psi solo lo puede tomar Psicología/Psiquiatría, y la mayoría de las pruebas usan un médico sin
+    especialidad, así que un id psi les cambiaría la elegibilidad sin que eso sea lo que prueban.
+    """
+    resp = await client.get("/api/v1/specialties")
+    return next(s["id"] for s in resp.json() if s["name"] not in ("Psicología", "Psiquiatría"))

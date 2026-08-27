@@ -3,6 +3,6 @@
   "private": true,
   "description": "Solo para pinnear el Supabase CLI (repo Python; no hay build de Node aquí). Uso: npx supabase <comando>.",
   "devDependencies": {
-    "supabase": "2.109.0"
+    "supabase": "2.111.0"
   }
 }

@@ -71,6 +71,7 @@ async def set_prefs(session: AsyncSession, user_id, prefs: dict) -> dict:
     await session.commit()
     return user.notification_prefs
 
+
 # ponytail: Venezuela = UTC-4 fijo (sin DST desde 2016) → offset constante; así el formateo de la
 # fecha en los correos no depende de tzdata/zoneinfo (que en Windows habría que instalar aparte).
 _VET = timezone(timedelta(hours=-4))
@@ -130,9 +131,7 @@ async def _doctor_name(session: AsyncSession, doctor_id) -> str | None:
     return await session.scalar(select(Profile.full_name).where(Profile.id == doctor_id))
 
 
-async def appointment_email_args(
-    session: AsyncSession, consultation: Consultation
-) -> dict | None:
+async def appointment_email_args(session: AsyncSession, consultation: Consultation) -> dict | None:
     """Args para `send_appointment_email` de una cita recién agendada, o None si el paciente no
     tiene email. Se resuelve DENTRO del request (sesión viva) para pasar valores planos al
     BackgroundTask (que corre tras cerrar la request)."""
@@ -187,43 +186,40 @@ async def send_due_reminders(session: AsyncSession, window_minutes: int = 30) ->
     spam); el correo confiable es el 'al agendar', esto es el recordatorio complementario."""
     now = datetime.now(UTC)
     horizon = now + timedelta(minutes=window_minutes)
-    rows = (
-        await session.execute(
-            select(
-                Consultation,
-                Patient.email.label("email"),
-                Patient.full_name.label("patient_name"),
-                Profile.full_name.label("doctor_name"),
-                Profile.email.label("doctor_email"),
-                Profile.notification_prefs.label("doctor_prefs"),
-            )
-            .outerjoin(Patient, Consultation.patient_id == Patient.id)
-            .outerjoin(Profile, Consultation.assigned_doctor_id == Profile.id)
-            .where(
-                Consultation.status == "scheduled",
-                Consultation.scheduled_at.isnot(None),
-                Consultation.scheduled_at >= now,
-                Consultation.scheduled_at <= horizon,
-                Consultation.reminder_sent_at.is_(None),
-            )
+    due_stmt = (
+        select(
+            Consultation,
+            Patient.email.label("email"),
+            Patient.full_name.label("patient_name"),
+            Profile.full_name.label("doctor_name"),
+            Profile.email.label("doctor_email"),
+            Profile.notification_prefs.label("doctor_prefs"),
         )
-    ).all()
+        .outerjoin(Patient, Consultation.patient_id == Patient.id)
+        .outerjoin(Profile, Consultation.assigned_doctor_id == Profile.id)
+        .where(
+            Consultation.status == "scheduled",
+            Consultation.scheduled_at.isnot(None),
+            Consultation.scheduled_at >= now,
+            Consultation.scheduled_at <= horizon,
+            Consultation.reminder_sent_at.is_(None),
+        )
+    )
+    rows = (await session.execute(due_stmt)).all()
     sent = 0
     for row in rows:
         cons = row.Consultation
         cons.reminder_sent_at = now  # idempotencia: marcar aunque no tenga email / el envío falle
         # Al paciente (siempre que tenga email).
-        if row.email:
-            ok = await send_appointment_email(
-                row.email,
-                row.patient_name,
-                cons.code,
-                cons.scheduled_at,
-                row.doctor_name,
-                is_reminder=True,
-            )
-            if ok:
-                sent += 1
+        if row.email and await send_appointment_email(
+            row.email,
+            row.patient_name,
+            cons.code,
+            cons.scheduled_at,
+            row.doctor_name,
+            is_reminder=True,
+        ):
+            sent += 1
         # Al médico, si tiene email y no desactivó el recordatorio por correo (opt-out).
         if row.doctor_email and should_send(row.doctor_prefs, "appointment_reminder", "email"):
             subject, text = _build_doctor_reminder(row.patient_name, cons.code, cons.scheduled_at)
