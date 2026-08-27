@@ -63,8 +63,13 @@ async def list_profiles(
         created_from=created_from,
         created_to=created_to,
     )
+    # `doctor_verified` no sale del ORM (viene del LEFT JOIN), así que se inyecta tras validar.
     return ProfileListResponse(
-        items=[ProfileResponse.model_validate(p) for p in items], total=total
+        items=[
+            ProfileResponse.model_validate(p).model_copy(update={"doctor_verified": verified})
+            for p, verified in items
+        ],
+        total=total,
     )
 
 

@@ -7,6 +7,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import BadRequestError, NotFoundError
+from src.models.doctor import Doctor
 from src.models.profile import Profile
 from src.services import audit
 from src.services import specialties as specialties_service
@@ -26,10 +27,15 @@ async def list_profiles(
     active: bool | None = None,
     created_from: date | None = None,
     created_to: date | None = None,
-) -> tuple[list[Profile], int]:
+) -> tuple[list[tuple[Profile, bool | None]], int]:
     """Perfiles filtrados + total exacto (para la tabla de médicos/usuarios del admin). Reemplaza
     el acceso directo del frontend a `users`. Filtros: uno o varios roles, estado activo/revocado,
-    rango de fechas, y búsqueda por nombre/email/especialidad. Todo con parámetros enlazados."""
+    rango de fechas, y búsqueda por nombre/email/especialidad. Todo con parámetros enlazados.
+
+    Cada fila viene con el `doctors.verified` de esa persona (o `None` si no tiene ficha de
+    médico). OJO: NO es `users.verified`, que nace `true` y ningún camino la baja — el dato real de
+    credencial, el que sale de contrastar la cédula con SACS/FPV, vive en `doctors`. La lista del
+    admin mostraba la primera y por eso pintaba a todo el mundo como verificado."""
     conditions = []
     if roles:
         conditions.append(Profile.role.in_(roles))
@@ -57,10 +63,28 @@ async def list_profiles(
     base = select(Profile)
     if conditions:
         base = base.where(*conditions)
+    # El total se sigue contando SIN el join: cuenta perfiles, no filas de doctors.
     total = await session.scalar(select(func.count()).select_from(base.subquery())) or 0
-    stmt = base.order_by(Profile.created_at.desc()).offset(skip).limit(limit)
-    items = list((await session.execute(stmt)).scalars().all())
-    return items, total
+
+    # LEFT JOIN en la misma consulta paginada: leer doctors.verified con un SELECT por fila sería
+    # un N+1 en la pantalla que más usa el admin (~3500 usuarios).
+    #
+    # `deleted_at.is_(None)` va en el ON, no en el WHERE, y no es opcional: el índice único de
+    # doctors.user_id es PARCIAL (uq_doctors_user_id_not_deleted, WHERE deleted_at IS NULL AND
+    # user_id IS NOT NULL). Sin ese filtro, una ficha borrada duplicaría la fila del usuario y
+    # descuadraría la página contra el total. En el WHERE además convertiría el LEFT JOIN en INNER
+    # y haría desaparecer a los que no son médicos.
+    stmt = (
+        select(Profile, Doctor.verified)
+        .outerjoin(Doctor, (Doctor.user_id == Profile.id) & (Doctor.deleted_at.is_(None)))
+        .order_by(Profile.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    if conditions:
+        stmt = stmt.where(*conditions)
+    rows = (await session.execute(stmt)).all()
+    return [(profile, doctor_verified) for profile, doctor_verified in rows], total
 
 
 async def get_profile(session: AsyncSession, profile_id: uuid.UUID) -> Profile:
