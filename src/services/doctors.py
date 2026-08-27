@@ -32,6 +32,7 @@ _DOCTOR_PROFILE_ROLES = {"doctor", "specialist"}
 # de verdad del KPI doctors_online del dashboard admin (el pool de médicos ya usa Presence).
 ONLINE_WINDOW = timedelta(minutes=3)
 
+
 def _normalize(text: str) -> str:
     """minúsculas y sin acentos: 'Médico' -> 'medico', 'Psicólogo' -> 'psicologo'."""
     decomposed = unicodedata.normalize("NFD", text.lower())
@@ -100,6 +101,38 @@ async def _sync_user_from_doctor(session: AsyncSession, doctor: Doctor) -> None:
     user.country = doctor.country_of_residence
     user.medical_license = doctor.license
     user.whatsapp_number = doctor.phone
+
+
+async def has_valid_credential(session: AsyncSession, user_id: uuid.UUID) -> bool:
+    """El médico está habilitado para atender: tiene ficha activa en `doctors` con la
+    credencial verificada Y los datos que la sustentan (cédula + licencia).
+
+    Es el gate de acceso de los médicos (lo consulta `get_current_principal`): sin esto
+    la cuenta conserva su rol pero pierde TODOS los permisos, igual que una revocada.
+    Cubre los tres casos de "no debería estar atendiendo":
+      - sin ficha (cuenta de Google que nunca completó su registro),
+      - ficha con `verified=false` (el SACS/FPV la rechazó o no respondió — fail-closed),
+      - ficha marcada verificada pero sin cédula o sin licencia (backfill legacy).
+    `status == 1` excluye además al que se dio de baja (0) y al expulsado (2).
+
+    Se vuelve a `true` cuando el SACS/FPV valida la cédula (al registrarse o al corregirla
+    en `PATCH /doctors/me`) o cuando un admin aprueba la ficha a mano
+    (`PATCH /doctors/{id}` con `verified=true`, que queda en `audit_log`).
+    """
+    stmt = (
+        select(Doctor.id)
+        .where(
+            Doctor.user_id == user_id,
+            Doctor.deleted_at.is_(None),
+            Doctor.status == 1,
+            Doctor.verified.is_(True),
+            Doctor.cedula.is_not(None),
+            Doctor.license.is_not(None),
+            func.btrim(Doctor.license) != "",
+        )
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none() is not None
 
 
 async def list_doctors(

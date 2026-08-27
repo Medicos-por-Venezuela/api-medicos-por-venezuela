@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.models.consultation import Consultation
 from src.models.patient import Patient
 from src.services import notifications
-from tests._helpers import auth_headers, make_profile
+from tests._helpers import add_doctor, auth_headers
 
 PREFIX = "/api/v1"
 
@@ -41,9 +41,7 @@ async def _open_consultation(client: AsyncClient, doctor_id) -> str:
 async def test_schedule_follow_up_closes_parent_and_creates_child(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    doc = make_profile(role="doctor")
-    db_session.add(doc)
-    await db_session.flush()
+    doc = await add_doctor(db_session)
     parent_cid = await _open_consultation(client, doc.id)
 
     when = (datetime.now(UTC) + timedelta(days=2)).isoformat()
@@ -70,9 +68,7 @@ async def test_schedule_follow_up_closes_parent_and_creates_child(
 async def test_schedule_follow_up_rejects_past_date(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    doc = make_profile(role="doctor")
-    db_session.add(doc)
-    await db_session.flush()
+    doc = await add_doctor(db_session)
     cid = await _open_consultation(client, doc.id)
     past = (datetime.now(UTC) - timedelta(days=1)).isoformat()
     resp = await client.post(
@@ -86,9 +82,7 @@ async def test_schedule_follow_up_rejects_past_date(
 async def test_agenda_lists_doctor_scheduled(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    doc = make_profile(role="doctor")
-    db_session.add(doc)
-    await db_session.flush()
+    doc = await add_doctor(db_session)
     cid = await _open_consultation(client, doc.id)
     when = (datetime.now(UTC) + timedelta(days=3)).isoformat()
     child = (
@@ -109,9 +103,7 @@ async def test_agenda_lists_doctor_scheduled(
 async def test_chain_returns_parent_and_child(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    doc = make_profile(role="doctor")
-    db_session.add(doc)
-    await db_session.flush()
+    doc = await add_doctor(db_session)
     parent_cid = await _open_consultation(client, doc.id)
     when = (datetime.now(UTC) + timedelta(days=1)).isoformat()
     child = (
@@ -134,10 +126,8 @@ async def test_chain_returns_parent_and_child(
 async def test_refer_hands_off_parent_and_schedules_for_specialist(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    doc = make_profile(role="doctor")
-    specialist = make_profile(role="specialist")
-    db_session.add_all([doc, specialist])
-    await db_session.flush()
+    doc = await add_doctor(db_session)
+    specialist = await add_doctor(db_session, role="specialist")
     parent_cid = await _open_consultation(client, doc.id)
 
     when = (datetime.now(UTC) + timedelta(days=2)).isoformat()
@@ -174,9 +164,7 @@ async def test_refer_hands_off_parent_and_schedules_for_specialist(
 
 
 async def test_refer_rejects_self(client: AsyncClient, db_session: AsyncSession) -> None:
-    doc = make_profile(role="doctor")
-    db_session.add(doc)
-    await db_session.flush()
+    doc = await add_doctor(db_session)
     cid = await _open_consultation(client, doc.id)
     when = (datetime.now(UTC) + timedelta(days=1)).isoformat()
     resp = await client.post(
@@ -201,9 +189,7 @@ async def _schedule_in(client, doc, cid, delta) -> dict:
 async def test_send_due_reminders_marks_and_is_idempotent(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    doc = make_profile(role="doctor")
-    db_session.add(doc)
-    await db_session.flush()
+    doc = await add_doctor(db_session)
     cid = await _open_consultation(client, doc.id)
     child = await _schedule_in(client, doc, cid, timedelta(minutes=10))  # dentro de la ventana
 
@@ -228,9 +214,7 @@ async def test_send_due_reminders_marks_and_is_idempotent(
 async def test_send_due_reminders_skips_far_future(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    doc = make_profile(role="doctor")
-    db_session.add(doc)
-    await db_session.flush()
+    doc = await add_doctor(db_session)
     cid = await _open_consultation(client, doc.id)
     child = await _schedule_in(client, doc, cid, timedelta(hours=5))  # fuera de la ventana
 
@@ -243,9 +227,7 @@ async def test_send_due_reminders_skips_far_future(
 async def test_appointment_email_args_needs_patient_email(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    doc = make_profile(role="doctor")
-    db_session.add(doc)
-    await db_session.flush()
+    doc = await add_doctor(db_session)
     cid = await _open_consultation(client, doc.id)
     child = await _schedule_in(client, doc, cid, timedelta(days=1))
     row = await db_session.get(Consultation, uuid.UUID(child["id"]))
@@ -264,9 +246,7 @@ async def test_appointment_email_args_needs_patient_email(
 
 
 async def test_close_saves_signature(client: AsyncClient, db_session: AsyncSession) -> None:
-    doc = make_profile(role="doctor")
-    db_session.add(doc)
-    await db_session.flush()
+    doc = await add_doctor(db_session)
     cid = await _open_consultation(client, doc.id)
     sig = "data:image/png;base64,SIGNATURE_DATA"
     resp = await client.post(
@@ -283,9 +263,7 @@ async def test_close_saves_signature(client: AsyncClient, db_session: AsyncSessi
 async def test_detail_has_patient_and_events_have_author(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    doc = make_profile(role="doctor")
-    db_session.add(doc)
-    await db_session.flush()
+    doc = await add_doctor(db_session)
     cid = await _open_consultation(client, doc.id)
 
     # GET /{id}: el detalle trae el paciente anidado (para el panel, sin leer `patients` directo).

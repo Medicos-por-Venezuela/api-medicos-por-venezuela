@@ -18,15 +18,19 @@ from sqlalchemy import delete, select
 
 from src.db.session import AsyncSessionLocal
 from src.models.consultation import Consultation
+from src.models.doctor import Doctor
 from src.models.patient import Patient
 from src.models.profile import Profile
-from tests._helpers import auth_headers, make_profile
+from tests._helpers import auth_headers, make_doctor_row, make_profile
 
 PREFIX = "/api/v1"
 
 
 async def _seed() -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
-    """Crea (committed) un médico staff + paciente + consulta en espera."""
+    """Crea (committed) un médico staff + paciente + consulta en espera.
+
+    El médico va con su ficha habilitada en `doctors`: sin ella el gate de credencial
+    lo deja sin permisos y la carrera por la cola ni siquiera llegaría al lock."""
     async with AsyncSessionLocal() as s:
         doctor = make_profile(role="doctor", specialty="Medicina general")
         patient = Patient(
@@ -37,6 +41,7 @@ async def _seed() -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
         )
         s.add_all([doctor, patient])
         await s.flush()
+        s.add(make_doctor_row(doctor.id))
         consultation = Consultation(
             code=f"TEST-{uuid.uuid4().hex[:10]}",
             patient_id=patient.id,
@@ -53,6 +58,7 @@ async def _cleanup(
     async with AsyncSessionLocal() as s:
         await s.execute(delete(Consultation).where(Consultation.id == consultation_id))
         await s.execute(delete(Patient).where(Patient.id == patient_id))
+        await s.execute(delete(Doctor).where(Doctor.user_id == doctor_id))
         await s.execute(delete(Profile).where(Profile.id == doctor_id))
         await s.commit()
 

@@ -2,8 +2,13 @@
 
 Autorización:
 - Registrar (`POST`): público (auto-registro). El backend verifica la credencial
-  contra SACS/FPV y fija `verified`; ese es el control real de acceso.
-- Leer: staff. Editar/eliminar: admin.
+  contra SACS/FPV y fija `verified`; ese es el control real de acceso: mientras la
+  ficha no esté verificada y completa (cédula + licencia), el médico conserva su rol
+  pero se queda SIN permisos y no puede atender (ver `has_valid_credential`).
+- Leer: staff. Editar/eliminar: admin — `PATCH /{id}` con `verified: true` es además
+  la vía de **aprobación manual** cuando el SACS/FPV no valida al médico.
+- `/me` (ver y completar la ficha propia) queda fuera del gate a propósito: es como el
+  médico no verificado sale del limbo.
 """
 
 import uuid
@@ -203,7 +208,7 @@ async def get_doctor(
 @router.patch(
     "/{doctor_id}",
     response_model=DoctorResponse,
-    summary="Actualizar médico (admin)",
+    summary="Actualizar médico (admin) · aprobar credencial con verified=true",
     responses=_NOT_FOUND,
 )
 async def update_doctor(
@@ -212,6 +217,11 @@ async def update_doctor(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("doctors.write")),
 ) -> DoctorResponse:
+    """Edición administrativa de la ficha de un médico.
+
+    Enviar `verified: true` es la **aprobación manual**: habilita para atender al médico al
+    que el SACS/FPV no validó (queda registrado en `audit_log` como `doctor.updated` con el
+    admin que lo aprobó). No basta con esto si la ficha no tiene cédula y licencia."""
     return await doctors_service.update_doctor(db, doctor_id, payload, actor_user_id=principal.id)
 
 

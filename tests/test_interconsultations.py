@@ -7,7 +7,7 @@ paciente (nombre/cédula/teléfono/zona).
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tests._helpers import auth_headers, make_profile
+from tests._helpers import add_doctor, auth_headers
 
 PREFIX = "/api/v1"
 
@@ -55,10 +55,8 @@ async def test_la_interconsulta_se_persiste_de_verdad(
     único que los distingue: que la llamada COMMITEA. Si alguien vuelve a quitar el commit, esto
     se pone rojo aunque la respuesta siga siendo un 201 impecable.
     """
-    attending = make_profile(role="doctor")
-    invited = make_profile(role="doctor")
-    db_session.add_all([attending, invited])
-    await db_session.flush()
+    attending = await add_doctor(db_session)
+    invited = await add_doctor(db_session)
     cid = await _consultation_with_patient(client)
     await _claim(client, cid, attending.id)
 
@@ -90,10 +88,8 @@ async def test_la_interconsulta_se_persiste_de_verdad(
 async def test_create_and_invitee_limited_view(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    attending = make_profile(role="doctor")
-    invited = make_profile(role="doctor")
-    db_session.add_all([attending, invited])
-    await db_session.flush()
+    attending = await add_doctor(db_session)
+    invited = await add_doctor(db_session)
 
     cid = await _consultation_with_patient(client)
     await _claim(client, cid, attending.id)
@@ -128,10 +124,8 @@ async def test_create_and_invitee_limited_view(
 async def test_one_interconsultation_per_consultation(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    attending = make_profile(role="doctor")
-    invited = make_profile(role="doctor")
-    db_session.add_all([attending, invited])
-    await db_session.flush()
+    attending = await add_doctor(db_session)
+    invited = await add_doctor(db_session)
     cid = await _consultation_with_patient(client)
     await _claim(client, cid, attending.id)
 
@@ -152,11 +146,9 @@ async def test_one_interconsultation_per_consultation(
 async def test_only_attending_doctor_can_create(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    attending = make_profile(role="doctor")
-    other = make_profile(role="doctor")
-    invited = make_profile(role="doctor")
-    db_session.add_all([attending, other, invited])
-    await db_session.flush()
+    attending = await add_doctor(db_session)
+    other = await add_doctor(db_session)
+    invited = await add_doctor(db_session)
     cid = await _consultation_with_patient(client)
     await _claim(client, cid, attending.id)
 
@@ -169,9 +161,7 @@ async def test_only_attending_doctor_can_create(
 
 
 async def test_cannot_invite_self(client: AsyncClient, db_session: AsyncSession) -> None:
-    attending = make_profile(role="doctor")
-    db_session.add(attending)
-    await db_session.flush()
+    attending = await add_doctor(db_session)
     cid = await _consultation_with_patient(client)
     await _claim(client, cid, attending.id)
 

@@ -72,7 +72,10 @@ async def list_profiles(
     "/me/finalize-role",
     response_model=ProfileResponse,
     summary="Finalizar el rol del usuario autenticado (patient/doctor)",
-    responses={400: {"description": "Rol inválido o ya elegido."}},
+    responses={
+        400: {"description": "Rol inválido o ya elegido."},
+        403: {"description": "Cuenta revocada (active=false)."},
+    },
 )
 async def finalize_role(
     payload: ProfileFinalizeRoleRequest,

@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.profile import Profile
 from src.services import calendar as calendar_service
-from tests._helpers import auth_headers, make_profile
+from tests._helpers import add_doctor, auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -44,27 +44,21 @@ def _token_from_url(ics_url: str) -> str:
 async def test_calendar_url_generates_and_persists_token(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    doc = make_profile(role="doctor")
-    db_session.add(doc)
-    await db_session.flush()
+    doc = await add_doctor(db_session)
     r = await client.get(f"{PREFIX}/agenda/calendar-url", headers=auth_headers(doc.id))
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ics_url"].endswith(".ics")
     assert body["webcal_url"].startswith("webcal://")
 
-    token = await db_session.scalar(
-        select(Profile.calendar_token).where(Profile.id == doc.id)
-    )
+    token = await db_session.scalar(select(Profile.calendar_token).where(Profile.id == doc.id))
     assert token is not None
 
 
 async def test_ics_feed_lists_scheduled_events(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    doc = make_profile(role="doctor")
-    db_session.add(doc)
-    await db_session.flush()
+    doc = await add_doctor(db_session)
     cid = await _open_consultation(client, doc.id)
     when = (datetime.now(UTC) + timedelta(days=2)).isoformat()
     child = (
@@ -75,9 +69,9 @@ async def test_ics_feed_lists_scheduled_events(
         )
     ).json()
 
-    url = (
-        await client.get(f"{PREFIX}/agenda/calendar-url", headers=auth_headers(doc.id))
-    ).json()["ics_url"]
+    url = (await client.get(f"{PREFIX}/agenda/calendar-url", headers=auth_headers(doc.id))).json()[
+        "ics_url"
+    ]
     tok = _token_from_url(url)
 
     r = await client.get(f"{PREFIX}/agenda/{tok}.ics")
@@ -90,9 +84,7 @@ async def test_ics_feed_lists_scheduled_events(
 
 
 async def test_rotate_revokes_old_token(client: AsyncClient, db_session: AsyncSession) -> None:
-    doc = make_profile(role="doctor")
-    db_session.add(doc)
-    await db_session.flush()
+    doc = await add_doctor(db_session)
     tok1 = _token_from_url(
         (await client.get(f"{PREFIX}/agenda/calendar-url", headers=auth_headers(doc.id))).json()[
             "ics_url"
@@ -100,9 +92,7 @@ async def test_rotate_revokes_old_token(client: AsyncClient, db_session: AsyncSe
     )
     tok2 = _token_from_url(
         (
-            await client.post(
-                f"{PREFIX}/agenda/calendar-url/rotate", headers=auth_headers(doc.id)
-            )
+            await client.post(f"{PREFIX}/agenda/calendar-url/rotate", headers=auth_headers(doc.id))
         ).json()["ics_url"]
     )
     assert tok1 != tok2
