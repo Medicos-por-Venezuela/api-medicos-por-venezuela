@@ -41,6 +41,15 @@ class ProfileResponse(ProfileBase):
     # si redirige a completar el perfil, sin un segundo round-trip.
     has_doctor_profile: bool = False
     doctor_cedula: str | None = None
+    # El `verified` de la ficha de médico: resultado real de contrastar la cédula con SACS (médico)
+    # o FPV (psicólogo). `None` = esta persona no tiene ficha, así que no hay credencial que
+    # verificar (un paciente, o un admin puro).
+    #
+    # Se llama `doctor_verified` y NO `verified` a propósito: este schema ya tiene un `verified`,
+    # el de `users`, que nace `true` y ningún camino la baja. Reutilizar el nombre es exactamente
+    # cómo la lista del admin acabó pintando a los 795 médicos sin cédula validada como
+    # "Verificado". Solo lo puebla GET /profiles; en /auth/me queda None.
+    doctor_verified: bool | None = None
     # Roles RBAC efectivos (user_roles; con fallback al legado si la cuenta no tiene filas).
     # En /auth/me, `role` se sobreescribe con el EFECTIVO más alto de esta lista — la columna
     # users.role es un único valor legado y puede quedarse corta (p. ej. dual doctor+super_admin).
