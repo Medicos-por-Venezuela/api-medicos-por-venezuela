@@ -24,7 +24,15 @@ class ProfileBase(BaseModel):
 class ProfileResponse(ProfileBase):
     model_config = ConfigDict(from_attributes=True)
 
+    # `str` y no `EmailStr` en la salida: FastAPI valida la respuesta, así que una sola fila con
+    # un email histórico mal formado tumbaría el listado completo con 500 (le pasó a
+    # PatientResponse). Hoy `users` está limpia, pero la validación de salida no debe poder
+    # convertir un dato viejo en una caída. La entrada la sigue validando ProfileFinalizeRole/
+    # UserCreate.
+    email: str | None = None
+
     id: uuid.UUID
+    specialty_id: uuid.UUID | None = None
     last_seen_at: datetime | None = None
     created_at: datetime
     # Contexto de médico resuelto en el mismo /auth/me (evita una segunda llamada a /doctors/me
@@ -33,6 +41,15 @@ class ProfileResponse(ProfileBase):
     # si redirige a completar el perfil, sin un segundo round-trip.
     has_doctor_profile: bool = False
     doctor_cedula: str | None = None
+    # El `verified` de la ficha de médico: resultado real de contrastar la cédula con SACS (médico)
+    # o FPV (psicólogo). `None` = esta persona no tiene ficha, así que no hay credencial que
+    # verificar (un paciente, o un admin puro).
+    #
+    # Se llama `doctor_verified` y NO `verified` a propósito: este schema ya tiene un `verified`,
+    # el de `users`, que nace `true` y ningún camino la baja. Reutilizar el nombre es exactamente
+    # cómo la lista del admin acabó pintando a los 795 médicos sin cédula validada como
+    # "Verificado". Solo lo puebla GET /profiles; en /auth/me queda None.
+    doctor_verified: bool | None = None
     # Roles RBAC efectivos (user_roles; con fallback al legado si la cuenta no tiene filas).
     # En /auth/me, `role` se sobreescribe con el EFECTIVO más alto de esta lista — la columna
     # users.role es un único valor legado y puede quedarse corta (p. ej. dual doctor+super_admin).
@@ -61,7 +78,10 @@ class ProfileFinalizeRoleRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     role: str = Field(..., pattern="^(patient|doctor)$")
-    specialty: str | None = None
+    # El id del catálogo, no el nombre: el nombre que guarda `users.specialty` lo resuelve el
+    # backend desde esta FK. Que el cliente eligiera la cadena era como entraban al sistema
+    # nombres de especialidad que el catálogo ya no tenía.
+    specialty_id: uuid.UUID | None = None
     country: str | None = None
     medical_license: str | None = None
     whatsapp_number: str | None = None

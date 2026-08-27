@@ -11,7 +11,7 @@ from src.models.consultation import Consultation
 from src.models.patient import Patient
 from src.models.profile import Profile
 from src.models.specialty import Specialty
-from tests._helpers import add_doctor, auth_headers, make_profile
+from tests._helpers import add_doctor, any_specialty_id, auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -36,7 +36,11 @@ async def test_consultation_crud_and_code_autogeneration(client: AsyncClient) ->
     # code omitido -> lo genera el trigger generate_consultation_code.
     resp = await client.post(
         f"{PREFIX}/consultations",
-        json={"patient_id": patient_id, "chief_complaint": "Dolor de cabeza"},
+        json={
+            "patient_id": patient_id,
+            "chief_complaint": "Dolor de cabeza",
+            "specialty_id": await any_specialty_id(client),
+        },
     )
     assert resp.status_code == 201, resp.text
     consultation = resp.json()
@@ -90,9 +94,12 @@ async def test_admin_pacientes_list_enrichment_and_admin_fields(
         },
     )
     patient_id = created.json()["id"]
-    cid = (await client.post(f"{PREFIX}/consultations", json={"patient_id": patient_id})).json()[
-        "id"
-    ]
+    cid = (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": patient_id, "specialty_id": await any_specialty_id(client)},
+        )
+    ).json()["id"]
 
     # La lista trae el paciente anidado con los datos que muestra/filtra la tabla admin.
     listed = await client.get(f"{PREFIX}/consultations", params={"patient_id": patient_id})
@@ -140,7 +147,10 @@ async def test_patient_view_exposes_scheduled_at(
     await db_session.flush()
     # Se crea por el endpoint (code/queued_at los pone el backend) y luego se agenda.
     cid = (
-        await client.post(f"{PREFIX}/consultations", json={"patient_id": str(patient.id)})
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": str(patient.id), "specialty_id": await any_specialty_id(client)},
+        )
     ).json()["id"]
     cons = await db_session.get(Consultation, uuid.UUID(cid))
     assert cons is not None
@@ -157,16 +167,46 @@ async def test_patient_view_exposes_scheduled_at(
 async def test_consultation_invalid_patient(client: AsyncClient) -> None:
     resp = await client.post(
         f"{PREFIX}/consultations",
-        json={"patient_id": "00000000-0000-0000-0000-000000000000"},
+        json={
+            "patient_id": "00000000-0000-0000-0000-000000000000",
+            "specialty_id": await any_specialty_id(client),
+        },
     )
     assert resp.status_code == 400
+
+
+async def test_consultation_requiere_specialty_id(client: AsyncClient) -> None:
+    """`specialty_id` es obligatorio: es la columna con la que matchea la cola.
+
+    Cuando era opcional entraban filas sin especialidad y el backend caia a un mapa de nombres
+    hardcodeado que se desincronizaba del catalogo. El mapa se elimino y las filas historicas se
+    rellenaron con una migracion, asi que la columna no puede volver a quedar vacia por la puerta
+    de entrada.
+    """
+    patient_id = await _create_patient(client)
+
+    sin_especialidad = await client.post(
+        f"{PREFIX}/consultations", json={"patient_id": patient_id}
+    )
+    assert sin_especialidad.status_code == 422, sin_especialidad.text
+
+    # Una especialidad que no existe en el catalogo tampoco pasa (400, no 500).
+    inexistente = await client.post(
+        f"{PREFIX}/consultations",
+        json={"patient_id": patient_id, "specialty_id": "00000000-0000-0000-0000-000000000000"},
+    )
+    assert inexistente.status_code == 400, inexistente.text
 
 
 async def test_consultation_invalid_status(client: AsyncClient) -> None:
     patient_id = await _create_patient(client)
     resp = await client.post(
         f"{PREFIX}/consultations",
-        json={"patient_id": patient_id, "status": "no_existe"},
+        json={
+            "patient_id": patient_id,
+            "status": "no_existe",
+            "specialty_id": await any_specialty_id(client),
+        },
     )
     assert resp.status_code == 422
 
@@ -176,12 +216,20 @@ async def test_consultation_code_is_server_generated(client: AsyncClient) -> Non
 
     # `code` no es un campo aceptado (extra="forbid"): se rechaza con 422.
     bad = await client.post(
-        f"{PREFIX}/consultations", json={"patient_id": patient_id, "code": "NO-ACEPTADO"}
+        f"{PREFIX}/consultations",
+        json={
+            "patient_id": patient_id,
+            "code": "NO-ACEPTADO",
+            "specialty_id": await any_specialty_id(client),
+        },
     )
     assert bad.status_code == 422
 
     # Sin enviar `code`, el trigger de la base genera el código automáticamente.
-    resp = await client.post(f"{PREFIX}/consultations", json={"patient_id": str(patient_id)})
+    resp = await client.post(
+        f"{PREFIX}/consultations",
+        json={"patient_id": str(patient_id), "specialty_id": await any_specialty_id(client)},
+    )
     assert resp.status_code == 201
     assert resp.json()["code"].startswith("CONS-")
 
@@ -198,9 +246,12 @@ async def test_consultation_not_found(client: AsyncClient) -> None:
 
 async def test_consultation_events(client: AsyncClient) -> None:
     patient_id = await _create_patient(client)
-    cid = (await client.post(f"{PREFIX}/consultations", json={"patient_id": patient_id})).json()[
-        "id"
-    ]
+    cid = (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": patient_id, "specialty_id": await any_specialty_id(client)},
+        )
+    ).json()["id"]
 
     # Crear evento (consultation_id coincide)
     ok = await client.post(
@@ -265,9 +316,12 @@ async def _create_waiting_consultation(client: AsyncClient) -> str:
     """Crea una consulta en espera. Sin envejecerla: el panel ya no tiene gate de 20 min, así
     que una consulta recién creada debe aparecer en la cola de inmediato (tiempo real)."""
     patient_id = await _create_patient(client)
-    return (await client.post(f"{PREFIX}/consultations", json={"patient_id": patient_id})).json()[
-        "id"
-    ]
+    return (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": patient_id, "specialty_id": await any_specialty_id(client)},
+        )
+    ).json()["id"]
 
 
 async def test_claim_es_atomico_solo_gana_un_medico(
@@ -332,13 +386,17 @@ async def test_panel_devuelve_espera_mias_y_cerradas(
     )
     # Una consulta con especialidad explícita: el panel debe traer el NOMBRE resuelto
     # (es la columna con la que matchea el médico en el frontend).
+    # La especialidad se toma DEL catálogo, sin hardcodear un nombre: los nombres se renombran
+    # (fue 'Pediatría' -> 'Pediatría y subespecialidades') y el test reventaba con StopIteration
+    # por un cambio de datos, no de comportamiento. Se excluye salud mental porque este médico
+    # no tiene especialidad y un caso psi solo lo puede tomar Psicología/Psiquiatría.
     specs = (await client.get(f"{PREFIX}/specialties")).json()
-    pediatria = next(s["id"] for s in specs if s["name"] == "Pediatría")
+    spec = next(s for s in specs if s["name"] not in ("Psicología", "Psiquiatría"))
     patient_id = await _create_patient(client)
     cid_spec = (
         await client.post(
             f"{PREFIX}/consultations",
-            json={"patient_id": patient_id, "specialty_id": pediatria},
+            json={"patient_id": patient_id, "specialty_id": spec["id"]},
         )
     ).json()["id"]
 
@@ -355,9 +413,11 @@ async def test_panel_devuelve_espera_mias_y_cerradas(
     # El paciente viene anidado (zona, síntomas para elegir el caso) pero SIN `full_name`.
     item = next(c for c in data["waiting"] if c["id"] == cid_waiting)
     assert "full_name" not in item["patient"]
-    assert item["specialty"] is None  # sin specialty_id: el matching cae al legacy
+    # `specialty_id` es obligatorio al crear, asi que el panel SIEMPRE resuelve el nombre; ya no
+    # existe el caso "sin especialidad" que caia al matching legacy.
+    assert item["specialty"] is not None
     item_spec = next(c for c in data["waiting"] if c["id"] == cid_spec)
-    assert item_spec["specialty"] == "Pediatría"
+    assert item_spec["specialty"] == spec["name"]  # el panel resuelve el NOMBRE, no el id
     # Mis consultas (ya tomadas por el médico) SÍ traen el nombre del paciente.
     mine_item = next(c for c in data["mine"] if c["id"] == cid_mine)
     assert mine_item["patient"]["full_name"] == "Paciente Consulta"
@@ -383,9 +443,12 @@ async def _consultation_assigned_to(
 ) -> str:
     """Consulta asignada a `doctor_id` (asignada por el client admin del fixture)."""
     patient_id = await _create_patient(client)
-    cid = (await client.post(f"{PREFIX}/consultations", json={"patient_id": patient_id})).json()[
-        "id"
-    ]
+    cid = (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": patient_id, "specialty_id": await any_specialty_id(client)},
+        )
+    ).json()["id"]
     assigned = await client.patch(
         f"{PREFIX}/consultations/{cid}",
         json={"status": "in_progress", "assigned_doctor_id": doctor_id},
@@ -419,9 +482,12 @@ async def test_doctor_no_puede_reasignar_a_terceros(
     dr_a = await add_doctor(db_session)
     dr_c = await add_doctor(db_session)
     patient_id = await _create_patient(client)
-    cid = (await client.post(f"{PREFIX}/consultations", json={"patient_id": patient_id})).json()[
-        "id"
-    ]
+    cid = (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": patient_id, "specialty_id": await any_specialty_id(client)},
+        )
+    ).json()["id"]
 
     # Sin asignar: A no puede asignársela a C...
     resp = await client.patch(
@@ -476,9 +542,12 @@ async def test_doctor_no_puede_editar_doctor_id(
     """doctor_id (ficha del médico) es server-only: un no-admin no lo edita por PATCH."""
     dr_a = await add_doctor(db_session)
     patient_id = await _create_patient(client)
-    cid = (await client.post(f"{PREFIX}/consultations", json={"patient_id": patient_id})).json()[
-        "id"
-    ]
+    cid = (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": patient_id, "specialty_id": await any_specialty_id(client)},
+        )
+    ).json()["id"]
 
     resp = await client.patch(
         f"{PREFIX}/consultations/{cid}",
@@ -538,9 +607,12 @@ async def test_consultation_entered_call_at_round_trips(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     patient_id = await _create_patient(client)
-    cid = (await client.post(f"{PREFIX}/consultations", json={"patient_id": patient_id})).json()[
-        "id"
-    ]
+    cid = (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": patient_id, "specialty_id": await any_specialty_id(client)},
+        )
+    ).json()["id"]
 
     consultation = await db_session.get(Consultation, uuid.UUID(cid))
     assert consultation.entered_call_at is None  # default: nadie ha entrado aún
@@ -564,7 +636,11 @@ async def test_consultation_list_includes_patient_and_doctor_names(
     cid = (
         await client.post(
             f"{PREFIX}/consultations",
-            json={"patient_id": patient_id, "chief_complaint": "Fiebre"},
+            json={
+                "patient_id": patient_id,
+                "chief_complaint": "Fiebre",
+                "specialty_id": await any_specialty_id(client),
+            },
         )
     ).json()["id"]
 
@@ -586,7 +662,11 @@ async def test_consultation_list_names_are_null_when_unassigned(client: AsyncCli
     cid = (
         await client.post(
             f"{PREFIX}/consultations",
-            json={"patient_id": patient_id, "chief_complaint": "Tos"},
+            json={
+                "patient_id": patient_id,
+                "chief_complaint": "Tos",
+                "specialty_id": await any_specialty_id(client),
+            },
         )
     ).json()["id"]
 
@@ -611,7 +691,11 @@ async def test_consultation_list_hides_pii_from_patient_viewer(
     cid = (
         await client.post(
             f"{PREFIX}/consultations",
-            json={"patient_id": patient_id, "chief_complaint": "Fiebre"},
+            json={
+                "patient_id": patient_id,
+                "chief_complaint": "Fiebre",
+                "specialty_id": await any_specialty_id(client),
+            },
         )
     ).json()["id"]
     patched = await client.patch(

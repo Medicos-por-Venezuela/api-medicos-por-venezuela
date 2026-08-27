@@ -7,7 +7,7 @@ paciente (nombre/cédula/teléfono/zona).
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tests._helpers import add_doctor, auth_headers
+from tests._helpers import add_doctor, any_specialty_id, auth_headers
 
 PREFIX = "/api/v1"
 
@@ -27,7 +27,11 @@ async def _consultation_with_patient(client: AsyncClient, *, age_range: str = "3
     assert p.status_code == 201, p.text
     c = await client.post(
         f"{PREFIX}/consultations",
-        json={"patient_id": p.json()["id"], "chief_complaint": "Dolor de pecho"},
+        json={
+            "patient_id": p.json()["id"],
+            "chief_complaint": "Dolor de pecho",
+            "specialty_id": await any_specialty_id(client),
+        },
     )
     assert c.status_code == 201, c.text
     return c.json()["id"]

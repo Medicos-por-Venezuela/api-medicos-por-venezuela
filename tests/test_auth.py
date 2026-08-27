@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.profile import Profile
 from src.models.rbac import Role, UserRole
-from tests._helpers import auth_headers, make_profile
+from tests._helpers import any_specialty_id, auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -147,7 +147,10 @@ async def test_patient_sees_only_own_consultations(
         )
     ).json()["id"]
     own_consult = (
-        await client.post(f"{PREFIX}/consultations", json={"patient_id": own_patient})
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": own_patient, "specialty_id": await any_specialty_id(client)},
+        )
     ).json()["id"]
 
     # Consulta de OTRO paciente (sin cuenta).
@@ -163,7 +166,10 @@ async def test_patient_sees_only_own_consultations(
         )
     ).json()["id"]
     other_consult = (
-        await client.post(f"{PREFIX}/consultations", json={"patient_id": other_patient})
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": other_patient, "specialty_id": await any_specialty_id(client)},
+        )
     ).json()["id"]
 
     headers = auth_headers(owner.id)

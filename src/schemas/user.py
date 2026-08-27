@@ -27,7 +27,10 @@ class UserResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    email: EmailStr | None = None
+    # `str` y no `EmailStr`: ver la nota en ProfileResponse.email — validar el formato en la
+    # SALIDA convierte un dato histórico malo en un 500 de todo el endpoint. `UserCreate.email`
+    # sigue siendo `EmailStr` (que es donde importa).
+    email: str | None = None
     full_name: str
     role: str
     active: bool

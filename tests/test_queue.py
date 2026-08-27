@@ -6,6 +6,7 @@ El médico que toma el caso es el titular del JWT (el `client` va como admin).
 from httpx import AsyncClient
 
 from src.models.profile import Profile
+from tests._helpers import any_specialty_id
 
 PREFIX = "/api/v1"
 
@@ -22,9 +23,12 @@ async def _waiting_consultation(client: AsyncClient) -> str:
             },
         )
     ).json()["id"]
-    return (await client.post(f"{PREFIX}/consultations", json={"patient_id": patient_id})).json()[
-        "id"
-    ]
+    return (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": patient_id, "specialty_id": await any_specialty_id(client)},
+        )
+    ).json()["id"]
 
 
 async def test_queue_list(client: AsyncClient) -> None:

@@ -2,8 +2,15 @@
 
 ## 📦 Gestión del Entorno (uv)
 El proyecto utiliza estrictamente **uv** (de Astral) como gestor de paquetes por su alto rendimiento. No utilices pip ni poetry de manera directa.
-- Sincronizar dependencias: `uv sync`
+- Sincronizar dependencias: `uv sync --extra dev` (**con el extra**: `ruff` y `pytest` viven en
+  `[project.optional-dependencies] dev`, y `uv sync` a secas solo instala las de runtime).
 - Agregar un paquete: `uv add <paquete>`
+- **`uv.lock` SÍ se versiona** y el CI instala con `uv sync --locked`, que falla si el lock no está
+  al día con `pyproject.toml`. Si tocas dependencias, corre `uv lock` y commitea el resultado.
+  Estuvo gitignored y el CI resolvía por su cuenta en cada corrida: local acabó con ruff 0.15.20 y
+  el runner con 0.16.3, y el mismo `ruff format --check` daba veredictos distintos en cada sitio.
+- **`ruff` está fijado a una versión EXACTA** por lo mismo: la salida de un formateador cambia
+  entre versiones. Al subirla, corre `uv run ruff format .` y commitea el delta.
 - Ejecutar servidor de desarrollo local: `uv run uvicorn src.main:app --reload --workers 1`
 
 ## 🧪 Estándar Riguroso de Testing (Pytest + Asyncio)

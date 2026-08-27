@@ -58,6 +58,13 @@ class PatientUpdate(BaseModel):
 class PatientResponse(PatientBase):
     model_config = ConfigDict(from_attributes=True)
 
+    # `str` y no `EmailStr` a propósito (mismo criterio que DoctorResponse.email): FastAPI valida
+    # también la RESPUESTA, así que una sola fila histórica con un email mal formado hacía fallar
+    # el endpoint ENTERO con 500, no solo esa fila. Hay filas así de la época en que el navegador
+    # escribía `patients` directo contra Supabase (anon key + RLS), sin validar formato.
+    # El formato se sigue exigiendo donde toca: en PatientCreate/PatientUpdate (entrada).
+    email: str | None = None
+
     id: uuid.UUID
     consent: bool
     consent_at: datetime | None = None

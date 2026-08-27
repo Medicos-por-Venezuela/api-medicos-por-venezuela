@@ -1,6 +1,7 @@
 """Specialty catalog, matching rules, and CRUD."""
 
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy import func, select
@@ -13,148 +14,68 @@ from src.services import audit
 
 _RESOURCE = "specialties"
 
-# Catálogo de especialidades de los médicos (lib/utils.ts: SPECIALTIES).
-SPECIALTIES: list[str] = [
-    "Medicina general",
-    "Pediatría",
-    "Traumatología",
-    "Ginecología",
-    "Obstetricia",
-    "Cardiología",
-    "Medicina interna",
-    "Psicología",
-    "Psiquiatría",
-    "Neurología",
-    "Cirugía",
-    "Oncología",
-    "Oncología médica",
-    "Fisiatría",
-    "Cuidados paliativos y manejo del dolor",
-    "Geriatría",
-    "Reumatología",
-    "Otra",
-]
-
-# Catálogo de necesidades del paciente (registro-paciente: NECESIDADES).
-NEEDS: list[str] = [
-    "Medicina general",
-    "Lesión física",
-    "Primeros auxilios",
-    "Apoyo emocional",
-    "Crisis de ansiedad",
-    "Niño / pediatría",
-    "Embarazo",
-    "Medicamentos",
-    "Enfermedad crónica",
-    "Otra",
-]
-
-# Especialidad -> necesidades que cubre ('*' = todo). (lib/utils.ts: SPECIALTY_NEEDS).
-SPECIALTY_NEEDS: dict[str, list[str]] = {
-    "Medicina general": ["*"],
-    "Medicina interna": [
-        "Medicina general",
-        "Enfermedad crónica",
-        "Medicamentos",
-        "Primeros auxilios",
-    ],
-    "Pediatría": ["Niño / pediatría"],
-    "Traumatología": ["Lesión física"],
-    "Ginecología": ["Embarazo"],
-    "Obstetricia": ["Embarazo"],
-    "Cardiología": ["Enfermedad crónica"],
-    "Psicología": ["Apoyo emocional", "Crisis de ansiedad"],
-    "Psiquiatría": ["Apoyo emocional", "Crisis de ansiedad"],
-    "Neurología": ["Enfermedad crónica"],
-    "Cirugía": ["Lesión física"],
-    "Oncología": ["Enfermedad crónica"],
-    "Oncología médica": ["Enfermedad crónica"],
-    "Fisiatría": ["Lesión física"],
-    "Cuidados paliativos y manejo del dolor": ["Enfermedad crónica"],
-    "Geriatría": ["Enfermedad crónica", "Medicina general"],
-    "Reumatología": ["Enfermedad crónica"],
-    "Otra": ["*"],
-}
-
-# Necesidades reservadas a salud mental (nunca caen en médicos generales).
-RESERVED_NEEDS: dict[str, list[str]] = {
-    "Apoyo emocional": ["Psicología", "Psiquiatría"],
-    "Crisis de ansiedad": ["Psicología", "Psiquiatría"],
-}
-
 # Necesidades que elevan la prioridad a "review" (registro-paciente).
 _PRIORITY_REVIEW_TAGS = {"Lesión física", "Embarazo", "Niño / pediatría"}
 
 
-def _values(category: str | None, needs_tags: list[str] | None) -> list[str]:
-    return [v for v in [category, *(needs_tags or [])] if v]
+@dataclass(frozen=True)
+class SpecialtyFlags:
+    """Reserva de salud mental de una especialidad, tal y como está en el catálogo."""
+
+    is_mental_health: bool = False
+    mental_health_only: bool = False
 
 
-def matches_specialty(
-    specialty: str | None, category: str | None, needs_tags: list[str] | None
-) -> bool:
-    """True si la consulta (category + needs_tags) alinea con la especialidad."""
-    if not specialty:
-        return False
-    covered = SPECIALTY_NEEDS.get(specialty)
-    if not covered:
-        return False
-    if "*" in covered:
-        return True
-    return any(v in covered for v in _values(category, needs_tags))
+async def flags_for_specialty_id(
+    session: AsyncSession, specialty_id: uuid.UUID | None
+) -> SpecialtyFlags:
+    """Flags de la especialidad de un MÉDICO, resueltos por su FK (`users.specialty_id`).
+
+    Por id y no por nombre: renombrar una especialidad en el catálogo no puede cambiar quién
+    puede atender qué. Si el médico no tiene especialidad devuelve todo en False, que es
+    fail-closed en la dirección que importa: sin `is_mental_health` NO puede tomar un caso de
+    salud mental.
+    """
+    if specialty_id is None:
+        return SpecialtyFlags()
+    row = (
+        await session.execute(
+            select(Specialty.is_mental_health, Specialty.mental_health_only).where(
+                Specialty.id == specialty_id
+            )
+        )
+    ).first()
+    return SpecialtyFlags(*row) if row else SpecialtyFlags()
 
 
-def can_attend(specialty: str | None, category: str | None, needs_tags: list[str] | None) -> bool:
-    """Elegibilidad dura (separación bidireccional psicología <-> salud física)."""
-    values = _values(category, needs_tags)
-
-    reserved_ok = all(
-        (v not in RESERVED_NEEDS) or (bool(specialty) and specialty in RESERVED_NEEDS[v])
-        for v in values
-    )
-    if not reserved_ok:
-        return False
-
-    if specialty == "Psicología":
-        is_psych_case = any(v in RESERVED_NEEDS for v in values)
-        if not is_psych_case:
-            return False
-    return True
-
-
-# El registro del paciente ahora pide la especialidad y la guarda en consultations.specialty_id:
-# esa columna ES el matching. category/needs_tags quedan como fallback para consultas viejas.
-_PSYCH_SPECIALTIES = {"Psicología", "Psiquiatría"}
-
-
-def matches_consultation(
-    specialty: str | None,
-    consultation_specialty: str | None,
-    category: str | None,
-    needs_tags: list[str] | None,
-) -> bool:
-    """Match de preferencia: igualdad exacta con la especialidad solicitada por el paciente;
-    fallback al matching legacy (category/needs) solo para consultas sin specialty_id."""
-    if consultation_specialty:
-        return specialty == consultation_specialty
-    return matches_specialty(specialty, category, needs_tags)
+async def name_for_id(session: AsyncSession, specialty_id: uuid.UUID | None) -> str | None:
+    """Nombre del catálogo para una especialidad. Lo usan los escritores de `users.specialty`,
+    que es una copia desnormalizada: el nombre SIEMPRE sale de la fila, nunca del cliente."""
+    if specialty_id is None:
+        return None
+    return await session.scalar(select(Specialty.name).where(Specialty.id == specialty_id))
 
 
 def can_attend_consultation(
-    specialty: str | None,
-    consultation_specialty: str | None,
-    category: str | None,
-    needs_tags: list[str] | None,
+    *,
+    doctor: SpecialtyFlags,
+    consultation_is_mental_health: bool,
 ) -> bool:
-    """Elegibilidad dura con la especialidad explícita. La reserva de psicología se mantiene:
-    un caso de salud mental solo va a Psicología/Psiquiatría, y Psicología solo atiende salud
-    mental. Un caso físico explícito lo puede tomar cualquier no-psicólogo (que la especialidad
-    coincida es la PREFERENCIA de attend-next, no un bloqueo — nadie se queda sin atender)."""
-    if consultation_specialty in _PSYCH_SPECIALTIES:
-        return specialty in _PSYCH_SPECIALTIES
-    if consultation_specialty:
-        return specialty != "Psicología"
-    return can_attend(specialty, category, needs_tags)
+    """Elegibilidad dura: separación bidireccional entre salud mental y salud física.
+
+    1) Un caso de salud mental solo lo toma quien atiende salud mental.
+    2) Quien SOLO atiende salud mental (Psicología, que no es médico) no toma casos físicos.
+
+    Que la especialidad del caso coincida exactamente con la del médico es la PREFERENCIA de
+    "atender al siguiente", no un bloqueo: nadie se queda sin atender.
+
+    Ambas reglas salen de columnas de `specialties`, no de nombres. Antes eran los literales
+    `_PSYCH_SPECIALTIES` y `!= "Psicología"`, que un renombre del catálogo rompía en silencio —
+    y en la dirección peligrosa: un caso de salud mental habría pasado a poder tomarlo cualquiera.
+    """
+    if consultation_is_mental_health:
+        return doctor.is_mental_health
+    return not doctor.mental_health_only
 
 
 def compute_priority(needs_tags: list[str] | None) -> str:

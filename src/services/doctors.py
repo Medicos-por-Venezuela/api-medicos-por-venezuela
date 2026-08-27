@@ -24,6 +24,7 @@ from src.schemas.doctor import DoctorCreate, DoctorMeResponse, DoctorSelfUpdate,
 from src.services import audit
 from src.services import psicologo as psicologo_service
 from src.services import sacs as sacs_service
+from src.services import specialties as specialties_service
 
 # Roles de `users` que corresponden a un médico (legacy `specialist` -> doctor).
 _DOCTOR_PROFILE_ROLES = {"doctor", "specialist"}
@@ -92,12 +93,9 @@ async def _sync_user_from_doctor(session: AsyncSession, doctor: Doctor) -> None:
     user = await session.get(Profile, doctor.user_id)
     if user is None:
         return
-    specialty_name = None
-    if doctor.specialty_id:
-        specialty_name = await session.scalar(
-            select(Specialty.name).where(Specialty.id == doctor.specialty_id)
-        )
-    user.specialty = specialty_name
+    # La FK manda; el nombre es su copia desnormalizada. Nunca uno sin el otro.
+    user.specialty_id = doctor.specialty_id
+    user.specialty = await specialties_service.name_for_id(session, doctor.specialty_id)
     user.country = doctor.country_of_residence
     user.medical_license = doctor.license
     user.whatsapp_number = doctor.phone
@@ -357,12 +355,11 @@ async def _my_doctor_profile(session: AsyncSession, user_id: uuid.UUID) -> Profi
     return profile
 
 
-def _me_from_doctor(
-    user_id: uuid.UUID,
-    doctor: Doctor,
-    specialty_name: str | None,
-    professional_type_name: str | None,
+async def _me_from_doctor_row(
+    session: AsyncSession, user_id: uuid.UUID, doctor: Doctor
 ) -> DoctorMeResponse:
+    """Perfil propio a partir de la ficha `doctors`, resolviendo los nombres de especialidad
+    y tipo profesional."""
     return DoctorMeResponse(
         source="doctor",
         user_id=user_id,
@@ -371,22 +368,10 @@ def _me_from_doctor(
         full_name=doctor.full_name,
         license=doctor.license,
         specialty_id=doctor.specialty_id,
-        specialty=specialty_name,
+        specialty=await _specialty_name(session, doctor.specialty_id),
         professional_type_id=doctor.professional_type_id,
-        professional_type=professional_type_name,
+        professional_type=await _professional_type_name(session, doctor.professional_type_id),
         verified=doctor.verified,
-    )
-
-
-async def _me_from_doctor_row(
-    session: AsyncSession, user_id: uuid.UUID, doctor: Doctor
-) -> DoctorMeResponse:
-    """`_me_from_doctor` resolviendo los nombres de especialidad y tipo profesional."""
-    return _me_from_doctor(
-        user_id,
-        doctor,
-        await _specialty_name(session, doctor.specialty_id),
-        await _professional_type_name(session, doctor.professional_type_id),
     )
 
 
@@ -490,6 +475,7 @@ async def _update_my_profile_row(
     if "license" in fields:
         profile.medical_license = fields["license"]
     if "specialty_id" in fields:
+        profile.specialty_id = fields["specialty_id"]
         profile.specialty = await _specialty_name(session, fields["specialty_id"])
     await session.commit()
     await session.refresh(profile)

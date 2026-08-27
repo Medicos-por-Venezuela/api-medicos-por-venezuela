@@ -4,6 +4,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import jwt
+from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
@@ -78,3 +79,15 @@ async def add_doctor(
     session.add(make_doctor_row(profile.id, verified=verified, **doctor_overrides))
     await session.flush()
     return profile
+
+
+async def any_specialty_id(client: AsyncClient) -> str:
+    """Id de una especialidad del catálogo, para crear consultas en las pruebas.
+
+    `specialty_id` es obligatorio en `ConsultationCreate` (esa columna ES el matching de la cola),
+    así que ya no se puede crear una consulta sin él. Se excluye salud mental a propósito: un caso
+    psi solo lo puede tomar Psicología/Psiquiatría, y la mayoría de las pruebas usan un médico sin
+    especialidad, así que un id psi les cambiaría la elegibilidad sin que eso sea lo que prueban.
+    """
+    resp = await client.get("/api/v1/specialties")
+    return next(s["id"] for s in resp.json() if s["name"] not in ("Psicología", "Psiquiatría"))

@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.profile import Profile
 from src.services import calendar as calendar_service
-from tests._helpers import add_doctor, auth_headers, make_profile
+from tests._helpers import add_doctor, any_specialty_id, auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -27,7 +27,11 @@ async def _open_consultation(client: AsyncClient, doctor_id) -> str:
     cid = (
         await client.post(
             f"{PREFIX}/consultations",
-            json={"patient_id": p.json()["id"], "chief_complaint": "Dolor"},
+            json={
+                "patient_id": p.json()["id"],
+                "chief_complaint": "Dolor",
+                "specialty_id": await any_specialty_id(client),
+            },
         )
     ).json()["id"]
     r = await client.post(

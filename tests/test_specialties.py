@@ -4,49 +4,82 @@ import uuid
 from collections.abc import AsyncGenerator
 
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.session import get_db
 from src.main import app
 from src.models.profile import Profile
-from src.services.specialties import can_attend, compute_priority, matches_specialty
+from src.models.specialty import Specialty
+from src.services.specialties import (
+    SpecialtyFlags,
+    can_attend_consultation,
+    compute_priority,
+    flags_for_specialty_id,
+)
 from tests._helpers import auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
 
-# --- matches_specialty ---
+# --- reserva de salud mental (flags del catálogo) ---
 
 
-def test_matches_general_is_wildcard() -> None:
-    assert matches_specialty("Medicina general", None, ["Lesión física"]) is True
+PSICOLOGO = SpecialtyFlags(is_mental_health=True, mental_health_only=True)
+PSIQUIATRA = SpecialtyFlags(is_mental_health=True, mental_health_only=False)
+GENERAL = SpecialtyFlags()
 
 
-def test_matches_by_need() -> None:
-    assert matches_specialty("Psicología", None, ["Apoyo emocional"]) is True
-    assert matches_specialty("Traumatología", None, ["Lesión física"]) is True
+def test_caso_de_salud_mental_solo_para_quien_la_atiende() -> None:
+    assert can_attend_consultation(doctor=GENERAL, consultation_is_mental_health=True) is False
+    assert can_attend_consultation(doctor=PSICOLOGO, consultation_is_mental_health=True) is True
+    assert can_attend_consultation(doctor=PSIQUIATRA, consultation_is_mental_health=True) is True
 
 
-def test_matches_false_when_unrelated() -> None:
-    assert matches_specialty("Cardiología", None, ["Lesión física"]) is False
-    assert matches_specialty(None, None, ["x"]) is False
+def test_psicologo_no_toma_casos_de_salud_fisica() -> None:
+    """Psicología SOLO atiende salud mental (no es médico); Psiquiatría sí puede lo físico."""
+    assert can_attend_consultation(doctor=PSICOLOGO, consultation_is_mental_health=False) is False
+    assert can_attend_consultation(doctor=PSIQUIATRA, consultation_is_mental_health=False) is True
+    assert can_attend_consultation(doctor=GENERAL, consultation_is_mental_health=False) is True
 
 
-# --- can_attend ---
+async def test_renombrar_la_especialidad_no_toca_la_reserva(db_session: AsyncSession) -> None:
+    """La reserva cuelga de la FILA, así que renombrarla no la afecta en absoluto.
+
+    Antes la regla eran los literales `{"Psicología", "Psiquiatría"}` y la resolución iba por
+    nombre: un renombre del catálogo la abría en silencio y un caso de salud mental pasaba a
+    poder tomarlo cualquiera.
+    """
+    psico = (
+        await db_session.execute(
+            select(Specialty).where(
+                func.lower(Specialty.name) == "psicología", Specialty.deleted_at.is_(None)
+            )
+        )
+    ).scalar_one()
+    assert (psico.is_mental_health, psico.mental_health_only) == (True, True)
+
+    psico.name = "Psicología clínica y de la salud"
+    await db_session.flush()
+
+    flags = await flags_for_specialty_id(db_session, psico.id)
+    assert flags.is_mental_health is True
+    assert can_attend_consultation(doctor=flags, consultation_is_mental_health=True) is True
+    assert can_attend_consultation(doctor=flags, consultation_is_mental_health=False) is False
 
 
-def test_reserved_need_blocks_general_doctor() -> None:
-    assert can_attend("Medicina general", None, ["Crisis de ansiedad"]) is False
-    assert can_attend("Psiquiatría", None, ["Crisis de ansiedad"]) is True
-
-
-def test_psychology_only_takes_psych_cases() -> None:
-    assert can_attend("Psicología", None, ["Lesión física"]) is False
-    assert can_attend("Psicología", None, ["Apoyo emocional"]) is True
-
-
-def test_can_attend_physical_general() -> None:
-    assert can_attend("Medicina general", None, ["Lesión física"]) is True
+async def test_medico_sin_especialidad_es_fail_closed(db_session: AsyncSession) -> None:
+    """Sin FK no se puede tomar un caso de salud mental (la dirección que importa)."""
+    assert await flags_for_specialty_id(db_session, None) == SpecialtyFlags()
+    assert (
+        can_attend_consultation(doctor=SpecialtyFlags(), consultation_is_mental_health=True)
+        is False
+    )
+    # Un id que ya no existe en el catálogo se comporta igual.
+    huerfano = await flags_for_specialty_id(
+        db_session, uuid.UUID("00000000-0000-0000-0000-000000000000")
+    )
+    assert huerfano == SpecialtyFlags()
 
 
 # --- compute_priority ---
@@ -83,17 +116,6 @@ async def test_specialties_list_is_public(db_session: AsyncSession) -> None:
     assert resp.status_code == 200
     names = [item["name"] for item in resp.json()]
     assert "Medicina general" in names
-
-
-async def test_specialties_catalog_endpoint(db_session: AsyncSession) -> None:
-    async for public_client in _public_client(db_session):
-        resp = await public_client.get(f"{PREFIX}/specialties/catalog")
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert "Medicina general" in body["specialties"]
-    assert "Apoyo emocional" in body["reserved_needs"]
-    assert body["specialty_needs"]["Medicina general"] == ["*"]
 
 
 # --- CRUD specialties ---
