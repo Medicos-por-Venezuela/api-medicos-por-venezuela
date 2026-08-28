@@ -14,7 +14,8 @@ from src.models.consultation import Consultation
 from src.models.doctor import Doctor
 from src.models.patient import Patient
 from src.models.profile import Profile
-from src.schemas.stats import StatsResponse
+from src.models.specialty import Specialty
+from src.schemas.stats import PublicStatsResponse, StatsResponse
 from src.services.doctors import ONLINE_WINDOW
 
 # Bucket amplio "en progreso" (igual criterio que el KPI del panel legacy).
@@ -78,4 +79,57 @@ async def get_dashboard_stats(session: AsyncSession) -> StatsResponse:
         consultations_in_progress=consultations_row.in_progress,
         consultations_closed=consultations_row.closed,
         consultations_urgent=consultations_row.urgent,
+    )
+
+
+# --- Cifras públicas de la portada -------------------------------------------
+
+# Escalones del redondeo a la baja. Los dos primeros los fijó el equipo: 379 consultas se publican
+# como "+300" y 450 como "+400" (centenas), y 2.900 médicos como "+2.500" (medios millares). Los
+# otros dos están para que la cifra siga significando algo cuando todavía es pequeña: sin ellos,
+# 47 consultas se publicarían como "+0".
+_ESCALONES = ((1000, 500), (100, 100), (10, 10))
+
+
+def round_down(n: int) -> int:
+    """Redondea a la baja al escalón que corresponda a la magnitud de `n`.
+
+    Siempre hacia abajo, nunca al más cercano: la cifra que se publica tiene que ser una que la
+    organización pueda defender ("hay AL MENOS estos"), y redondear hacia arriba convertiría un
+    dato real en una exageración.
+    """
+    for minimo, escalon in _ESCALONES:
+        if n >= minimo:
+            return (n // escalon) * escalon
+    return n
+
+
+async def get_public_stats(session: AsyncSession) -> PublicStatsResponse:
+    """Las tres cifras de la banda de impacto del home, ya redondeadas.
+
+    Tres conteos y ninguna fila leída: solo `COUNT(*)`. Los criterios son los mismos que usa el
+    panel admin, para que la portada y el panel no cuenten cosas distintas — salvo en consultas,
+    donde aquí se cuentan TODAS las creadas (decisión del equipo, 2026-08-28), sin los buckets por
+    estado del dashboard.
+    """
+    doctors = (
+        await session.scalar(
+            select(func.count())
+            .select_from(Doctor)
+            .where(Doctor.status == 1, Doctor.deleted_at.is_(None))
+        )
+    ) or 0
+    consultations = await session.scalar(select(func.count()).select_from(Consultation)) or 0
+    specialties = (
+        await session.scalar(
+            select(func.count())
+            .select_from(Specialty)
+            .where(Specialty.status == "active", Specialty.deleted_at.is_(None))
+        )
+    ) or 0
+
+    return PublicStatsResponse(
+        doctors=round_down(doctors),
+        consultations=round_down(consultations),
+        specialties=round_down(specialties),
     )
