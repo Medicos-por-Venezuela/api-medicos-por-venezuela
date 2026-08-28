@@ -214,3 +214,35 @@ async def test_la_lista_sigue_siendo_dos_consultas(
     assert len(sobre_users) == 2, (
         f"esperaba COUNT + SELECT, hubo {len(sobre_users)}:\n" + "\n---\n".join(sobre_users)
     )
+
+
+async def test_el_listado_no_devuelve_campos_que_no_puebla(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """`has_doctor_profile`, `doctor_cedula` y `roles` solo los rellena GET /auth/me. Mientras
+    vivieron en el schema compartido, el listado los devolvía con su valor por defecto: la misma
+    fila llegaba a decir `has_doctor_profile: false` y `doctor_verified: true`, que es imposible.
+    Un campo que siempre miente es peor que uno ausente."""
+    perfil = _named("doctor")
+    db_session.add(perfil)
+    await db_session.flush()
+    db_session.add(Doctor(user_id=perfil.id, full_name="Dr Contrato", verified=True))
+    await db_session.flush()
+
+    fila = await _fetch_one(client, perfil)
+    for fantasma in ("has_doctor_profile", "doctor_cedula", "roles"):
+        assert fantasma not in fila, f"{fantasma} no debe viajar en el listado"
+    # Y lo que sí puebla, sigue ahí.
+    assert fila["doctor_verified"] is True
+
+
+async def test_auth_me_conserva_el_contexto_de_medico(client: AsyncClient) -> None:
+    """El reverso: los tres campos siguen en /auth/me, que es su único sitio. El panel médico
+    depende de `has_doctor_profile`/`doctor_cedula` para decidir si manda a completar la cédula."""
+    resp = await client.get(f"{PREFIX}/auth/me")
+    assert resp.status_code == 200
+    body = resp.json()
+    for campo in ("has_doctor_profile", "doctor_cedula", "roles"):
+        assert campo in body, f"{campo} debe seguir en /auth/me"
+    # Y el del listado no se cuela aquí: /auth/me no lo puebla.
+    assert "doctor_verified" not in body

@@ -7,7 +7,7 @@ from src.core.errors import NotFoundError
 from src.core.security import Principal, effective_role, get_current_principal
 from src.db.session import get_db
 from src.schemas.auth import PrincipalPermissionsResponse
-from src.schemas.profile import ProfileResponse
+from src.schemas.profile import MyProfileResponse
 from src.services import doctors as doctors_service
 from src.services import profiles as profiles_service
 
@@ -19,14 +19,14 @@ tag_metadata = [
 
 @router.get(
     "/me",
-    response_model=ProfileResponse,
+    response_model=MyProfileResponse,
     summary="Perfil del usuario autenticado",
     responses={401: {"description": "No autenticado / token inválido."}},
 )
 async def me(
     principal: Principal = Depends(get_current_principal),
     db: AsyncSession = Depends(get_db),
-) -> ProfileResponse:
+) -> MyProfileResponse:
     """Perfil del titular del JWT (reemplaza getSession + cargar profile). Incluye el contexto de
     médico (`has_doctor_profile`/`doctor_cedula`), con la MISMA lógica que `/doctors/me`, para que
     el panel decida el redirect sin una segunda llamada.
@@ -36,7 +36,7 @@ async def me(
     único valor legado — el Principal ya trae los roles reales (con fallback al legado para
     cuentas sin filas RBAC), así que esto no agrega queries."""
     profile = await profiles_service.get_profile(db, principal.id)
-    resp = ProfileResponse.model_validate(profile)
+    resp = MyProfileResponse.model_validate(profile)
     resp.roles = sorted(principal.roles)
     resp.role = effective_role(principal.roles) or resp.role
     try:
