@@ -20,6 +20,7 @@ from src.db.session import get_db
 from src.schemas.profile import (
     ProfileActiveRequest,
     ProfileFinalizeRoleRequest,
+    ProfileListItem,
     ProfileListResponse,
     ProfileResponse,
 )
@@ -66,7 +67,7 @@ async def list_profiles(
     # `doctor_verified` no sale del ORM (viene del LEFT JOIN), así que se inyecta tras validar.
     return ProfileListResponse(
         items=[
-            ProfileResponse.model_validate(p).model_copy(update={"doctor_verified": verified})
+            ProfileListItem.model_validate(p).model_copy(update={"doctor_verified": verified})
             for p, verified in items
         ],
         total=total,
