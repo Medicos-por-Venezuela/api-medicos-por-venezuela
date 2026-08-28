@@ -124,7 +124,10 @@ app.add_middleware(
     allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Correlation-ID"],
+    # X-Consultation-Token: la credencial de sala del paciente anónimo (ver
+    # routers/consultations.py). Sin ella aquí el navegador tumba el preflight con "Disallowed
+    # CORS headers" y el paciente se queda sin videoconsulta al registrarse.
+    allow_headers=["Authorization", "Content-Type", "X-Correlation-ID", "X-Consultation-Token"],
 )
 
 register_exception_handlers(app)
