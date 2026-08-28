@@ -61,10 +61,24 @@ si `src/services/doctors.py::has_valid_credential` es cierto: ficha en `doctors`
   rol para que el frontend sepa a dónde mandarlo. **No** añadas checks de credencial por endpoint:
   centralizado no se olvida ninguno (lección del sub-recurso `/events` en IDOR).
 - `verified` se pone en `true` solo por dos vías: el **SACS/FPV** al registrar o al corregir la
-  cédula (fail-closed: servicio caído o no encontrado ⇒ `false`), o la **aprobación manual de un
-  admin** (`PATCH /doctors/{id}` con `verified: true`, que queda en `audit_log`).
+  cédula, o la **aprobación manual de un admin** (`POST /doctors/{id}/approve`, permiso
+  `doctors.verify`, que queda en `audit_log` como `doctor.approved`; su reverso es
+  `POST /doctors/{id}/revoke-approval`). `DoctorUpdate` **no** incluye `verified` a propósito:
+  si la aprobación se pudiera colar por el PATCH genérico, su traza sería un `doctor.updated`
+  indistinguible de un cambio de teléfono.
+- **La auto-verificación solo puede venir del registro oficial.** No basta con que el SACS/FPV
+  "encuentre" la cédula: tiene que devolver **nombre y licencia**, y esos son los valores que se
+  escriben en la ficha. Fail-closed en todo lo demás (servicio caído, no encontrado, respuesta
+  incompleta ⇒ `false`). El nombre y la licencia que manda el cliente son una **declaración**,
+  no una credencial: se conservan tal cual cuando el registro no valida (para que el admin tenga
+  qué revisar) pero nunca producen un `verified=true`.
 - Marcar `verified` no basta si falta la cédula o la licencia: las filas legacy backfilleadas
-  nacieron con `verified=true` sin haber pasado nunca por el SACS.
+  nacieron con `verified=true` sin haber pasado nunca por el SACS. Por eso `approve` devuelve
+  **422** si la ficha está incompleta o dada de baja, en vez de un 200 que no habilita a nadie.
+- **Una sola definición del criterio.** `has_valid_credential` (el gate) y el listado admin
+  (`GET /doctors`, con `can_practice`/`blocked_reason`) salen ambos de
+  `doctors._blocked_reason`. Si divergen, el panel dice "aprobado" de alguien a quien el backend
+  bloquea; no dupliques el criterio en una consulta nueva, reutiliza esa función.
 - **Lo que el gate NO debe bloquear:** `/doctors/me` (ver y completar la propia ficha) y
   `/auth/me*`. Son la vía de salida del limbo; si las cierras, el médico queda en una trampa sin
   salida. Van por `get_current_principal`, no por `require_permission`.

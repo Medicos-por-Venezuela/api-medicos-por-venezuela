@@ -40,7 +40,13 @@ class DoctorCreate(BaseModel):
 
 
 class DoctorUpdate(BaseModel):
-    """Edición (admin). Permite mover `status` (0/1/2) y forzar `verified`."""
+    """Edición administrativa de la ficha. Permite mover `status` (0/1/2).
+
+    NO incluye `verified`: habilitar a un médico que el SACS/FPV no validó es una acción
+    con nombre propio (`POST /doctors/{id}/approve`, permiso `doctors.verify`) porque tiene
+    que quedar distinguible en `audit_log` de un cambio de teléfono. Si se pudiera colar por
+    aquí, esa traza sería opcional.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -51,7 +57,6 @@ class DoctorUpdate(BaseModel):
     email: EmailStr | None = None
     country_of_residence: str | None = Field(default=None, max_length=100)
     status: int | None = Field(default=None, ge=0, le=2)
-    verified: bool | None = None
 
 
 class DoctorSelfUpdate(BaseModel):
@@ -125,6 +130,68 @@ class DoctorResponse(BaseModel):
     verified: bool
     created_at: datetime
     updated_at: datetime
+
+
+# Motivos por los que un médico NO puede atender (los produce `services.doctors._blocked_reason`).
+# Alias con nombre para que el filtro del listado y la respuesta no puedan divergir.
+DoctorBlockedReason = Literal[
+    "sin_ficha", "de_baja", "sin_cedula", "sin_licencia", "no_verificado"
+]
+
+
+class DoctorAdminItem(BaseModel):
+    """Fila de la tabla de médicos del panel admin.
+
+    El universo son las fichas de `doctors` **más** las cuentas con rol de médico que
+    todavía no tienen ficha (`id: null`, `blocked_reason: "sin_ficha"`): esas también hay
+    que perseguirlas, y no aparecerían en un listado de `doctors` a secas.
+
+    `can_practice` es el criterio real de acceso (`has_valid_credential`), NO `verified`:
+    una ficha verificada sin cédula no atiende. `blocked_reason` dice por qué, y con eso el
+    admin sabe qué hacer — solo `no_verificado` se arregla con el botón de aprobar; los
+    demás exigen que el médico complete su ficha (o reactivarla).
+    """
+
+    id: uuid.UUID | None = None  # null = la cuenta aún no tiene ficha en `doctors`
+    user_id: uuid.UUID | None = None
+    full_name: str
+    cedula: str | None = None
+    license: str | None = None
+    email: str | None = None
+    specialty_id: uuid.UUID | None = None
+    professional_type_id: uuid.UUID | None = None
+    status: int | None = None  # null = sin ficha
+    verified: bool
+    created_at: datetime
+    can_practice: bool
+    blocked_reason: DoctorBlockedReason | None = None
+
+
+class DoctorAdminPage(BaseModel):
+    """Página del listado admin: filas + total exacto (paginación server-side)."""
+
+    items: list[DoctorAdminItem]
+    total: int
+
+
+class DoctorCredentialSummary(BaseModel):
+    """Cuántos médicos hay en cada estado de credencial.
+
+    El panel lo pinta como fila de contadores para que el admin vea de entrada qué puede
+    hacer: `no_verificado` es su cola de trabajo (aprobar), y `sin_cedula`/`sin_licencia`
+    la campaña de recaptura de datos, que no se resuelve desde el panel.
+
+    Los campos coinciden con los valores de `blocked_reason`, así que cada contador es un
+    atajo directo al filtro del listado.
+    """
+
+    can_practice: int
+    sin_ficha: int
+    de_baja: int
+    sin_cedula: int
+    sin_licencia: int
+    no_verificado: int
+    total: int
 
 
 class DoctorPoolItem(BaseModel):
