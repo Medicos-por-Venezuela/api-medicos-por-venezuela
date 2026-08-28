@@ -136,16 +136,15 @@ async def test_medico_que_ademas_es_admin_no_queda_bloqueado(
 async def test_aprobacion_del_admin_habilita_al_medico(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """El camino de aprobación manual: el SACS rechazó al médico, un admin marca la ficha
-    como verificada (`PATCH /doctors/{id}`) y a partir de ahí puede atender."""
+    """El camino de aprobación manual: el SACS rechazó al médico, un admin aprueba la ficha
+    (`POST /doctors/{id}/approve`) y a partir de ahí puede atender. El endpoint y sus casos
+    de borde tienen su propia suite en `test_doctor_approval.py`."""
     doc = await add_doctor(db_session, verified=False)
     assert await _queue_status(client, doc.id) == 403
 
     ficha = (await client.get(f"{PREFIX}/doctors/me", headers=auth_headers(doc.id))).json()
     # `client` va autenticado como admin.
-    aprobacion = await client.patch(
-        f"{PREFIX}/doctors/{ficha['doctor_id']}", json={"verified": True}
-    )
+    aprobacion = await client.post(f"{PREFIX}/doctors/{ficha['doctor_id']}/approve")
     assert aprobacion.status_code == 200, aprobacion.text
 
     assert await _queue_status(client, doc.id) == 200

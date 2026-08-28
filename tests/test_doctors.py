@@ -47,19 +47,51 @@ def _payload(type_id: str, **over: object) -> dict:
     return base
 
 
-def _mock_sacs(*, encontrado: bool = True, es_medico: bool = True):
+# Identidad "oficial" que devuelven los registros en los mocks. Una verificación válida
+# exige nombre Y licencia: son los valores que acaban en la ficha (los del payload del
+# cliente no verifican nada). Ver `_apply_official_identity`.
+SACS_NOMBRE, SACS_APELLIDO, SACS_LICENCIA = "JUAN", "PEREZ", "MPPS-77777"
+SACS_FULL_NAME = f"{SACS_NOMBRE} {SACS_APELLIDO}"
+FPV_NOMBRE, FPV_APELLIDO, FPV_LICENCIA = "ANA", "GOMEZ", "FPV-4242"
+FPV_FULL_NAME = f"{FPV_NOMBRE} {FPV_APELLIDO}"
+
+
+def _mock_sacs(
+    *,
+    encontrado: bool = True,
+    es_medico: bool = True,
+    nombre: str | None = SACS_NOMBRE,
+    apellido: str | None = SACS_APELLIDO,
+    licencia: str | None = SACS_LICENCIA,
+):
     return patch(
         "src.services.sacs.verificar_sacs",
         AsyncMock(
-            return_value=SacsVerificationResponse(encontrado=encontrado, es_medico=es_medico)
+            return_value=SacsVerificationResponse(
+                encontrado=encontrado,
+                es_medico=es_medico,
+                nombre=nombre,
+                apellido=apellido,
+                licencia=licencia,
+            )
         ),
     )
 
 
-def _mock_fpv(*, encontrado: bool = True):
+def _mock_fpv(
+    *,
+    encontrado: bool = True,
+    nombre: str | None = FPV_NOMBRE,
+    apellido: str | None = FPV_APELLIDO,
+    licencia: str | None = FPV_LICENCIA,
+):
     return patch(
         "src.services.psicologo.verificar_psicologo",
-        AsyncMock(return_value=PsicologoVerificationResponse(encontrado=encontrado)),
+        AsyncMock(
+            return_value=PsicologoVerificationResponse(
+                encontrado=encontrado, nombre=nombre, apellido=apellido, licencia=licencia
+            )
+        ),
     )
 
 
@@ -96,6 +128,98 @@ async def test_register_psicologo_valido_queda_verificado(
         resp = await client.post(f"{PREFIX}/doctors", json=_payload(type_id, cedula="V-90000002"))
     assert resp.status_code == 201
     assert resp.json()["verified"] is True
+
+
+# --- La auto-verificación solo puede venir del registro oficial ---
+# `verified=true` automático exige que SACS/FPV devuelvan nombre Y licencia, y esos son
+# los valores que se escriben en la ficha. Lo que manda el cliente no verifica nada.
+
+
+async def test_sacs_sin_licencia_no_verifica(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El SACS encuentra la cédula pero no devuelve licencia: no hay credencial que
+    acreditar (y una ficha sin licencia tampoco habilitaría para atender)."""
+    type_id = await _type_id(db_session, "medico")
+    with _mock_sacs(licencia=""):
+        resp = await client.post(f"{PREFIX}/doctors", json=_payload(type_id, cedula="V-90000010"))
+    assert resp.status_code == 201
+    assert resp.json()["verified"] is False
+
+
+async def test_sacs_sin_nombre_no_verifica(client: AsyncClient, db_session: AsyncSession) -> None:
+    """Respuesta sin nombre: no identifica a nadie -> fail-closed."""
+    type_id = await _type_id(db_session, "medico")
+    with _mock_sacs(nombre="", apellido=""):
+        resp = await client.post(f"{PREFIX}/doctors", json=_payload(type_id, cedula="V-90000011"))
+    assert resp.status_code == 201
+    assert resp.json()["verified"] is False
+
+
+async def test_fpv_sin_licencia_no_verifica(client: AsyncClient, db_session: AsyncSession) -> None:
+    """Mismo criterio para psicólogos (FPV)."""
+    type_id = await _type_id(db_session, "psicologo")
+    with _mock_fpv(licencia=None):
+        resp = await client.post(f"{PREFIX}/doctors", json=_payload(type_id, cedula="V-90000012"))
+    assert resp.status_code == 201
+    assert resp.json()["verified"] is False
+
+
+async def test_fpv_no_encuentra_la_cedula_no_verifica(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """La FPV no tiene esa cédula colegiada: fail-closed, igual que el SACS."""
+    type_id = await _type_id(db_session, "psicologo")
+    with _mock_fpv(encontrado=False):
+        resp = await client.post(f"{PREFIX}/doctors", json=_payload(type_id, cedula="V-90000015"))
+    assert resp.status_code == 201
+    assert resp.json()["verified"] is False
+
+
+async def test_el_nombre_y_la_licencia_verificados_los_pone_el_registro(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El cliente declara nombre y licencia; si el registro valida, mandan los del registro.
+
+    Si no, cualquiera se registraría con el nombre de otro y una licencia inventada, y la
+    ficha saldría "verificada" con datos que el SACS nunca dijo."""
+    type_id = await _type_id(db_session, "medico")
+    with _mock_sacs():
+        resp = await client.post(
+            f"{PREFIX}/doctors",
+            json=_payload(
+                type_id,
+                cedula="V-90000013",
+                full_name="Dr Impostor",
+                license="MPPS-INVENTADA",
+            ),
+        )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["verified"] is True
+    assert body["full_name"] == SACS_FULL_NAME
+    assert body["license"] == SACS_LICENCIA
+
+
+async def test_si_el_registro_no_valida_se_conserva_lo_declarado_sin_verificar(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Cuando no hay respuesta oficial no hay nada que copiar: se guarda lo que declaró el
+    médico, pero como `verified=false`. Es la ficha que un admin revisa y aprueba a mano;
+    borrarla dejaría al admin sin nada que mirar."""
+    type_id = await _type_id(db_session, "medico")
+    with _mock_sacs(encontrado=False, es_medico=False):
+        resp = await client.post(
+            f"{PREFIX}/doctors",
+            json=_payload(
+                type_id, cedula="V-90000014", full_name="Dr Declarado", license="MPPS-DECL"
+            ),
+        )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["verified"] is False
+    assert body["full_name"] == "Dr Declarado"
+    assert body["license"] == "MPPS-DECL"
 
 
 async def test_registro_es_publico(client: AsyncClient, db_session: AsyncSession) -> None:
@@ -158,7 +282,7 @@ async def test_list_get_update_delete(
 
     listed = await client.get(f"{PREFIX}/doctors", params={"status": 1})
     assert listed.status_code == 200
-    assert any(d["id"] == doctor_id for d in listed.json())
+    assert any(d["id"] == doctor_id for d in listed.json()["items"])
 
     # admin expulsa (status = 2)
     patched = await client.patch(f"{PREFIX}/doctors/{doctor_id}", json={"status": 2})
@@ -253,7 +377,8 @@ async def test_create_doctor_propaga_datos_a_la_cuenta(
 
     await db_session.refresh(user)
     assert user.specialty == specialty.name
-    assert user.medical_license == "MPPS-12345"
+    # La licencia que se propaga es la OFICIAL del SACS, no la "MPPS-12345" del payload.
+    assert user.medical_license == SACS_LICENCIA
     assert user.whatsapp_number == "+584140009999"
     assert user.country == "Venezuela"
 
@@ -430,6 +555,29 @@ async def test_patch_me_cambiar_cedula_reverifica(
     assert body["verified"] is False
 
 
+async def test_patch_me_cedula_valida_reescribe_nombre_y_licencia_oficiales(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Al corregir la cédula, si el SACS valida, el nombre y la licencia de la ficha pasan
+    a ser los suyos — incluso pisando lo que el médico mandó en ese mismo PATCH."""
+    user_id, _ = await _seed_doctor_with_account(db_session, cedula="V-90001006")
+    with _mock_sacs():
+        resp = await client.patch(
+            f"{PREFIX}/doctors/me",
+            headers=auth_headers(user_id),
+            json={
+                "cedula": "V-90001098",
+                "full_name": "Dr Como Yo Diga",
+                "license": "MPPS-COMO-YO-DIGA",
+            },
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["verified"] is True
+    assert body["full_name"] == SACS_FULL_NAME
+    assert body["license"] == SACS_LICENCIA
+
+
 async def test_patch_me_fallback_users_actualiza(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
@@ -527,10 +675,13 @@ async def test_patch_me_user_completa_ficha_crea_doctor(
     assert doctor.cedula == "V-90002001"
     assert doctor.phone == "+584145200799"  # tomado de users.whatsapp_number
     assert doctor.email == "google.doc@test.com"
+    # el nombre y la licencia son los del SACS, no los que mandó el cliente
+    assert doctor.full_name == SACS_FULL_NAME
+    assert doctor.license == SACS_LICENCIA
     # y se sincronizó de vuelta a users (specialty/license)
     await db_session.refresh(user)
     assert user.specialty == specialty.name
-    assert user.medical_license == "MPPS-GOO-1"
+    assert user.medical_license == SACS_LICENCIA
 
 
 async def test_patch_me_user_completa_ficha_no_verificada(
