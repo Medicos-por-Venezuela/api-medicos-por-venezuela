@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel, ConfigDict, Field
 
-__all__ = ["StatsResponse"]
+__all__ = ["PublicStatsResponse", "StatsResponse"]
 
 
 class StatsResponse(BaseModel):
@@ -51,4 +51,29 @@ class StatsResponse(BaseModel):
             "Consultas marcadas `urgent_in_person`. Also counted within "
             "`consultations_in_progress`; do not sum buckets expecting a partition."
         ),
+    )
+
+
+class PublicStatsResponse(BaseModel):
+    """Cifras para la portada pública. Van **redondeadas hacia abajo desde el servidor**, no
+    exactas: son las tres de la banda de impacto del home, y ese es todo el uso que tienen.
+
+    El redondeo se hace aquí y no en el navegador a propósito. Este endpoint no pide token, así
+    que cualquiera puede leerlo; devolver el conteo exacto publicaría el pulso operativo de la
+    organización (cuántos médicos tiene, a qué ritmo crece) a quien mire la pestaña de red. Con
+    los múltiplos de abajo, la cifra es cierta —siempre igual o menor que la real— y no dice nada
+    más que el orden de magnitud.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    doctors: int = Field(
+        ...,
+        description="Médicos activos, redondeado a la baja. Mismo criterio que el KPI admin.",
+    )
+    consultations: int = Field(
+        ..., description="Consultas creadas, redondeado a la baja. Todas, sin filtrar por estado."
+    )
+    specialties: int = Field(
+        ..., description="Especialidades activas del catálogo, redondeado a la baja."
     )

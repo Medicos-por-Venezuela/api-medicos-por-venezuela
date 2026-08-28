@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from httpx import AsyncClient
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.consultation import Consultation
@@ -237,3 +237,104 @@ async def test_stats_read_permission_exists_exactly_once(db_session: AsyncSessio
         .all()
     )
     assert len(all_matches) == 1
+
+
+# --- Cifras públicas de la portada (`GET /stats/public`) ----------------------
+
+
+def test_round_down_uses_the_step_for_each_magnitude() -> None:
+    """Los escalones acordados con el equipo, y los dos que evitan publicar un '+0'."""
+    # Medios millares a partir de 1.000: 2.900 médicos se publican como 2.500.
+    assert stats_service.round_down(2900) == 2500
+    assert stats_service.round_down(1000) == 1000
+    assert stats_service.round_down(1499) == 1000
+    # Centenas por debajo de 1.000: 379 consultas -> 300; 450 -> 400.
+    assert stats_service.round_down(379) == 300
+    assert stats_service.round_down(450) == 400
+    assert stats_service.round_down(999) == 900
+    # Decenas por debajo de 100: si no, 47 se publicaría como 0.
+    assert stats_service.round_down(47) == 40
+    assert stats_service.round_down(23) == 20
+    # Por debajo de 10 se publica el número tal cual.
+    assert stats_service.round_down(7) == 7
+    assert stats_service.round_down(0) == 0
+
+
+def test_round_down_never_rounds_up() -> None:
+    """Nunca hacia arriba: la cifra publicada debe ser siempre defendible ('hay al menos N')."""
+    for n in range(0, 3000):
+        assert stats_service.round_down(n) <= n
+
+
+async def test_public_stats_are_rounded_down_multiples(client: AsyncClient) -> None:
+    resp = await client.get(f"{PREFIX}/stats/public")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert set(body) == {"doctors", "consultations", "specialties"}
+    for valor in body.values():
+        assert isinstance(valor, int)
+        assert valor == stats_service.round_down(valor), "el valor publicado ya venía redondeado"
+
+
+async def test_public_stats_needs_no_token(anon_client: AsyncClient) -> None:
+    """Es la portada: si exigiera Bearer, habría que inventarse una credencial pública."""
+    resp = await anon_client.get(f"{PREFIX}/stats/public")
+    assert resp.status_code == 200, resp.text
+
+
+async def test_public_stats_counts_every_consultation_and_active_doctors(
+    db_session: AsyncSession,
+) -> None:
+    """Consultas: TODAS las creadas, sin filtrar por estado. Médicos: solo los activos.
+
+    Se comprueba por delta contra el conteo crudo, no contra la cifra publicada: el redondeo
+    absorbe incrementos pequeños y un test sobre la cifra redondeada no distinguiría entre
+    'cuenta bien' y 'no cuenta nada'.
+    """
+    antes_consultas = await db_session.scalar(select(func.count()).select_from(Consultation)) or 0
+    antes_medicos = (
+        await db_session.scalar(
+            select(func.count())
+            .select_from(Doctor)
+            .where(Doctor.status == 1, Doctor.deleted_at.is_(None))
+        )
+    ) or 0
+
+    patient = Patient(
+        full_name="Paciente Stats Publicas",
+        phone_whatsapp="+58412000002",
+        affected_zone="Caracas",
+        consent=True,
+    )
+    db_session.add(patient)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            Consultation(patient_id=patient.id, status="waiting"),
+            Consultation(patient_id=patient.id, status="cancelled"),
+            Consultation(patient_id=patient.id, status="closed"),
+        ]
+    )
+    db_session.add_all(
+        [
+            Doctor(full_name="Dr Publico Activo", user_id=None, status=1),
+            Doctor(full_name="Dr Publico De Baja", user_id=None, status=0),
+        ]
+    )
+    await db_session.flush()
+
+    despues_consultas = (
+        await db_session.scalar(select(func.count()).select_from(Consultation)) or 0
+    )
+    despues_medicos = (
+        await db_session.scalar(
+            select(func.count())
+            .select_from(Doctor)
+            .where(Doctor.status == 1, Doctor.deleted_at.is_(None))
+        )
+    ) or 0
+
+    # Las 3 consultas cuentan, incluidas la que sigue en espera y la cancelada.
+    assert despues_consultas == antes_consultas + 3
+    # Solo el médico con status=1; el de baja no.
+    assert despues_medicos == antes_medicos + 1
