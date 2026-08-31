@@ -78,13 +78,13 @@
 - [x] **T15** `cancel` (200 `open` / 409 `taken` / 403 ajena) **y** `close` (200 sobre
       `taken`, 409 sobre `open`, **403 si lo intenta el especialista**) + tests — S · *dep: T13*
       · *adelantada a la fase 4: la máquina de estados se cerraba sola con `take`*
-- [ ] **T16** `.knowledge/interconsultas.md` con los **cuatro** flujos +
+- [x] **T16** `.knowledge/interconsultas.md` con los **cuatro** flujos +
       `_EXPECTED_PREFIXES` + Swagger completo — S · *dep: T15*
 
 ### ✅ Checkpoint 5 — PR a `dev`
 
-- [ ] Suite verde, 0 fallos · cobertura ≥95% · `ruff` limpio
-- [ ] `tests/test_interconsultations.py` pasa **sin haberse editado** (cero regresión en vivo)
+- [x] Suite verde: **393 pasan, 0 fallos** · cobertura **97%** · `ruff` limpio
+- [x] `tests/test_interconsultations.py` pasa **sin haberse editado** (cero regresión en vivo)
 
 ## Fase 6 — Frontend (`dev_aws`)
 
