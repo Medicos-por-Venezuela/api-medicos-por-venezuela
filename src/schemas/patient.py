@@ -65,7 +65,16 @@ class PatientResponse(PatientBase):
     # El formato se sigue exigiendo donde toca: en PatientCreate/PatientUpdate (entrada).
     email: str | None = None
 
+    # Mismo motivo que `email`, por la otra punta: desde el alta por médico estos dos pueden ser
+    # NULL en la BD (ver la migración 20260831_170051). Heredados de PatientBase son OBLIGATORIOS,
+    # y FastAPI valida también la RESPUESTA: un solo paciente de consultorio haría fallar con 500
+    # el endpoint entero, no esa fila. La exigencia se mantiene donde corresponde, en la ENTRADA
+    # del alta pública (PatientCreate).
+    phone_whatsapp: str | None = None
+    affected_zone: str | None = None
+
     id: uuid.UUID
     consent: bool
     consent_at: datetime | None = None
     created_at: datetime
+    created_by_doctor_id: uuid.UUID | None = None

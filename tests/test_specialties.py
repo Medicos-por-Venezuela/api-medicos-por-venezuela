@@ -277,3 +277,51 @@ async def test_super_admin_can_manage_specialties(
         f"{PREFIX}/specialties", json=_payload(), headers=auth_headers(super_admin.id)
     )
     assert created.status_code == 201, created.text
+
+
+# --- selector de interconsulta (flag available_for_interconsultation) ---
+
+
+async def test_medicina_general_no_es_pedible_en_interconsulta(db_session: AsyncSession) -> None:
+    """La regla vive en la COLUMNA, no en un literal: el seed de la migración apagó el flag de
+    Medicina general. Si alguien renombra esa fila del catálogo, la regla sigue en pie."""
+    flag = await db_session.scalar(
+        select(Specialty.available_for_interconsultation).where(
+            func.lower(Specialty.name) == "medicina general",
+            Specialty.deleted_at.is_(None),
+        )
+    )
+    assert flag is False, "Medicina general debe quedar fuera del selector de interconsultas"
+
+
+async def test_listado_publico_filtra_por_flag_de_interconsulta(client: AsyncClient) -> None:
+    """`?for_interconsultation=true` es el selector del médico tratante: solo especialidades
+    de verdad. Sin el filtro, el catálogo sigue completo (lo usa el registro de médicos)."""
+    solo_pedibles = await client.get(f"{PREFIX}/specialties?for_interconsultation=true&limit=100")
+    assert solo_pedibles.status_code == 200, solo_pedibles.text
+    nombres = {s["name"].lower() for s in solo_pedibles.json()}
+    assert "medicina general" not in nombres
+    assert all(s["available_for_interconsultation"] for s in solo_pedibles.json())
+
+    completo = await client.get(f"{PREFIX}/specialties?limit=100")
+    assert completo.status_code == 200
+    assert len(completo.json()) >= len(solo_pedibles.json())
+
+
+async def test_admin_puede_reincorporar_una_especialidad_al_selector(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Excluir o reincorporar una especialidad es un PATCH, no un despliegue."""
+    especialidad = Specialty(name=f"Nefrología {uuid.uuid4().hex[:8]}")
+    db_session.add(especialidad)
+    await db_session.flush()
+
+    # Nace pedible (default true: el fallo abierto es el correcto para un catálogo).
+    assert especialidad.available_for_interconsultation is True
+
+    apagada = await client.patch(
+        f"{PREFIX}/specialties/{especialidad.id}",
+        json={"available_for_interconsultation": False},
+    )
+    assert apagada.status_code == 200, apagada.text
+    assert apagada.json()["available_for_interconsultation"] is False

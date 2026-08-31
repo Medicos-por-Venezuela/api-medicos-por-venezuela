@@ -98,11 +98,20 @@ async def _ensure_unique_specialty_name(
 
 
 async def list_specialties(
-    session: AsyncSession, skip: int = 0, limit: int = 100, status: str | None = None
+    session: AsyncSession,
+    skip: int = 0,
+    limit: int = 100,
+    status: str | None = None,
+    for_interconsultation: bool | None = None,
 ) -> list[Specialty]:
+    """Catálogo de especialidades. `for_interconsultation=True` deja solo las que se pueden
+    pedir en una interconsulta asíncrona (excluye Medicina general): es el selector del médico
+    tratante. El filtro sale de la columna, nunca de comparar nombres."""
     stmt = select(Specialty).where(Specialty.deleted_at.is_(None))
     if status:
         stmt = stmt.where(Specialty.status == status)
+    if for_interconsultation is not None:
+        stmt = stmt.where(Specialty.available_for_interconsultation.is_(for_interconsultation))
     stmt = (
         stmt.order_by(Specialty.sort_order.asc(), Specialty.created_at.desc())
         .offset(skip)
