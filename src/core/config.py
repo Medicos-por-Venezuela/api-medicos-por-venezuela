@@ -113,6 +113,13 @@ class Settings(BaseSettings):
     # Sandbox (Email Testing): si se define el inbox, entrega ahí en vez de enviar de verdad —
     # ideal para probar plantillas en dev sin spamear correos reales.
     MAILTRAP_INBOX_ID: str | None = None
+    # Difusión (fan-out de interconsultas). Una especialidad puede tener cientos de médicos:
+    # un correo por cabeza serían cientos de peticiones al stream transaccional. Se manda por
+    # el stream BULK de Mailtrap, en lotes por BCC.
+    MAIL_BULK_BATCH_SIZE: int = 50
+    # Tope duro de destinatarios por difusión. Si se supera, se notifica hasta el tope y se
+    # LOGUEA el recorte: un truncamiento silencioso se leería como "se notificó a todos".
+    MAIL_FANOUT_MAX: int = 500
 
     # --- CORS ---
     BACKEND_CORS_ORIGINS: str = "*"

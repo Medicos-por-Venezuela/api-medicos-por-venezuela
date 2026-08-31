@@ -35,20 +35,23 @@
 
 ## Fase 3 — Solicitar y difundir
 
-- [ ] **T7** `mail`: stream `bulk=True` + `bcc` + `send_bulk` en lotes de 50 con tope
+- [x] **T7** `mail`: stream `bulk=True` + `bcc` + `send_bulk` en lotes de 50 con tope
       `INTERCONSULTATION_FANOUT_MAX` · *sandbox debe seguir ganando sobre bulk* — S
-- [ ] **T8** Eventos `interconsultation_request_broadcast` y `..._taken` en
+- [x] **T8** Eventos `interconsultation_request_broadcast` y `..._taken` en
       `NOTIFICATION_EVENTS` · *test: el correo no lleva PII del paciente* — S · *dep: T7*
-- [ ] **T9** Service `create` (ambos modos, 422 si la especialidad no es elegible, 403 si el
+- [x] **T9** Service `create` (ambos modos, 422 si la especialidad no es elegible, 403 si el
       paciente no es suyo, `commit()` explícito) — M · *dep: T2, T3, T5, T8*
-- [ ] **T10** Router `POST /interconsultation-requests` + `GET /mine` — **congela el
+- [x] **T10** Router `POST /interconsultation-requests` + `GET /mine` — **congela el
       contrato del frontend** — M · *dep: T9*
 
 ### ✅ Checkpoint 3
 
-- [ ] Crear solicitud dispara los correos (verificado en Inbucket)
-- [ ] `notified_count` coincide con los elegibles
-- [ ] 🚀 **La fase 6 ya puede arrancar en paralelo**
+- [ ] Crear solicitud dispara los correos **en vivo** — BLOQUEADO: `.env` local tiene
+      token real de Mailtrap y **sin** `MAILTRAP_INBOX_ID`, así que un fan-out local le
+      escribiría a los médicos reales del backup restaurado. Definir el inbox de sandbox
+      antes de verificar. El envío sí está cubierto por tests que espían el SDK.
+- [x] `notified_count` coincide con los elegibles
+- [x] 🚀 **La fase 6 ya puede arrancar en paralelo** (contrato congelado en T10)
 
 ## Fase 4 — Bandeja y toma
 
