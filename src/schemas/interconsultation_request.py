@@ -65,6 +65,59 @@ class InterconsultationRequestCreate(BaseModel):
         return self
 
 
+class InterconsultationRequestInbox(BaseModel):
+    """Lo que ve el ESPECIALISTA **antes** de tomar el caso. Anonimizado.
+
+    Esta clase ES la frontera de datos, no un filtro sobre ella: los campos prohibidos no están
+    declarados, así que no pueden escaparse aunque la query los traiga. Antes de agregar un campo
+    acá, preguntate si el especialista lo necesita para decidir si toma el caso.
+
+    NUNCA: nombre, cédula, teléfono, correo, zona ni descripción del paciente — el paciente no es
+    usuario de la plataforma y su relación es con su médico. Tampoco la identidad del médico que
+    pide: que el caso se elija por el caso, no por quién pregunta.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    specialty_id: uuid.UUID
+    specialty_name: str | None = None
+    chief_complaint: str
+    clinical_notes: str | None = None
+    # Solo el RANGO etario, nunca la fecha de nacimiento: alcanza para valorar el caso.
+    patient_age_range: str | None = None
+    # Si la solicitud venía dirigida a este especialista en concreto (modo 'doctor').
+    dirigida_a_mi: bool = False
+    created_at: datetime
+
+
+class InterconsultationRequestTaken(BaseModel):
+    """Lo que recibe el especialista **al tomar** el caso: el contacto del médico TRATANTE.
+
+    Es el objetivo de todo el flujo — que los dos médicos se hablen fuera de la plataforma. Se
+    suma la identidad del tratante, nunca la del paciente.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    status: str
+    taken_at: datetime
+    specialty_name: str | None = None
+    chief_complaint: str
+    clinical_notes: str | None = None
+    patient_age_range: str | None = None
+    requesting_doctor: DoctorContact
+
+
+class InterconsultationRequestClose(BaseModel):
+    """Cierre del caso por el médico tratante (nota opcional)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    closing_note: str | None = Field(default=None, max_length=2000)
+
+
 class InterconsultationRequestResponse(BaseModel):
     """Lo que ve el MÉDICO TRATANTE de su propia solicitud: todo lo suyo.
 

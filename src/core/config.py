@@ -110,6 +110,9 @@ class Settings(BaseSettings):
     MAILTRAP_API_TOKEN: str = ""
     MAIL_FROM_EMAIL: str = "no-reply@medicosporvenezuela.org"
     MAIL_FROM_NAME: str = "Médicos por Venezuela"
+    # Base para los enlaces de los correos. El apex es el host canónico (www quedó con fallo de
+    # TLS). Sin barra final: los constructores de enlaces la ponen.
+    FRONTEND_URL: str = "https://medicosporvenezuela.org"
     # Sandbox (Email Testing): si se define el inbox, entrega ahí en vez de enviar de verdad —
     # ideal para probar plantillas en dev sin spamear correos reales.
     MAILTRAP_INBOX_ID: str | None = None

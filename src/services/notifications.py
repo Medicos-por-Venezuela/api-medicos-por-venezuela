@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import settings
 from src.core.errors import NotFoundError
 from src.models.consultation import Consultation
 from src.models.patient import Patient
@@ -244,6 +245,12 @@ async def send_due_reminders(session: AsyncSession, window_minutes: int = 30) ->
 _MOTIVO_EN_CORREO = 200
 
 
+def panel_url() -> str:
+    """Enlace al panel médico. La base es configurable (`FRONTEND_URL`) para que un cambio de
+    dominio no obligue a tocar código."""
+    return f"{settings.FRONTEND_URL.rstrip('/')}/panel-medico"
+
+
 def _recorta(texto: str, tope: int = _MOTIVO_EN_CORREO) -> str:
     texto = " ".join(texto.split())
     return texto if len(texto) <= tope else texto[: tope - 1].rstrip() + "…"
@@ -258,18 +265,19 @@ def interconsultation_broadcast_email(
     edad_html = f"<strong>Edad:</strong> {age_range}<br>" if age_range else ""
     motivo = _recorta(chief_complaint)
     subject = f"Solicitud de interconsulta en {specialty_name}"
+    panel = panel_url()
     text = (
         f"Un colega busca apoyo de {specialty_name}.\n\n"
         f"{edad}Motivo: {motivo}\n\n"
-        "Ingresa a tu panel en Médicos por Venezuela para ver el caso y tomarlo si puedes "
-        "ayudar. El primer especialista que lo tome recibe los datos de contacto del médico "
-        "tratante.\n"
+        f"Entra a tu panel para ver el caso y tomarlo si puedes ayudar:\n{panel}\n\n"
+        "El primer especialista que lo tome recibe los datos de contacto del médico tratante.\n"
     )
     html = (
         f"<p>Un colega busca apoyo de <strong>{specialty_name}</strong>.</p>"
         f"<p>{edad_html}<strong>Motivo:</strong> {motivo}</p>"
-        "<p>Ingresa a tu panel en Médicos por Venezuela para ver el caso y tomarlo si puedes "
-        "ayudar. El primer especialista que lo tome recibe los datos de contacto del médico "
+        f'<p><a href="{panel}">Entra a tu panel</a> para ver el caso y tomarlo si puedes '
+        "ayudar.</p>"
+        "<p>El primer especialista que lo tome recibe los datos de contacto del médico "
         "tratante.</p>"
     )
     return subject, text, html
@@ -282,16 +290,16 @@ def interconsultation_taken_email(
     quien = specialist_name or f"Un especialista en {specialty_name}"
     motivo = _recorta(chief_complaint)
     subject = "Un especialista tomó tu solicitud de interconsulta"
+    panel = panel_url()
     text = (
         f"{quien} tomó tu solicitud de interconsulta.\n\n"
         f"Motivo del caso: {motivo}\n\n"
-        "Se pondrá en contacto contigo. También puedes ver sus datos en tu panel de "
-        "Médicos por Venezuela.\n"
+        f"Se pondrá en contacto contigo. Sus datos también están en tu panel:\n{panel}\n"
     )
     html = (
         f"<p><strong>{quien}</strong> tomó tu solicitud de interconsulta.</p>"
         f"<p><strong>Motivo del caso:</strong> {motivo}</p>"
-        "<p>Se pondrá en contacto contigo. También puedes ver sus datos en tu panel de "
-        "Médicos por Venezuela.</p>"
+        "<p>Se pondrá en contacto contigo. Sus datos también están en "
+        f'<a href="{panel}">tu panel</a>.</p>'
     )
     return subject, text, html

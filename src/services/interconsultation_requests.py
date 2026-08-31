@@ -9,11 +9,17 @@ Ver .knowledge/interconsultas.md y tasks/interconsulta-asincrona/spec.md.
 """
 
 import uuid
+from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.errors import ConflictError, NotFoundError, UnprocessableError
+from src.core.errors import (
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    UnprocessableError,
+)
 from src.models.doctor import Doctor
 from src.models.interconsultation_request import InterconsultationRequest
 from src.models.patient import Patient
@@ -22,7 +28,9 @@ from src.models.specialty import Specialty
 from src.schemas.interconsultation_request import (
     DoctorContact,
     InterconsultationRequestCreate,
+    InterconsultationRequestInbox,
     InterconsultationRequestResponse,
+    InterconsultationRequestTaken,
 )
 from src.services import audit, notifications
 from src.services import patients as patients_service
@@ -253,3 +261,253 @@ async def list_mine(
     )
     rows = (await session.execute(stmt)).scalars().all()
     return [await _to_response(session, row) for row in rows]
+
+
+# --- Bandeja del especialista y toma del caso ---
+
+
+async def inbox(
+    session: AsyncSession, doctor_id: uuid.UUID, skip: int = 0, limit: int = 100
+) -> list[InterconsultationRequestInbox]:
+    """Solicitudes ABIERTAS que este especialista puede tomar, ANONIMIZADAS.
+
+    Son las de su especialidad más las dirigidas a él. Nunca las propias: pedir ayuda y
+    ofrecerla son los dos lados del mismo feature, pero no sobre el mismo caso.
+    """
+    me = await session.get(Profile, doctor_id)
+    mi_especialidad = me.specialty_id if me else None
+
+    condiciones = [InterconsultationRequest.target_doctor_id == doctor_id]
+    if mi_especialidad is not None:
+        # Las difusiones llegan por especialidad; una dirigida a OTRO médico no se ve aunque
+        # compartan especialidad — ya tiene destinatario elegido.
+        condiciones.append(
+            and_(
+                InterconsultationRequest.specialty_id == mi_especialidad,
+                InterconsultationRequest.target_doctor_id.is_(None),
+            )
+        )
+
+    stmt = (
+        select(InterconsultationRequest, Specialty.name, Patient.age_range)
+        .join(Specialty, Specialty.id == InterconsultationRequest.specialty_id)
+        .outerjoin(Patient, Patient.id == InterconsultationRequest.patient_id)
+        .where(
+            InterconsultationRequest.status == "open",
+            InterconsultationRequest.requesting_doctor_id != doctor_id,
+            or_(*condiciones),
+        )
+        .order_by(InterconsultationRequest.created_at.desc(), InterconsultationRequest.id)
+        .offset(skip)
+        .limit(limit)
+    )
+    return [
+        InterconsultationRequestInbox(
+            id=row.id,
+            specialty_id=row.specialty_id,
+            specialty_name=specialty_name,
+            chief_complaint=row.chief_complaint,
+            clinical_notes=row.clinical_notes,
+            patient_age_range=age_range,
+            dirigida_a_mi=row.target_doctor_id == doctor_id,
+            created_at=row.created_at,
+        )
+        for row, specialty_name, age_range in (await session.execute(stmt)).all()
+    ]
+
+
+async def _puede_tomar(
+    session: AsyncSession, row: InterconsultationRequest, doctor_id: uuid.UUID
+) -> bool:
+    """Elegibilidad para tomar: destinatario elegido, o médico de la especialidad pedida."""
+    if row.target_doctor_id is not None:
+        return row.target_doctor_id == doctor_id
+    me = await session.get(Profile, doctor_id)
+    return bool(me and me.specialty_id == row.specialty_id)
+
+
+async def take(
+    session: AsyncSession, request_id: uuid.UUID, doctor_id: uuid.UUID
+) -> tuple[InterconsultationRequestTaken, dict | None]:
+    """El especialista toma el caso. Devuelve (respuesta, args del correo al tratante).
+
+    Dos especialistas pueden hacer clic en el mismo milisegundo. NUNCA select+update común: se
+    bloquea la fila SI sigue 'open' con `with_for_update(nowait=True)`, así el perdedor recibe un
+    error de lock inmediato (55P03 -> 409 por el manejador global) en vez de quedarse colgado
+    esperando a que el otro termine. Mismo patrón que la cola (`services/queue.py`).
+    """
+    existe = await session.get(InterconsultationRequest, request_id)
+    if existe is None:
+        raise NotFoundError("Solicitud de interconsulta no encontrada.")
+    if existe.requesting_doctor_id == doctor_id:
+        raise ConflictError("No puedes tomar tu propia solicitud.")
+    if not await _puede_tomar(session, existe, doctor_id):
+        raise ForbiddenError("Esta interconsulta no es para tu especialidad.")
+
+    row = (
+        await session.execute(
+            select(InterconsultationRequest)
+            .where(
+                InterconsultationRequest.id == request_id,
+                InterconsultationRequest.status == "open",
+            )
+            .with_for_update(nowait=True)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        # La fila existe (se comprobó arriba) pero ya no está abierta: otro llegó primero, o el
+        # tratante la canceló.
+        raise ConflictError("Esta interconsulta ya no está disponible.")
+
+    row.status = "taken"
+    row.taken_by_doctor_id = doctor_id
+    row.taken_at = datetime.now(UTC)
+
+    tratante = await session.get(Profile, row.requesting_doctor_id)
+    specialty_name = await session.scalar(
+        select(Specialty.name).where(Specialty.id == row.specialty_id)
+    )
+
+    # Se audita la toma Y, con ella, la revelación del contacto: a partir de acá este
+    # especialista tiene el teléfono de un colega (mismo criterio que `doctor.contact_viewed`).
+    await audit.log_action(
+        session,
+        action="interconsultation_request.taken",
+        actor_user_id=doctor_id,
+        resource="interconsultation_requests",
+        resource_id=row.id,
+        metadata={"requesting_doctor_id": str(row.requesting_doctor_id)},
+    )
+    await session.commit()
+    await session.refresh(row)
+
+    respuesta = InterconsultationRequestTaken(
+        id=row.id,
+        status=row.status,
+        taken_at=row.taken_at,
+        specialty_name=specialty_name,
+        chief_complaint=row.chief_complaint,
+        clinical_notes=row.clinical_notes,
+        patient_age_range=await session.scalar(
+            select(Patient.age_range).where(Patient.id == row.patient_id)
+        ),
+        requesting_doctor=DoctorContact.model_validate(tratante),
+    )
+
+    especialista = await session.get(Profile, doctor_id)
+    subject, text, html = notifications.interconsultation_taken_email(
+        especialista.full_name if especialista else None,
+        specialty_name or "",
+        row.chief_complaint,
+    )
+    aviso = await notifications.doctor_event_email_args(
+        session,
+        user_id=row.requesting_doctor_id,
+        event=TAKEN_EVENT,
+        subject=subject,
+        text=text,
+        html=html,
+    )
+    return respuesta, aviso
+
+
+async def taken_by_me(
+    session: AsyncSession, doctor_id: uuid.UUID, skip: int = 0, limit: int = 100
+) -> list[InterconsultationRequestTaken]:
+    """Casos ACTIVOS que tomó este especialista, con el contacto del tratante.
+
+    Sin esta lista perdería ese contacto al recargar la página y el flujo se cortaría justo en el
+    paso que lo justifica. El historial de casos ya cerrados es otra iteración.
+    """
+    stmt = (
+        select(InterconsultationRequest, Specialty.name, Patient.age_range)
+        .join(Specialty, Specialty.id == InterconsultationRequest.specialty_id)
+        .outerjoin(Patient, Patient.id == InterconsultationRequest.patient_id)
+        .where(
+            InterconsultationRequest.taken_by_doctor_id == doctor_id,
+            InterconsultationRequest.status == "taken",
+        )
+        .order_by(InterconsultationRequest.taken_at.desc(), InterconsultationRequest.id)
+        .offset(skip)
+        .limit(limit)
+    )
+    salida = []
+    for row, specialty_name, age_range in (await session.execute(stmt)).all():
+        tratante = await session.get(Profile, row.requesting_doctor_id)
+        salida.append(
+            InterconsultationRequestTaken(
+                id=row.id,
+                status=row.status,
+                taken_at=row.taken_at,
+                specialty_name=specialty_name,
+                chief_complaint=row.chief_complaint,
+                clinical_notes=row.clinical_notes,
+                patient_age_range=age_range,
+                requesting_doctor=DoctorContact.model_validate(tratante),
+            )
+        )
+    return salida
+
+
+# --- Transiciones terminales (exclusivas del médico TRATANTE) ---
+
+
+async def _mia(
+    session: AsyncSession, request_id: uuid.UUID, doctor_id: uuid.UUID
+) -> InterconsultationRequest:
+    row = await session.get(InterconsultationRequest, request_id)
+    if row is None:
+        raise NotFoundError("Solicitud de interconsulta no encontrada.")
+    if row.requesting_doctor_id != doctor_id:
+        raise ForbiddenError("Esta solicitud no es tuya.")
+    return row
+
+
+async def cancel(
+    session: AsyncSession, request_id: uuid.UUID, doctor_id: uuid.UUID
+) -> InterconsultationRequestResponse:
+    """El tratante retira una solicitud que nadie tomó todavía."""
+    row = await _mia(session, request_id, doctor_id)
+    if row.status != "open":
+        raise ConflictError("Solo se puede cancelar una solicitud abierta.")
+    row.status = "cancelled"
+    row.cancelled_at = datetime.now(UTC)
+    await audit.log_action(
+        session,
+        action="interconsultation_request.cancelled",
+        actor_user_id=doctor_id,
+        resource="interconsultation_requests",
+        resource_id=row.id,
+    )
+    await session.commit()
+    await session.refresh(row)
+    return await _to_response(session, row)
+
+
+async def close(
+    session: AsyncSession,
+    request_id: uuid.UUID,
+    doctor_id: uuid.UUID,
+    closing_note: str | None = None,
+) -> InterconsultationRequestResponse:
+    """Cierra un caso ya tomado.
+
+    Transición EXCLUSIVA del médico tratante: el especialista no cierra ni suelta el caso. Quien
+    sabe si la ayuda sirvió es quien la pidió.
+    """
+    row = await _mia(session, request_id, doctor_id)
+    if row.status != "taken":
+        raise ConflictError("Solo se puede cerrar una solicitud que un especialista haya tomado.")
+    row.status = "closed"
+    row.closed_at = datetime.now(UTC)
+    row.closing_note = closing_note
+    await audit.log_action(
+        session,
+        action="interconsultation_request.closed",
+        actor_user_id=doctor_id,
+        resource="interconsultation_requests",
+        resource_id=row.id,
+    )
+    await session.commit()
+    await session.refresh(row)
+    return await _to_response(session, row)

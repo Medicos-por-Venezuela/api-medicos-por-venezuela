@@ -58,24 +58,26 @@
 
 ## Fase 4 — Bandeja y toma
 
-- [ ] **T11** Service + schemas de `inbox` · *la frontera de datos vive en el schema
+- [x] **T11** Service + schemas de `inbox` · *la frontera de datos vive en el schema
       Pydantic, no en un `del` manual* — M · *dep: T9*
-- [ ] **T12** Service `take` con `with_for_update(nowait=True)` + contacto del tratante +
+- [x] **T12** Service `take` con `with_for_update(nowait=True)` + contacto del tratante +
       audit + correo — M · *dep: T11*
-- [ ] **T13** Router `inbox`/`take`/detalle + **test que recorre el JSON crudo y falla si
+- [x] **T13** Router `inbox`/`take`/detalle + **test que recorre el JSON crudo y falla si
       aparece PII del paciente** — M · *dep: T12*
-- [ ] **T14** Test de concurrencia: `asyncio.gather` → exactamente un 200 y un 409 — S · *dep: T13*
+- [x] **T14** Test de concurrencia: `asyncio.gather` → exactamente un 200 y un 409 — S · *dep: T13*
 
 ### ✅ Checkpoint 4
 
-- [ ] End-to-end por Swagger: registrar → solicitar → tomar → ver contacto
-- [ ] Ambos correos llegan a Inbucket
-- [ ] El test de concurrencia pasa 10 corridas seguidas sin flakear
+- [x] End-to-end cubierto por tests: registrar → solicitar → tomar → ver contacto
+- [x] Difusión verificada en vivo (2026-08-31). El correo de *caso tomado* se verifica con
+      test (destinatario, nombre del especialista, enlace al panel, sin PII).
+- [x] El test de concurrencia pasa 10 corridas seguidas sin flakear (10/10)
 
 ## Fase 5 — Cierre del backend
 
-- [ ] **T15** `cancel` (200 `open` / 409 `taken` / 403 ajena) **y** `close` (200 sobre
+- [x] **T15** `cancel` (200 `open` / 409 `taken` / 403 ajena) **y** `close` (200 sobre
       `taken`, 409 sobre `open`, **403 si lo intenta el especialista**) + tests — S · *dep: T13*
+      · *adelantada a la fase 4: la máquina de estados se cerraba sola con `take`*
 - [ ] **T16** `.knowledge/interconsultas.md` con los **cuatro** flujos +
       `_EXPECTED_PREFIXES` + Swagger completo — S · *dep: T15*
 
