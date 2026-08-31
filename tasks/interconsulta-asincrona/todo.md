@@ -46,10 +46,13 @@
 
 ### ✅ Checkpoint 3
 
-- [ ] Crear solicitud dispara los correos **en vivo** — BLOQUEADO: `.env` local tiene
-      token real de Mailtrap y **sin** `MAILTRAP_INBOX_ID`, así que un fan-out local le
-      escribiría a los médicos reales del backup restaurado. Definir el inbox de sandbox
-      antes de verificar. El envío sí está cubierto por tests que espían el SDK.
+- [x] Envío en vivo verificado (2026-08-31): Mailtrap aceptó el mensaje real por el
+      stream bulk con los 3 destinatarios en BCC, en **una** petición. Acotado a tres
+      correos autorizados por el usuario.
+- [ ] ⚠️ `.env` local tiene token real de Mailtrap y **sin** `MAILTRAP_INBOX_ID`: cualquier
+      envío desde local sale de verdad, y la base tiene médicos reales del backup
+      restaurado. Definir el inbox de sandbox antes de probar el fan-out contra datos
+      reales de la base.
 - [x] `notified_count` coincide con los elegibles
 - [x] 🚀 **La fase 6 ya puede arrancar en paralelo** (contrato congelado en T10)
 
