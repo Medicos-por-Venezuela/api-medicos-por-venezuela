@@ -189,6 +189,20 @@ Dos permisos nuevos, sembrados en migración (nunca a mano), mapeados al rol `do
 
 No se toca el `POST /patients` público ni `GET /patients/me` (portal del paciente).
 
+#### Cambio al listado staff existente (aprobado 2026-08-31)
+
+`patients.read` lo tiene **todo médico**, así que `GET /patients` dejaba ver a cualquier colega
+el nombre, la cédula y las alergias de los pacientes de consultorio de otro — incoherente con
+anonimizar el caso en la bandeja de interconsultas. Se cerró:
+
+| Endpoint | Antes | Ahora |
+|---|---|---|
+| `GET /patients` | todos los pacientes | solo los de la cola pública. `?scope=all` los incluye, y **exige `patients.write`** (admin) |
+| `GET /patients/{id}` | cualquier paciente | **403** si es de consultorio y el llamante no tiene `patients.write` |
+
+El dueño sigue leyendo el suyo por `/doctors/me/patients/{id}`; el admin conserva la visión
+completa pidiendo `scope=all`.
+
 ### Solicitudes de interconsulta
 
 | Método | Ruta | Permiso | Qué hace |

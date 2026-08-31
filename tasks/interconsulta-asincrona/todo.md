@@ -5,33 +5,33 @@
 
 ## Fase 1 — Fundación de datos (API)
 
-- [ ] **T1** Migración: `patients.created_by_doctor_id` + `phone_whatsapp`/`affected_zone`
+- [x] **T1** Migración: `patients.created_by_doctor_id` + `phone_whatsapp`/`affected_zone`
       nullable con CHECK · *auditar antes los usos de `phone_whatsapp`* — S
-- [ ] **T2** Migración + modelo `interconsultation_requests` (CHECKs de `mode`/`status`/
+- [x] **T2** Migración + modelo `interconsultation_requests` (CHECKs de `mode`/`status`/
       `target_doctor_id`, 4 índices, RLS deny-all) · *4 estados:
       `open`/`taken`/`closed`/`cancelled` + `closed_at` + `closing_note`* — S
-- [ ] **T3** Migración `specialties.available_for_interconsultation` + Medicina general en
+- [x] **T3** Migración `specialties.available_for_interconsultation` + Medicina general en
       `false` + filtro en `GET /specialties` · *sin literales en el código* — M
-- [ ] **T4** Migración: seed de `interconsultation_requests.write` y `.take` → doctor/admin/
+- [x] **T4** Migración: seed de `interconsultation_requests.write` y `.take` → doctor/admin/
       super_admin — XS
 
 ### ✅ Checkpoint 1
 
-- [ ] `python artisan migrate` limpio en base nueva **y** con datos restaurados
-- [ ] Suite completa verde (273+, 0 fallos) — nada existente roto
-- [ ] `ruff check` / `ruff format` limpios
+- [x] `python artisan migrate` limpio en base nueva **y** con datos restaurados
+- [x] Suite completa verde (0 fallos) — nada existente roto
+- [x] `ruff check` / `ruff format` limpios
 
 ## Fase 2 — El médico registra su paciente
 
-- [ ] **T5** Service + schemas: alta/listado/edición/soft-delete de pacientes propios
+- [x] **T5** Service + schemas: alta/listado/edición/soft-delete de pacientes propios
       (`consent=true` obligatorio, pertenencia) — M · *dep: T1*
-- [ ] **T6** Router `/doctors/me/patients` + tests **con IDOR cubierto** — M · *dep: T5*
+- [x] **T6** Router `/doctors/me/patients` + tests **con IDOR cubierto** — M · *dep: T5*
 
 ### ✅ Checkpoint 2
 
-- [ ] Alta por Swagger sin WhatsApp ni zona afectada
-- [ ] El paciente no aparece en la cola pública ni para otro médico
-- [ ] Cobertura ≥95% en lo tocado
+- [x] Alta por Swagger sin WhatsApp ni zona afectada
+- [x] El paciente no aparece en la cola pública ni para otro médico
+- [x] Cobertura ≥95% en lo tocado
 
 ## Fase 3 — Solicitar y difundir
 

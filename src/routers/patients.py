@@ -5,11 +5,13 @@ eliminar requieren admin (replica las RLS).
 """
 
 import uuid
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
+from src.core.errors import ForbiddenError
 from src.core.ratelimit import limiter
 from src.core.security import Principal, get_current_principal, require_permission
 from src.db.session import get_db
@@ -24,15 +26,37 @@ tag_metadata = [
 _NOT_FOUND = {404: {"description": "Paciente no encontrado."}}
 
 
-@router.get("", response_model=list[PatientResponse], summary="Listar pacientes (staff)")
+@router.get(
+    "",
+    response_model=list[PatientResponse],
+    summary="Listar pacientes (staff)",
+    responses={403: {"description": "`scope=all` requiere el permiso patients.write."}},
+)
 async def list_patients(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=100),
+    scope: Literal["public", "all"] = Query(
+        "public",
+        description=(
+            "'public' (default) = solo pacientes de la cola pública. 'all' incluye además los "
+            "de consultorio registrados por médicos; requiere patients.write."
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("patients.read")),
+    principal: Principal = Depends(require_permission("patients.read")),
 ) -> list[PatientResponse]:
-    """Lista paginada de pacientes (más recientes primero)."""
-    return await patients_service.list_patients(db, skip=skip, limit=limit)
+    """Lista paginada de pacientes (más recientes primero).
+
+    Por defecto excluye los pacientes **de consultorio**: son privados del médico que los
+    registró y `patients.read` lo tiene todo médico. Para verlos hace falta `patients.write`
+    (admin) y pedir `scope=all` explícitamente."""
+    if scope == "all" and not principal.has_permission("patients.write"):
+        raise ForbiddenError(
+            "Ver los pacientes de consultorio requiere el permiso patients.write."
+        )
+    return await patients_service.list_patients(
+        db, skip=skip, limit=limit, include_doctor_patients=scope == "all"
+    )
 
 
 @router.post(
@@ -79,9 +103,13 @@ async def list_my_patients(
 async def get_patient(
     patient_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("patients.read")),
+    principal: Principal = Depends(require_permission("patients.read")),
 ) -> PatientResponse:
-    return await patients_service.get_patient(db, patient_id)
+    """Un paciente de la cola pública. Los de consultorio dan 403 por acá: los lee su médico en
+    `/doctors/me/patients/{id}`, o un admin (`patients.write`)."""
+    return await patients_service.get_patient_as_staff(
+        db, patient_id, may_see_doctor_patients=principal.has_permission("patients.write")
+    )
 
 
 @router.patch(
