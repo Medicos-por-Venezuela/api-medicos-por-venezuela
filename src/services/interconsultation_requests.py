@@ -8,12 +8,14 @@ No confundir con `interconsultations` (segunda opinión EN VIVO durante una cons
 Ver .knowledge/interconsultas.md y tasks/interconsulta-asincrona/spec.md.
 """
 
+import logging
 import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import settings
 from src.core.errors import (
     ConflictError,
     ForbiddenError,
@@ -34,6 +36,8 @@ from src.schemas.interconsultation_request import (
 )
 from src.services import audit, notifications
 from src.services import patients as patients_service
+
+logger = logging.getLogger("mpv.api")
 
 BROADCAST_EVENT = "interconsultation_request_broadcast"
 TAKEN_EVENT = "interconsultation_request_taken"
@@ -129,29 +133,38 @@ async def _destinatarios(
 # --- Respuestas ---
 
 
-async def _contacto(session: AsyncSession, user_id: uuid.UUID | None) -> DoctorContact | None:
-    if user_id is None:
-        return None
-    profile = await session.get(Profile, user_id)
-    return DoctorContact.model_validate(profile) if profile else None
+async def _contactos(
+    session: AsyncSession, user_ids: set[uuid.UUID | None]
+) -> dict[uuid.UUID, DoctorContact]:
+    """Contactos de varios médicos en UNA query.
+
+    Existe para que los listados no hagan un `get` por fila: con `session.get` por colega,
+    `taken_by_me` emitía una consulta por cada médico tratante distinto (medido: 20 filas = 20
+    queries). El identity map lo disimula cuando se repite el mismo médico, que es justo el caso
+    que NO se da en producción.
+    """
+    ids = {i for i in user_ids if i is not None}
+    if not ids:
+        return {}
+    perfiles = (await session.execute(select(Profile).where(Profile.id.in_(ids)))).scalars().all()
+    return {p.id: DoctorContact.model_validate(p) for p in perfiles}
 
 
-async def _to_response(
-    session: AsyncSession, row: InterconsultationRequest
+def _build_response(
+    row: InterconsultationRequest,
+    patient_name: str | None,
+    specialty_name: str | None,
+    contactos: dict[uuid.UUID, DoctorContact],
 ) -> InterconsultationRequestResponse:
-    """Vista del médico TRATANTE. Incluye el nombre de su paciente (es suyo) y el contacto de
-    los colegas involucrados."""
+    """Mapeo puro (sin BD) de una fila a la vista del médico TRATANTE. Lo comparten el listado
+    —que trae los nombres por join y los contactos en lote— y las respuestas de una sola fila."""
     return InterconsultationRequestResponse(
         id=row.id,
         patient_id=row.patient_id,
-        patient_name=await session.scalar(
-            select(Patient.full_name).where(Patient.id == row.patient_id)
-        ),
+        patient_name=patient_name,
         mode=row.mode,
         specialty_id=row.specialty_id,
-        specialty_name=await session.scalar(
-            select(Specialty.name).where(Specialty.id == row.specialty_id)
-        ),
+        specialty_name=specialty_name,
         chief_complaint=row.chief_complaint,
         clinical_notes=row.clinical_notes,
         status=row.status,
@@ -160,8 +173,20 @@ async def _to_response(
         taken_at=row.taken_at,
         closed_at=row.closed_at,
         cancelled_at=row.cancelled_at,
-        target_doctor=await _contacto(session, row.target_doctor_id),
-        taken_by=await _contacto(session, row.taken_by_doctor_id),
+        target_doctor=contactos.get(row.target_doctor_id) if row.target_doctor_id else None,
+        taken_by=contactos.get(row.taken_by_doctor_id) if row.taken_by_doctor_id else None,
+    )
+
+
+async def _to_response(
+    session: AsyncSession, row: InterconsultationRequest
+) -> InterconsultationRequestResponse:
+    """Vista del médico TRATANTE para UNA fila (crear, cancelar, cerrar)."""
+    return _build_response(
+        row,
+        await session.scalar(select(Patient.full_name).where(Patient.id == row.patient_id)),
+        await session.scalar(select(Specialty.name).where(Specialty.id == row.specialty_id)),
+        await _contactos(session, {row.target_doctor_id, row.taken_by_doctor_id}),
     )
 
 
@@ -201,6 +226,18 @@ async def create_request(
         requesting_doctor_id=requesting_doctor_id,
         target_doctor_id=data.target_doctor_id,
     )
+    # El tope se aplica ACÁ y no solo dentro de `send_bulk`, porque de lo contrario
+    # `notified_count` diría 800 mientras salían 500 correos: la UI le prometería al médico que
+    # se avisó a gente a la que nadie avisó. El recorte de `send_bulk` queda como red de
+    # seguridad para otros llamadores.
+    if len(destinatarios) > settings.MAIL_FANOUT_MAX:
+        logger.warning(
+            "INTERCONSULTA:destinatarios_recortados especialidad=%s elegibles=%d tope=%d",
+            specialty_id,
+            len(destinatarios),
+            settings.MAIL_FANOUT_MAX,
+        )
+        destinatarios = destinatarios[: settings.MAIL_FANOUT_MAX]
 
     row = InterconsultationRequest(
         patient_id=patient.id,
@@ -249,9 +286,16 @@ async def create_request(
 async def list_mine(
     session: AsyncSession, requesting_doctor_id: uuid.UUID, skip: int = 0, limit: int = 100
 ) -> list[InterconsultationRequestResponse]:
-    """Las solicitudes del médico tratante, más recientes primero."""
+    """Las solicitudes del médico tratante, más recientes primero.
+
+    Dos queries fijas, no dos por fila: los nombres vienen por JOIN y los contactos en lote. Con
+    `_to_response` por fila esto era 2N+1 (medido: 41 consultas para 20 filas, 201 con el límite
+    de 100).
+    """
     stmt = (
-        select(InterconsultationRequest)
+        select(InterconsultationRequest, Patient.full_name, Specialty.name)
+        .outerjoin(Patient, Patient.id == InterconsultationRequest.patient_id)
+        .join(Specialty, Specialty.id == InterconsultationRequest.specialty_id)
         .where(InterconsultationRequest.requesting_doctor_id == requesting_doctor_id)
         # `id` como desempate: sin columna única al final, dos solicitudes del mismo instante
         # pueden repetirse u omitirse entre páginas con OFFSET.
@@ -259,8 +303,15 @@ async def list_mine(
         .offset(skip)
         .limit(limit)
     )
-    rows = (await session.execute(stmt)).scalars().all()
-    return [await _to_response(session, row) for row in rows]
+    filas = (await session.execute(stmt)).all()
+    contactos = await _contactos(
+        session,
+        {r.target_doctor_id for r, _, _ in filas} | {r.taken_by_doctor_id for r, _, _ in filas},
+    )
+    return [
+        _build_response(row, patient_name, specialty_name, contactos)
+        for row, patient_name, specialty_name in filas
+    ]
 
 
 # --- Bandeja del especialista y toma del caso ---
@@ -431,22 +482,23 @@ async def taken_by_me(
         .offset(skip)
         .limit(limit)
     )
-    salida = []
-    for row, specialty_name, age_range in (await session.execute(stmt)).all():
-        tratante = await session.get(Profile, row.requesting_doctor_id)
-        salida.append(
-            InterconsultationRequestTaken(
-                id=row.id,
-                status=row.status,
-                taken_at=row.taken_at,
-                specialty_name=specialty_name,
-                chief_complaint=row.chief_complaint,
-                clinical_notes=row.clinical_notes,
-                patient_age_range=age_range,
-                requesting_doctor=DoctorContact.model_validate(tratante),
-            )
+    filas = (await session.execute(stmt)).all()
+    # En lote: un especialista acumula casos de médicos DISTINTOS, así que un `get` por fila era
+    # una consulta por caso (medido: 20 filas = 20 queries).
+    tratantes = await _contactos(session, {r.requesting_doctor_id for r, _, _ in filas})
+    return [
+        InterconsultationRequestTaken(
+            id=row.id,
+            status=row.status,
+            taken_at=row.taken_at,
+            specialty_name=specialty_name,
+            chief_complaint=row.chief_complaint,
+            clinical_notes=row.clinical_notes,
+            patient_age_range=age_range,
+            requesting_doctor=tratantes[row.requesting_doctor_id],
         )
-    return salida
+        for row, specialty_name, age_range in filas
+    ]
 
 
 # --- Transiciones terminales (exclusivas del médico TRATANTE) ---

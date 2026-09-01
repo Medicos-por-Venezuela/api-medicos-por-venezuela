@@ -852,3 +852,27 @@ async def test_no_se_cierra_una_que_nadie_tomo(
         f"{SOLICITUDES}/{request_id}/close", headers=auth_headers(tratante.id)
     )
     assert intento.status_code == 409, intento.text
+
+
+async def test_notified_count_no_promete_mas_de_lo_que_se_envia(
+    client: AsyncClient, db_session: AsyncSession, sin_correo: list[dict], monkeypatch
+) -> None:
+    """Con el tope por debajo de los elegibles, `notified_count` refleja a cuántos se AVISÓ, no
+    cuántos había. Si contara los elegibles, la UI le prometería al médico que se notificó a
+    gente a la que nadie escribió."""
+    monkeypatch.setattr(settings, "MAIL_FANOUT_MAX", 2)
+
+    sp = await _especialidad_pedible(db_session)
+    tratante = await _medico(db_session)
+    for _ in range(4):
+        await _medico(db_session, sp)
+    await db_session.flush()
+
+    creada = await client.post(
+        SOLICITUDES,
+        json=_payload(await _paciente_de(client, tratante), sp.id),
+        headers=auth_headers(tratante.id),
+    )
+    assert creada.status_code == 201, creada.text
+    assert creada.json()["notified_count"] == 2  # el tope, no los 4 elegibles
+    assert len(sin_correo[0]["recipients"]) == 2
