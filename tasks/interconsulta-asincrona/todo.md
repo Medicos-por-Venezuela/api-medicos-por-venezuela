@@ -88,22 +88,22 @@
 
 ## Fase 6 — Frontend (`dev_aws`)
 
-- [ ] **T17** `lib/doctorPatients.ts` + `lib/interconsultationRequests.ts` · *los tipos
+- [x] **T17** `lib/doctorPatients.ts` + `lib/interconsultationRequests.ts` · *los tipos
       anonimizados no declaran campos de PII* — S · *dep: T10, T13*
-- [ ] **T18** `pages/panel-medico/mis-pacientes.tsx`: formulario corto + consentimiento +
+- [x] **T18** `pages/panel-medico/mis-pacientes.tsx`: formulario corto + consentimiento +
       listado — M · *dep: T17*
-- [ ] **T19** Solicitar interconsulta: especialidad por defecto (**sin Medicina general**),
+- [x] **T19** Solicitar interconsulta: especialidad por defecto (**sin Medicina general**),
       médico específico como opción secundaria con su teléfono — M · *dep: T17*
-- [ ] **T20** Bandeja del especialista + Tomar (409 → "otro colega ya lo tomó" + refresco) +
+- [x] **T20** Bandeja del especialista + Tomar (409 → "otro colega ya lo tomó" + refresco) +
       pestaña "casos **activos** que tomé" (no es el historial) + "mis solicitudes" con
       cancelar y **cerrar** · *el botón de cerrar no existe para el especialista* — M · *dep: T19*
-- [ ] **T21** E2E Playwright · *assert: la bandeja no contiene el nombre del paciente* — S · *dep: T20*
-- [ ] **T22** Entrada en `changeslog.md` — XS · *dep: T21*
+- [x] **T21** E2E Playwright · *assert: la bandeja no contiene el nombre del paciente* — S · *dep: T20*
+- [x] **T22** Entrada en `changeslog.md` — XS · *dep: T21*
 
 ### ✅ Checkpoint 6 — PR a `dev_aws`
 
-- [ ] Los 9 criterios de éxito de la spec, verificados uno por uno
-- [ ] `pnpm build` (con `NEXT_DIST_DIR=.next-e2e`), `lint`, `tsc --noEmit`, `test:e2e` verdes
+- [x] Los 9 criterios de éxito de la spec, verificados uno por uno
+- [x] `pnpm build`, `lint` (0 errores), `tsc --noEmit` y `test:e2e` (**26/26**) verdes
 
 ---
 
