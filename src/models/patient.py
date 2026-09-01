@@ -18,8 +18,11 @@ class Patient(Base):
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
     full_name: Mapped[str] = mapped_column(String, nullable=False)
-    phone_whatsapp: Mapped[str] = mapped_column(String, nullable=False)
-    affected_zone: Mapped[str] = mapped_column(String, nullable=False)
+    # Nullable SOLO para el alta por médico (paciente de consultorio, que no entra a la cola).
+    # El alta pública los sigue exigiendo vía el CHECK
+    # `ck_patients_contacto_requerido_en_alta_publica`, no vía NOT NULL.
+    phone_whatsapp: Mapped[str | None] = mapped_column(String, nullable=True)
+    affected_zone: Mapped[str | None] = mapped_column(String, nullable=True)
     needs_tags: Mapped[list[str]] = mapped_column(
         ARRAY(Text), nullable=False, server_default=text("'{}'")
     )
@@ -38,6 +41,12 @@ class Patient(Base):
         UUID(as_uuid=True), ForeignKey("patients.id", ondelete="SET NULL"), nullable=True
     )
     parentesco: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Médico dueño del registro (alta desde su consultorio, para pedir una interconsulta).
+    # NULL = alta pública del propio paciente, que es como se llenó esta tabla hasta ahora.
+    # La pertenencia se valida en services/, no por RLS: la API entra como dueña de la BD.
+    created_by_doctor_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

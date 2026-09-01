@@ -35,10 +35,25 @@ _VALIDATION = {422: {"description": "Payload inválido."}}
 async def list_specialties(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=100),
+    for_interconsultation: bool | None = Query(
+        None,
+        description=(
+            "true = solo las que se pueden pedir en una interconsulta asíncrona "
+            "(excluye Medicina general). Es el selector del médico tratante."
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
 ) -> list[SpecialtyResponse]:
-    """Lista pública de especialidades activas; no requiere Bearer token."""
-    return await specialties_service.list_specialties(db, skip=skip, limit=limit, status="active")
+    """Lista pública de especialidades activas; no requiere Bearer token.
+
+    Con `?for_interconsultation=true` devuelve solo las pedibles en una interconsulta."""
+    return await specialties_service.list_specialties(
+        db,
+        skip=skip,
+        limit=limit,
+        status="active",
+        for_interconsultation=for_interconsultation,
+    )
 
 
 @router.get(
