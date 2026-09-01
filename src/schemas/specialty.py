@@ -22,6 +22,9 @@ class SpecialtyBase(BaseModel):
     # especialidad de salud mental nueva no debe requerir un despliegue.
     is_mental_health: bool = False
     mental_health_only: bool = False
+    # Igual que los de salud mental: editable por admin, para que excluir o reincorporar una
+    # especialidad del selector de interconsultas sea un UPDATE y no un despliegue.
+    available_for_interconsultation: bool = True
 
     @field_validator("name", mode="before")
     @classmethod
@@ -40,6 +43,7 @@ class SpecialtyUpdate(BaseModel):
     status: str | None = Field(default=None, pattern="^(active|inactive)$")
     is_mental_health: bool | None = None
     mental_health_only: bool | None = None
+    available_for_interconsultation: bool | None = None
 
     @field_validator("name", mode="before")
     @classmethod

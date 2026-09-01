@@ -55,6 +55,44 @@ class PatientUpdate(BaseModel):
     parentesco: str | None = None
 
 
+class DoctorPatientCreate(BaseModel):
+    """Alta de un paciente **de consultorio**, hecha por su médico para pedir una interconsulta.
+
+    Formulario deliberadamente corto: solo lo que un especialista necesita para evaluar el caso.
+    No pide `phone_whatsapp` ni `affected_zone` (obligatorios en el alta pública) porque este
+    paciente no entra a la cola y nadie de la plataforma lo va a contactar — la relación con él
+    la mantiene su médico. Pedir esos datos sería guardar PII que no usamos.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    full_name: str = Field(..., min_length=2, max_length=200)
+    age_range: str | None = Field(default=None, max_length=20)
+    cedula: str | None = Field(default=None, max_length=20)
+    allergies: str | None = Field(default=None, max_length=500)
+    description: str | None = Field(default=None, max_length=2000)
+    # Opcionales acá, a diferencia del alta pública. Si el médico los tiene, se guardan.
+    phone_whatsapp: str | None = Field(default=None, min_length=5, max_length=30)
+    affected_zone: str | None = Field(default=None, min_length=2, max_length=100)
+    # Sin default `true` (a diferencia de PatientCreate): acá el médico ATESTIGUA que su paciente
+    # autorizó compartir el caso. Una atestación que el cliente puede omitir no es una atestación.
+    consent: bool = False
+
+
+class DoctorPatientUpdate(BaseModel):
+    """Edición de un paciente propio. Ni `consent` ni el dueño se tocan por acá."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    full_name: str | None = Field(default=None, min_length=2, max_length=200)
+    age_range: str | None = Field(default=None, max_length=20)
+    cedula: str | None = Field(default=None, max_length=20)
+    allergies: str | None = Field(default=None, max_length=500)
+    description: str | None = Field(default=None, max_length=2000)
+    phone_whatsapp: str | None = Field(default=None, min_length=5, max_length=30)
+    affected_zone: str | None = Field(default=None, min_length=2, max_length=100)
+
+
 class PatientResponse(PatientBase):
     model_config = ConfigDict(from_attributes=True)
 
@@ -65,7 +103,16 @@ class PatientResponse(PatientBase):
     # El formato se sigue exigiendo donde toca: en PatientCreate/PatientUpdate (entrada).
     email: str | None = None
 
+    # Mismo motivo que `email`, por la otra punta: desde el alta por médico estos dos pueden ser
+    # NULL en la BD (ver la migración 20260831_170051). Heredados de PatientBase son OBLIGATORIOS,
+    # y FastAPI valida también la RESPUESTA: un solo paciente de consultorio haría fallar con 500
+    # el endpoint entero, no esa fila. La exigencia se mantiene donde corresponde, en la ENTRADA
+    # del alta pública (PatientCreate).
+    phone_whatsapp: str | None = None
+    affected_zone: str | None = None
+
     id: uuid.UUID
     consent: bool
     consent_at: datetime | None = None
     created_at: datetime
+    created_by_doctor_id: uuid.UUID | None = None

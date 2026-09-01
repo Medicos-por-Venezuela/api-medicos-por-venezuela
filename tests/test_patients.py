@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.patient import Patient
 from src.models.profile import Profile
-from tests._helpers import any_specialty_id, auth_headers, make_profile
+from tests._helpers import add_doctor, any_specialty_id, auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -362,3 +362,247 @@ async def test_list_patients_tolera_email_historico_invalido(
         },
     )
     assert rechazado.status_code == 422, rechazado.text
+
+
+# --- Pacientes de consultorio (alta por médico, para pedir una interconsulta) ---
+#
+# Segunda vía de alta, bajo /doctors/me/patients. Lo que se protege acá es la PERTENENCIA:
+# el permiso RBAC autoriza la acción, nunca el objeto (regla IDOR del repo).
+
+MIS_PACIENTES = f"{PREFIX}/doctors/me/patients"
+
+
+def _caso() -> dict:
+    """Alta mínima de consultorio: sin teléfono ni zona afectada, que es el punto del feature."""
+    return {
+        "full_name": "Paciente de Consultorio",
+        "age_range": "30-39",
+        "allergies": "Penicilina",
+        "description": "HTA controlada, sin cirugías previas.",
+        "consent": True,
+    }
+
+
+async def test_medico_registra_paciente_sin_telefono_ni_zona(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El formulario corto: el especialista nunca contacta al paciente, así que no se le pide
+    PII de contacto. Antes estos dos campos eran NOT NULL."""
+    medico = await add_doctor(db_session)
+
+    creado = await client.post(MIS_PACIENTES, json=_caso(), headers=auth_headers(medico.id))
+    assert creado.status_code == 201, creado.text
+    body = creado.json()
+    assert body["phone_whatsapp"] is None
+    assert body["affected_zone"] is None
+    assert body["created_by_doctor_id"] == str(medico.id)
+    assert body["consent_at"] is not None
+
+
+async def test_alta_de_consultorio_exige_consentimiento(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El médico ATESTIGUA que su paciente autorizó compartir el caso. Sin eso, no hay alta."""
+    medico = await add_doctor(db_session)
+
+    sin_consent = await client.post(
+        MIS_PACIENTES, json={"full_name": "Sin Consentimiento"}, headers=auth_headers(medico.id)
+    )
+    assert sin_consent.status_code == 400, sin_consent.text
+
+
+async def test_alta_publica_sigue_exigiendo_telefono_y_zona(client: AsyncClient) -> None:
+    """Relajar el NOT NULL no puede abrirle la puerta a la cola: el alta pública, que sí usa
+    esos datos, los sigue exigiendo."""
+    incompleto = await client.post(
+        f"{PREFIX}/patients", json={"full_name": "Publico Incompleto", "consent": True}
+    )
+    assert incompleto.status_code == 422, incompleto.text
+
+
+async def test_listado_solo_devuelve_los_propios(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Dos médicos, un paciente cada uno: ninguno ve el del otro. Tampoco aparecen los
+    pacientes de altas públicas, que no tienen dueño médico."""
+    medico_a = await add_doctor(db_session)
+    medico_b = await add_doctor(db_session)
+
+    a = await client.post(MIS_PACIENTES, json=_caso(), headers=auth_headers(medico_a.id))
+    b = await client.post(
+        MIS_PACIENTES,
+        json={**_caso(), "full_name": "Paciente de B"},
+        headers=auth_headers(medico_b.id),
+    )
+    assert (a.status_code, b.status_code) == (201, 201)
+
+    lista_a = await client.get(MIS_PACIENTES, headers=auth_headers(medico_a.id))
+    assert lista_a.status_code == 200
+    ids_a = {p["id"] for p in lista_a.json()}
+    assert a.json()["id"] in ids_a
+    assert b.json()["id"] not in ids_a
+    assert all(p["created_by_doctor_id"] == str(medico_a.id) for p in lista_a.json())
+
+
+async def test_idor_no_puede_leer_editar_ni_archivar_paciente_ajeno(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """IDOR: tener el permiso no da derecho sobre el objeto. Se cubren los TRES caminos de
+    acceso al recurso, no solo la lectura — un guard que se olvida de un verbo no es un guard."""
+    dueno = await add_doctor(db_session)
+    intruso = await add_doctor(db_session)
+
+    creado = await client.post(MIS_PACIENTES, json=_caso(), headers=auth_headers(dueno.id))
+    assert creado.status_code == 201
+    ajeno = creado.json()["id"]
+    headers = auth_headers(intruso.id)
+
+    assert (await client.get(f"{MIS_PACIENTES}/{ajeno}", headers=headers)).status_code == 403
+    assert (
+        await client.patch(
+            f"{MIS_PACIENTES}/{ajeno}", json={"full_name": "Secuestrado"}, headers=headers
+        )
+    ).status_code == 403
+    assert (await client.delete(f"{MIS_PACIENTES}/{ajeno}", headers=headers)).status_code == 403
+
+    # Y el dueño sigue viendo su paciente intacto.
+    suyo = await client.get(f"{MIS_PACIENTES}/{ajeno}", headers=auth_headers(dueno.id))
+    assert suyo.status_code == 200
+    assert suyo.json()["full_name"] == "Paciente de Consultorio"
+
+
+async def test_paciente_de_alta_publica_no_es_de_ningun_medico(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Un paciente que se registró solo no tiene dueño médico: nadie puede reclamarlo por esta
+    vía. Si esto devolviera 200, la cola pública quedaría expuesta por la puerta de al lado."""
+    medico = await add_doctor(db_session)
+    publico = await client.post(
+        f"{PREFIX}/patients",
+        json={
+            "full_name": "Paciente Publico",
+            "phone_whatsapp": "+58412777777",
+            "affected_zone": "Caracas",
+            "consent": True,
+        },
+    )
+    assert publico.status_code == 201
+
+    intento = await client.get(
+        f"{MIS_PACIENTES}/{publico.json()['id']}", headers=auth_headers(medico.id)
+    )
+    assert intento.status_code == 403
+
+
+async def test_editar_y_archivar_el_propio(client: AsyncClient, db_session: AsyncSession) -> None:
+    medico = await add_doctor(db_session)
+    creado = await client.post(MIS_PACIENTES, json=_caso(), headers=auth_headers(medico.id))
+    pid = creado.json()["id"]
+    headers = auth_headers(medico.id)
+
+    editado = await client.patch(
+        f"{MIS_PACIENTES}/{pid}", json={"allergies": "Ninguna conocida"}, headers=headers
+    )
+    assert editado.status_code == 200, editado.text
+    assert editado.json()["allergies"] == "Ninguna conocida"
+
+    assert (await client.delete(f"{MIS_PACIENTES}/{pid}", headers=headers)).status_code == 204
+    # Baja lógica: el archivado desaparece del listado y de la lectura directa (404, no 403:
+    # sigue siendo suyo, ya no existe para la API).
+    assert (await client.get(f"{MIS_PACIENTES}/{pid}", headers=headers)).status_code == 404
+    assert pid not in {p["id"] for p in (await client.get(MIS_PACIENTES, headers=headers)).json()}
+
+
+async def test_paciente_no_puede_registrar_pacientes_de_consultorio(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El feature es entre médicos: una cuenta de paciente no tiene el permiso."""
+    paciente = make_profile(role="patient")
+    db_session.add(paciente)
+    await db_session.flush()
+
+    intento = await client.post(MIS_PACIENTES, json=_caso(), headers=auth_headers(paciente.id))
+    assert intento.status_code == 403, intento.text
+
+
+# --- Frontera del listado staff: los de consultorio no son de dominio público ---
+#
+# `patients.read` lo tiene TODO médico. Sin esta frontera, cualquier colega leería nombre,
+# cédula y alergias de los pacientes privados de otro — justo lo que el feature anonimiza en la
+# bandeja de interconsultas. Se cubren el LISTADO y el DETALLE: un guard que se olvida de un
+# camino no es un guard.
+
+
+async def _paciente_privado(client: AsyncClient, medico: Profile) -> str:
+    creado = await client.post(
+        MIS_PACIENTES,
+        json={"full_name": "Paciente Privado", "consent": True, "cedula": "V-11223344"},
+        headers=auth_headers(medico.id),
+    )
+    assert creado.status_code == 201, creado.text
+    return creado.json()["id"]
+
+
+async def test_otro_medico_no_ve_pacientes_de_consultorio_en_el_listado_staff(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    dueno = await add_doctor(db_session)
+    intruso = await add_doctor(db_session)
+    privado = await _paciente_privado(client, dueno)
+
+    staff = await client.get(f"{PREFIX}/patients?limit=100", headers=auth_headers(intruso.id))
+    assert staff.status_code == 200, staff.text
+    assert privado not in {p["id"] for p in staff.json()}
+    assert all(p["created_by_doctor_id"] is None for p in staff.json())
+
+
+async def test_otro_medico_no_puede_leer_el_detalle_de_un_paciente_de_consultorio(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El mismo agujero por el `GET /{id}`: cerrar solo el listado dejaría la puerta abierta."""
+    dueno = await add_doctor(db_session)
+    intruso = await add_doctor(db_session)
+    privado = await _paciente_privado(client, dueno)
+
+    detalle = await client.get(f"{PREFIX}/patients/{privado}", headers=auth_headers(intruso.id))
+    assert detalle.status_code == 403, detalle.text
+
+
+async def test_scope_all_requiere_patients_write(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Un médico no puede saltarse el filtro pidiendo `scope=all`."""
+    medico = await add_doctor(db_session)
+    intento = await client.get(f"{PREFIX}/patients?scope=all", headers=auth_headers(medico.id))
+    assert intento.status_code == 403, intento.text
+
+
+async def test_admin_conserva_la_vision_completa(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El admin (que tiene patients.write) sigue pudiendo operar sobre todo: la frontera protege
+    a los médicos entre sí, no ciega a quien administra la plataforma."""
+    dueno = await add_doctor(db_session)
+    privado = await _paciente_privado(client, dueno)
+
+    # El fixture `client` va autenticado como admin.
+    con_todo = await client.get(f"{PREFIX}/patients?scope=all&limit=100")
+    assert con_todo.status_code == 200, con_todo.text
+    assert privado in {p["id"] for p in con_todo.json()}
+    assert (await client.get(f"{PREFIX}/patients/{privado}")).status_code == 200
+
+    # Pero incluso para el admin el default sigue siendo la cola pública.
+    por_defecto = await client.get(f"{PREFIX}/patients?limit=100")
+    assert privado not in {p["id"] for p in por_defecto.json()}
+
+
+async def test_el_dueno_sigue_leyendo_su_paciente_por_su_ruta(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Cerrar la puerta staff no puede dejar al médico sin acceso a su propio paciente."""
+    dueno = await add_doctor(db_session)
+    privado = await _paciente_privado(client, dueno)
+
+    suyo = await client.get(f"{MIS_PACIENTES}/{privado}", headers=auth_headers(dueno.id))
+    assert suyo.status_code == 200
+    assert suyo.json()["cedula"] == "V-11223344"

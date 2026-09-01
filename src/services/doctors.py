@@ -468,6 +468,32 @@ async def list_doctor_pool(
     return items, total
 
 
+async def log_contact_reveal(
+    session: AsyncSession, *, user_id: uuid.UUID, viewer_user_id: uuid.UUID, via: str
+) -> None:
+    """Deja en `audit_log` que `viewer_user_id` recibió el contacto del médico `user_id`.
+
+    El WhatsApp de un médico no se expone en listados: se entrega solo por vías que dejan rastro
+    (ver `reveal_doctor_contact`). Las interconsultas abrieron dos vías nuevas —elegir a un colega
+    y tomar un caso— que entregan ese número sin pasar por el endpoint del pool; sin esto, la
+    bitácora del admin quedaría ciega justo para las vías por las que más se va a revelar.
+
+    Vive aquí, en el módulo que posee el concepto "médico", para que el nombre de la acción y la
+    forma del registro no se dupliquen en cada feature que revele un contacto. `via` distingue el
+    origen en la bitácora. No hace commit: se persiste con la transacción del caller.
+    """
+    if user_id is None:
+        return
+    await audit.log_action(
+        session,
+        action="doctor.contact_viewed",
+        actor_user_id=viewer_user_id,
+        resource="users",
+        resource_id=user_id,
+        metadata={"via": via},
+    )
+
+
 async def reveal_doctor_contact(
     session: AsyncSession, doctor_id: uuid.UUID, viewer_user_id: uuid.UUID
 ) -> str | None:

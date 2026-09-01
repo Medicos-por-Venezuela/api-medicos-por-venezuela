@@ -110,9 +110,19 @@ class Settings(BaseSettings):
     MAILTRAP_API_TOKEN: str = ""
     MAIL_FROM_EMAIL: str = "no-reply@medicosporvenezuela.org"
     MAIL_FROM_NAME: str = "Médicos por Venezuela"
+    # Base para los enlaces de los correos. El apex es el host canónico (www quedó con fallo de
+    # TLS). Sin barra final: los constructores de enlaces la ponen.
+    FRONTEND_URL: str = "https://medicosporvenezuela.org"
     # Sandbox (Email Testing): si se define el inbox, entrega ahí en vez de enviar de verdad —
     # ideal para probar plantillas en dev sin spamear correos reales.
     MAILTRAP_INBOX_ID: str | None = None
+    # Difusión (fan-out de interconsultas). Una especialidad puede tener cientos de médicos:
+    # un correo por cabeza serían cientos de peticiones al stream transaccional. Se manda por
+    # el stream BULK de Mailtrap, en lotes por BCC.
+    MAIL_BULK_BATCH_SIZE: int = 50
+    # Tope duro de destinatarios por difusión. Si se supera, se notifica hasta el tope y se
+    # LOGUEA el recorte: un truncamiento silencioso se leería como "se notificó a todos".
+    MAIL_FANOUT_MAX: int = 500
 
     # --- CORS ---
     BACKEND_CORS_ORIGINS: str = "*"
@@ -124,6 +134,10 @@ class Settings(BaseSettings):
     # Escrituras públicas (alta de paciente y de consulta): sin límite, cualquiera puede
     # inundar la cola con casos falsos que los médicos ven en el panel.
     PUBLIC_WRITE_RATE_LIMIT: str = "10/minute"
+    # Pedir una interconsulta es un AMPLIFICADOR: una petición autenticada dispara hasta
+    # MAIL_FANOUT_MAX correos a médicos reales. Sin tope, una cuenta comprometida convierte
+    # la plataforma en un emisor de spam contra sus propios usuarios.
+    INTERCONSULTATION_REQUEST_RATE_LIMIT: str = "10/minute"
 
     def _normalize_async_scheme(self, url: str) -> str:
         """Garantiza el driver async (postgresql+asyncpg://)."""

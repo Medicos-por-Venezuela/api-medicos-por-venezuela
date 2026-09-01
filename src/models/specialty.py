@@ -29,6 +29,12 @@ class Specialty(Base):
     mental_health_only: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
+    # ¿Se puede PEDIR en una interconsulta asíncrona? false para las que no son especialidad en
+    # el sentido del feature (Medicina general): pedirle ayuda a otro general no resuelve nada.
+    # En la BD y no en un literal, por lo mismo que los flags de arriba (ver 20260831_174358).
+    available_for_interconsultation: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

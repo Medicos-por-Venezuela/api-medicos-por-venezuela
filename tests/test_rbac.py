@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.models.rbac import Role, UserRole
+from src.models.rbac import Permission, Role, UserRole
 from src.services.authz import load_authz
 from tests._helpers import make_profile
 
@@ -74,3 +74,53 @@ async def test_authz_ignora_roles_revocados(db_session: AsyncSession) -> None:
     # El único rol asignado está revocado -> cae al fallback (patient, sin permisos).
     assert "admin" not in roles
     assert "roles.assign" not in perms
+
+
+# --- permisos de la interconsulta asíncrona (seed 20260831_174444) ---
+
+
+async def test_permisos_de_interconsulta_asincrona_sembrados(db_session: AsyncSession) -> None:
+    """Los dos permisos existen. Si el seed no corriera, los endpoints darían 403 para todos
+    y el feature entero quedaría muerto sin un solo test rojo que lo explique."""
+    codes = set(
+        (
+            await db_session.execute(
+                select(Permission.code).where(
+                    Permission.code.in_(
+                        [
+                            "interconsultation_requests.write",
+                            "interconsultation_requests.take",
+                        ]
+                    )
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert codes == {
+        "interconsultation_requests.write",
+        "interconsultation_requests.take",
+    }
+
+
+async def test_doctor_recibe_ambos_permisos_de_interconsulta(db_session: AsyncSession) -> None:
+    """`doctor` usa el feature de las dos puntas: pide ayuda y la da. El cross-join del seed
+    original de RBAC ya había corrido, así que estos mapeos son explícitos y hay que
+    verificarlos."""
+    # El rol lo asigna el trigger de `users` a partir de `role` (ver test_profile_role_trigger):
+    # insertarlo a mano acá chocaría contra uq_user_roles_active.
+    prof = await _profile(db_session, role="doctor")
+
+    _, permissions = await load_authz(db_session, prof.id, prof.role)
+    assert "interconsultation_requests.write" in permissions
+    assert "interconsultation_requests.take" in permissions
+
+
+async def test_paciente_no_recibe_permisos_de_interconsulta(db_session: AsyncSession) -> None:
+    """La interconsulta es entre médicos: un paciente no pide ni toma casos."""
+    prof = await _profile(db_session, role="patient")
+
+    _, permissions = await load_authz(db_session, prof.id, prof.role)
+    assert "interconsultation_requests.write" not in permissions
+    assert "interconsultation_requests.take" not in permissions

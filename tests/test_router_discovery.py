@@ -17,6 +17,9 @@ _EXPECTED_PREFIXES = {
     "/profiles",
     "/specialties",
     "/professional-types",
+    # Interconsulta asíncrona. Sin auto-discovery el feature entero daría 404 sin un solo
+    # test rojo que lo explicara.
+    "/interconsultation-requests",
 }
 
 
@@ -59,3 +62,13 @@ def test_app_incluye_tag_health_y_los_recolectados():
     nombres = {t["name"] for t in app.openapi_tags}
     assert "health" in nombres
     assert "auth" in nombres and "queue" in nombres
+
+
+def test_pacientes_de_consultorio_montados_con_su_tag():
+    """`/doctors/me/patients` no entra en `_EXPECTED_PREFIXES` porque ese set asume dos cosas
+    que no se cumplen acá: que el prefijo es el PRIMER segmento del path (sería `/doctors`, que
+    ya es de otro router) y que el nombre del tag sale de ese prefijo (el tag es
+    `doctor-patients`). Se verifica aparte en vez de deformar el molde."""
+    paths = {p for p in _route_paths() if p.startswith("/doctors/me/patients")}
+    assert paths, "El router de pacientes de consultorio no quedó registrado."
+    assert "doctor-patients" in {t["name"] for t in tags_metadata}
