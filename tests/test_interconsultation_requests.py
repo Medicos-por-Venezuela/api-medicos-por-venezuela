@@ -13,10 +13,12 @@ import uuid
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
+from src.models.audit_log import AuditLog
 from src.models.interconsultation_request import (
     REQUEST_MODES,
     REQUEST_STATUSES,
@@ -876,3 +878,110 @@ async def test_notified_count_no_promete_mas_de_lo_que_se_envia(
     assert creada.status_code == 201, creada.text
     assert creada.json()["notified_count"] == 2  # el tope, no los 4 elegibles
     assert len(sin_correo[0]["recipients"]) == 2
+
+
+# ============================================================================
+# 4. Seguridad: revelación de contacto entre colegas
+# ============================================================================
+#
+# `doctors.reveal_doctor_contact` existe porque el WhatsApp de un médico NO se expone en el
+# listado del pool: solo se entrega por un endpoint que deja rastro `doctor.contact_viewed` en
+# `audit_log`. Este feature entrega ese mismo número por dos vías nuevas (elegir a un colega, y
+# tomar un caso), así que tiene que dejar el mismo rastro — si no, la bitácora del admin queda
+# ciega justo para las vías por las que más se va a revelar.
+
+
+async def _reveals(db_session: AsyncSession, actor) -> list[AuditLog]:
+    filas = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "doctor.contact_viewed",
+                    AuditLog.actor_user_id == actor,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return list(filas)
+
+
+async def test_elegir_un_medico_audita_la_revelacion_de_su_contacto(
+    client: AsyncClient, db_session: AsyncSession, sin_correo: list[dict]
+) -> None:
+    """Modo 'doctor': el solicitante recibe el WhatsApp del elegido en la misma respuesta, sin
+    que el otro haya aceptado nada. Es una revelación de contacto y debe quedar auditada."""
+    sp = await _especialidad_pedible(db_session)
+    tratante = await _medico(db_session)
+    elegido = await _medico(db_session, sp)
+    elegido.whatsapp_number = "+58412555111"
+    await db_session.flush()
+
+    creada = await client.post(
+        SOLICITUDES,
+        json=_payload(
+            await _paciente_de(client, tratante),
+            sp.id,
+            mode="doctor",
+            specialty_id=None,
+            target_doctor_id=str(elegido.id),
+        ),
+        headers=auth_headers(tratante.id),
+    )
+    assert creada.status_code == 201, creada.text
+    assert creada.json()["target_doctor"]["whatsapp_number"] == "+58412555111"
+
+    reveals = await _reveals(db_session, tratante.id)
+    assert len(reveals) == 1, "la revelación del WhatsApp del colega no quedó en audit_log"
+    assert reveals[0].resource_id == str(elegido.id)
+
+
+async def test_tomar_un_caso_audita_la_revelacion_del_contacto_del_tratante(
+    client: AsyncClient, db_session: AsyncSession, sin_correo: list[dict]
+) -> None:
+    """Al tomar, el especialista recibe el WhatsApp del tratante. Mismo criterio."""
+    sp = await _especialidad_pedible(db_session)
+    tratante = await _medico(db_session)
+    tratante.whatsapp_number = "+58412000777"
+    especialista = await _medico(db_session, sp)
+    await db_session.flush()
+
+    creada = await client.post(
+        SOLICITUDES,
+        json=_payload(await _paciente_de(client, tratante), sp.id),
+        headers=auth_headers(tratante.id),
+    )
+    request_id = creada.json()["id"]
+    tomada = await client.post(
+        f"{SOLICITUDES}/{request_id}/take", headers=auth_headers(especialista.id)
+    )
+    assert tomada.status_code == 200, tomada.text
+
+    reveals = await _reveals(db_session, especialista.id)
+    assert len(reveals) == 1, "la revelación del contacto del tratante no quedó en audit_log"
+    assert reveals[0].resource_id == str(tratante.id)
+
+
+async def test_pedir_interconsulta_tiene_rate_limit(
+    client: AsyncClient, db_session: AsyncSession, sin_correo: list[dict], monkeypatch
+) -> None:
+    """Una sola petición autenticada dispara hasta MAIL_FANOUT_MAX correos: es un amplificador.
+    Sin límite, una cuenta comprometida convierte la plataforma en un emisor de spam contra sus
+    propios médicos."""
+    from src.core.ratelimit import limiter
+
+    monkeypatch.setattr(limiter, "enabled", True)  # el conftest lo apaga para el resto
+
+    sp = await _especialidad_pedible(db_session)
+    tratante = await _medico(db_session)
+    await db_session.flush()
+    paciente = await _paciente_de(client, tratante)
+
+    codigos = []
+    for _ in range(12):
+        r = await client.post(
+            SOLICITUDES, json=_payload(paciente, sp.id), headers=auth_headers(tratante.id)
+        )
+        codigos.append(r.status_code)
+    assert 429 in codigos, f"sin rate limit: {codigos}"

@@ -35,6 +35,7 @@ from src.schemas.interconsultation_request import (
     InterconsultationRequestTaken,
 )
 from src.services import audit, notifications
+from src.services import doctors as doctors_service
 from src.services import patients as patients_service
 
 logger = logging.getLogger("mpv.api")
@@ -264,6 +265,15 @@ async def create_request(
             "notified_count": row.notified_count,
         },
     )
+    if data.target_doctor_id is not None:
+        # La respuesta lleva el WhatsApp del colega elegido, y él no aceptó nada: es una
+        # revelación de contacto y va a la misma bitácora que la del pool.
+        await doctors_service.log_contact_reveal(
+            session,
+            user_id=data.target_doctor_id,
+            viewer_user_id=requesting_doctor_id,
+            via="interconsultation_request.created",
+        )
     # SIN este commit la solicitud NO se guarda: `get_db` cierra la sesión al terminar el request
     # y eso hace ROLLBACK. Ya pasó con `interconsultations` (201 con id real y cero filas en la
     # tabla); no se repite.
@@ -419,8 +429,6 @@ async def take(
         select(Specialty.name).where(Specialty.id == row.specialty_id)
     )
 
-    # Se audita la toma Y, con ella, la revelación del contacto: a partir de acá este
-    # especialista tiene el teléfono de un colega (mismo criterio que `doctor.contact_viewed`).
     await audit.log_action(
         session,
         action="interconsultation_request.taken",
@@ -428,6 +436,15 @@ async def take(
         resource="interconsultation_requests",
         resource_id=row.id,
         metadata={"requesting_doctor_id": str(row.requesting_doctor_id)},
+    )
+    # La toma entrega el WhatsApp del tratante: se registra además como revelación de contacto,
+    # para que el admin la encuentre buscando `doctor.contact_viewed` y no solo leyendo el
+    # historial de interconsultas.
+    await doctors_service.log_contact_reveal(
+        session,
+        user_id=row.requesting_doctor_id,
+        viewer_user_id=doctor_id,
+        via="interconsultation_request.taken",
     )
     await session.commit()
     await session.refresh(row)

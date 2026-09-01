@@ -134,6 +134,10 @@ class Settings(BaseSettings):
     # Escrituras públicas (alta de paciente y de consulta): sin límite, cualquiera puede
     # inundar la cola con casos falsos que los médicos ven en el panel.
     PUBLIC_WRITE_RATE_LIMIT: str = "10/minute"
+    # Pedir una interconsulta es un AMPLIFICADOR: una petición autenticada dispara hasta
+    # MAIL_FANOUT_MAX correos a médicos reales. Sin tope, una cuenta comprometida convierte
+    # la plataforma en un emisor de spam contra sus propios usuarios.
+    INTERCONSULTATION_REQUEST_RATE_LIMIT: str = "10/minute"
 
     def _normalize_async_scheme(self, url: str) -> str:
         """Garantiza el driver async (postgresql+asyncpg://)."""

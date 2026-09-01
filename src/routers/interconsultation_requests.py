@@ -6,9 +6,11 @@ activa de la cola. Ver .knowledge/interconsultas.md.
 
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import settings
+from src.core.ratelimit import limiter
 from src.core.security import Principal, require_permission
 from src.db.session import get_db
 from src.schemas.interconsultation_request import (
@@ -51,9 +53,12 @@ _TAKE = "interconsultation_requests.take"  # darla
                 "destino no habilitado o sin especialidad, o payload incoherente con `mode`."
             )
         },
+        429: {"description": "Demasiadas solicitudes en poco tiempo (rate limit)."},
     },
 )
+@limiter.limit(settings.INTERCONSULTATION_REQUEST_RATE_LIMIT)
 async def create_request(
+    request: Request,
     payload: InterconsultationRequestCreate,
     background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
@@ -65,7 +70,10 @@ async def create_request(
     `doctor`, solo al elegido. `notified_count` dice a cuántos se les avisó.
 
     El envío va en segundo plano y es best-effort: que un correo falle **no** cambia el 201 ni
-    deshace la solicitud."""
+    deshace la solicitud.
+
+    `request` es obligatorio para slowapi (lee la IP), aunque no se use aquí. El tope existe
+    porque una sola petición dispara hasta `MAIL_FANOUT_MAX` correos a médicos reales."""
     response, difusion = await requests_service.create_request(db, payload, principal.id)
     background.add_task(send_bulk, **difusion)
     return response
