@@ -123,6 +123,13 @@ class Settings(BaseSettings):
     # Tope duro de destinatarios por difusión. Si se supera, se notifica hasta el tope y se
     # LOGUEA el recorte: un truncamiento silencioso se leería como "se notificó a todos".
     MAIL_FANOUT_MAX: int = 500
+    # Buzones de OPERACIÓN que reciben los avisos de alta (paciente nuevo, médico registrado):
+    # lista separada por comas. VACÍA por defecto, a propósito y por el mismo criterio que
+    # MAILTRAP_API_TOKEN: con las direcciones reales cableadas aquí, cualquier entorno de
+    # pruebas que tenga token de Mailtrap le escribiría de verdad a esas personas en el primer
+    # registro de prueba. Se define solo en .env.production — si falta allí, no sale ningún
+    # aviso interno (ese es el precio consciente de equivocarse hacia el lado callado).
+    MAIL_INTERNAL_RECIPIENTS: str = ""
 
     # --- CORS ---
     BACKEND_CORS_ORIGINS: str = "*"
@@ -195,6 +202,17 @@ class Settings(BaseSettings):
         # rstrip("/") tolera barras finales: el navegador manda el header Origin SIN barra, así
         # que un "https://x/" en la env rompía el match exacto de CORS en silencio (sin ACAO).
         return [s for o in self.BACKEND_CORS_ORIGINS.split(",") if (s := o.strip().rstrip("/"))]
+
+    @property
+    def internal_mail_recipients(self) -> list[str]:
+        """Buzones de operación que reciben los avisos de alta. Vacía = no avisar a nadie.
+
+        Se parte a mano (y no con un `list[str]` de pydantic-settings) porque este repo ya
+        resuelve así sus listas de entorno — ver `cors_origins`: pydantic-settings espera JSON
+        para un `list[str]` en `.env`, y una coma suelta produciría un error de arranque poco
+        obvio.
+        """
+        return [s for r in self.MAIL_INTERNAL_RECIPIENTS.split(",") if (s := r.strip())]
 
 
 @lru_cache

@@ -56,7 +56,7 @@ from src.schemas.consultation_event import (
     ConsultationEventResponse,
 )
 from src.services import consultations as consultations_service
-from src.services import notifications
+from src.services import notifications, registration_mail
 
 logger = logging.getLogger("mpv.api")
 
@@ -88,6 +88,19 @@ async def _queue_appointment_email(
     args = await notifications.appointment_email_args(db, child)
     if args:
         background_tasks.add_task(notifications.send_appointment_email, **args)
+
+
+async def _queue_new_patient_alert(
+    background_tasks: BackgroundTasks, db: AsyncSession, consultation: Consultation
+) -> None:
+    """Encola el aviso a operación de que entró un paciente a la cola.
+
+    Los args se resuelven AQUÍ, con la sesión todavía viva: el BackgroundTask corre tras cerrar
+    la request y allí ya no se puede consultar la base. `None` = este caso no se avisa (de
+    consultorio, agendado, o sin buzones configurados); no es un fallo."""
+    args = await registration_mail.new_patient_mail_args(db, consultation)
+    if args:
+        background_tasks.add_task(registration_mail.send_new_patient_alert, **args)
 
 
 async def require_consultation_token(
@@ -163,7 +176,10 @@ async def list_consultations(
 )
 @limiter.limit(settings.PUBLIC_WRITE_RATE_LIMIT)
 async def create_consultation(
-    request: Request, payload: ConsultationCreate, db: AsyncSession = Depends(get_db)
+    request: Request,
+    payload: ConsultationCreate,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
 ) -> ConsultationCreatedResponse:
     """Crea una consulta en espera. El `code` lo genera la base de datos (trigger).
 
@@ -173,6 +189,7 @@ async def create_consultation(
 
     `request` es obligatorio para slowapi (lee la IP del cliente), aunque no se use aquí."""
     consultation = await consultations_service.create_consultation(db, payload)
+    await _queue_new_patient_alert(background_tasks, db, consultation)
     return ConsultationCreatedResponse(
         **ConsultationResponse.model_validate(consultation).model_dump(),
         access_token=consultation_token.issue(consultation.id),

@@ -43,6 +43,7 @@ from src.models.doctor import Doctor
 from src.models.professional_type import ProfessionalType
 from src.models.profile import Profile
 from src.models.specialty import Specialty
+from src.schemas import sacs as sacs_schemas
 from src.schemas.doctor import DoctorCreate, DoctorMeResponse, DoctorSelfUpdate, DoctorUpdate
 from src.services import audit
 from src.services import psicologo as psicologo_service
@@ -72,15 +73,66 @@ class CredentialCheck(NamedTuple):
     verifican algo. Si falta cualquiera de los dos, la credencial no está verificada:
     una ficha sin licencia no habilita a nadie (`has_valid_credential` la bloquea), así
     que darla por buena solo produciría un verificado que no puede atender.
+
+    `reason` dice POR QUÉ no se verificó (None si sí). No cambia ninguna decisión de acceso
+    —`verified` sigue siendo fail-closed exactamente igual— pero es lo que permite decirle al
+    médico qué pasó. Antes los cinco caminos de rechazo colapsaban en un único `_UNVERIFIED`,
+    así que "el SACS está caído" y "tu cédula no existe" eran indistinguibles: para el médico,
+    los dos se veían como un silencio.
     """
 
     verified: bool
     full_name: str | None = None
     license: str | None = None
+    reason: str | None = None
 
 
-# Resultado único para todos los caminos de "el registro no valida esta cédula".
-_UNVERIFIED = CredentialCheck(verified=False)
+# Motivos por los que una credencial no queda verificada. Los consume `registration_mail` para
+# redactar el correo al médico; aquí no deciden nada.
+SIN_TIPO = "sin_tipo"  # no mandó professional_type_id, o apunta a un tipo que no existe
+TIPO_NO_VERIFICABLE = "tipo_no_verificable"  # p. ej. nutricionista: no hay registro en línea
+NO_ENCONTRADO = "no_encontrado"  # el registro respondió y la cédula no está
+DATOS_INCOMPLETOS = "datos_incompletos"  # respondió, pero sin nombre o sin licencia
+SERVICIO_NO_DISPONIBLE = "servicio_no_disponible"  # no respondió / respondió algo ilegible
+
+# Mapa del motivo tipado del verificador externo al motivo de dominio. Se traduce en vez de
+# reutilizar las constantes de `schemas.sacs` para que el dominio no herede el vocabulario de
+# un proveedor concreto.
+_EXTERNAL_REASONS = {
+    sacs_schemas.NO_ENCONTRADO: NO_ENCONTRADO,
+    sacs_schemas.SERVICIO_NO_DISPONIBLE: SERVICIO_NO_DISPONIBLE,
+    sacs_schemas.FORMATO_INVALIDO: NO_ENCONTRADO,
+}
+
+
+def _unverified(reason: str) -> CredentialCheck:
+    """Credencial no verificada, con el motivo. Fail-closed: todo camino que no confirma la
+    cédula pasa por aquí, y ahora cada uno dice cuál fue."""
+    return CredentialCheck(verified=False, reason=reason)
+
+
+class RegistrationResult(NamedTuple):
+    """La ficha recién creada y, si no quedó verificada, por qué.
+
+    El motivo no se guarda en `doctors`: es un dato del INTENTO de verificación, no del médico,
+    y mañana la misma cédula puede validar sin que nada de la ficha haya cambiado. Viaja en el
+    retorno hasta el router, que es quien redacta el correo, y ahí se acaba.
+    """
+
+    doctor: "Doctor"
+    reason: str | None = None
+
+
+class ApprovalResult(NamedTuple):
+    """La ficha aprobada y si esta llamada fue la que la aprobó.
+
+    `newly_approved` existe porque el endpoint es idempotente: aprobar dos veces no falla y
+    ambas quedan auditadas, pero solo la primera es un cambio real. Sin distinguirlas, dos
+    clics del admin le mandan dos correos "ya puedes entrar" al médico.
+    """
+
+    doctor: "Doctor"
+    newly_approved: bool
 
 
 def _official_identity(
@@ -95,7 +147,7 @@ def _official_identity(
     full_name = " ".join(part.strip() for part in (nombre or "", apellido or "") if part.strip())
     license_ = (licencia or "").strip()
     if not full_name or not license_:
-        return _UNVERIFIED
+        return _unverified(DATOS_INCOMPLETOS)
     return CredentialCheck(verified=True, full_name=full_name, license=license_)
 
 
@@ -103,7 +155,9 @@ async def _check_in_sacs(cedula: str) -> CredentialCheck:
     """El SACS confirma que la cédula corresponde a un médico registrado."""
     result = await sacs_service.verificar_sacs(cedula)
     if not (result.encontrado and result.es_medico):
-        return _UNVERIFIED
+        # `encontrado` sin `es_medico` = la cédula existe pero no como médico: para el
+        # interesado es lo mismo que no estar en el registro de médicos.
+        return _unverified(_EXTERNAL_REASONS.get(result.error_kind or "", NO_ENCONTRADO))
     return _official_identity(result.nombre, result.apellido, result.licencia)
 
 
@@ -111,7 +165,7 @@ async def _check_in_fpv(cedula: str) -> CredentialCheck:
     """La FPV confirma que la cédula corresponde a un psicólogo colegiado."""
     result = await psicologo_service.verificar_psicologo(cedula)
     if not result.encontrado:
-        return _UNVERIFIED
+        return _unverified(_EXTERNAL_REASONS.get(result.error_kind or "", NO_ENCONTRADO))
     return _official_identity(result.nombre, result.apellido, result.licencia)
 
 
@@ -132,12 +186,12 @@ async def _verify_credential(
     (p. ej. nutricionista) -> no verificado.
     """
     if professional_type_id is None:
-        return _UNVERIFIED
+        return _unverified(SIN_TIPO)
     ptype = await session.get(ProfessionalType, professional_type_id)
     if ptype is None:
-        return _UNVERIFIED
+        return _unverified(SIN_TIPO)
     verify = _CREDENTIAL_VERIFIERS.get(_normalize(ptype.name))
-    return await verify(cedula) if verify else _UNVERIFIED
+    return await verify(cedula) if verify else _unverified(TIPO_NO_VERIFICABLE)
 
 
 def _apply_official_identity(doctor: Doctor, check: CredentialCheck) -> None:
@@ -566,11 +620,14 @@ async def get_doctor(session: AsyncSession, doctor_id: uuid.UUID) -> Doctor:
     return doctor
 
 
-async def create_doctor(session: AsyncSession, data: DoctorCreate) -> Doctor:
+async def create_doctor(session: AsyncSession, data: DoctorCreate) -> RegistrationResult:
     """Registra un médico. `verified` se decide contra SACS/FPV; `status` = 1 (activo).
 
     Si el registro oficial valida la cédula, el nombre y la licencia de la ficha son los
-    SUYOS, no los del payload (ver `_apply_official_identity`)."""
+    SUYOS, no los del payload (ver `_apply_official_identity`).
+
+    Devuelve `RegistrationResult` y no solo la ficha porque el motivo del rechazo es lo que
+    permite escribirle al médico qué le falta, y ese dato solo existe aquí: no se persiste."""
     # Honeypot: si el campo trampa llegó con valor, es un bot. Rechazo genérico.
     if data.website:
         raise BadRequestError("Solicitud inválida.")
@@ -590,7 +647,7 @@ async def create_doctor(session: AsyncSession, data: DoctorCreate) -> Doctor:
     await _sync_user_from_doctor(session, doctor)
     await session.commit()
     await session.refresh(doctor)
-    return doctor
+    return RegistrationResult(doctor, None if check.verified else check.reason)
 
 
 async def update_doctor(
@@ -647,7 +704,7 @@ async def _assert_approvable(session: AsyncSession, doctor: Doctor) -> None:
 
 async def approve_doctor(
     session: AsyncSession, doctor_id: uuid.UUID, actor_user_id: uuid.UUID | None = None
-) -> Doctor:
+) -> ApprovalResult:
     """Aprobación manual: un admin habilita a un médico al que el registro oficial no validó.
 
     Deja su propia acción en `audit_log` (`doctor.approved`, en la misma transacción). No es
@@ -669,7 +726,7 @@ async def approve_doctor(
     )
     await session.commit()
     await session.refresh(doctor)
-    return doctor
+    return ApprovalResult(doctor, newly_approved=not was_verified)
 
 
 async def revoke_doctor_approval(
