@@ -16,6 +16,7 @@ dependencies = [
     "httpx>=0.28.1",
     "slowapi>=0.1.9",
     "mailtrap>=2.6.1",
+    "xlsxwriter>=3.2.9",
 ]
 
 [project.optional-dependencies]

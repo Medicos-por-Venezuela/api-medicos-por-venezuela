@@ -25,3 +25,14 @@ async def test_preflight_permite_las_cabeceras_del_frontend(
         },
     )
     assert resp.status_code == 200, resp.text
+
+
+async def test_content_disposition_queda_expuesto_al_navegador(live_client: AsyncClient) -> None:
+    """El nombre del archivo de los reportes viaja en `Content-Disposition`, y una respuesta
+    cross-origin solo deja leer esa cabecera si está en `Access-Control-Expose-Headers`. Sin
+    esto la descarga funciona pero el archivo llega con un nombre inventado por el cliente."""
+    resp = await live_client.get(
+        "/api/v1/stats/public", headers={"Origin": "https://medicosporvenezuela.org"}
+    )
+    expuestas = resp.headers.get("access-control-expose-headers", "").lower()
+    assert "content-disposition" in expuestas
