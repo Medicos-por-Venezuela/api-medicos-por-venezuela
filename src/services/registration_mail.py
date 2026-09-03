@@ -48,7 +48,7 @@ from src.models.patient import Patient
 from src.models.professional_type import ProfessionalType
 from src.models.profile import Profile
 from src.models.specialty import Specialty
-from src.services.mail import send_mail
+from src.services.mail import esc, send_mail
 
 logger = logging.getLogger("mpv.api")
 
@@ -139,7 +139,9 @@ def _rows_text(rows: list[tuple[str, str | None]]) -> str:
 
 def _rows_html(rows: list[tuple[str, str | None]]) -> str:
     """Los mismos pares en HTML. Saltar los vacíos evita filas como 'Especialidad: None'."""
-    return "<br>".join(f"<strong>{label}:</strong> {value}" for label, value in rows if value)
+    return "<br>".join(
+        f"<strong>{esc(label)}:</strong> {esc(value)}" for label, value in rows if value
+    )
 
 
 # --- A: paciente nuevo en la cola pública -------------------------------------
@@ -312,11 +314,16 @@ def _build_doctor_rejected(
     Le devolvemos **su propia cédula** porque teclearla mal es la causa más común de que el
     registro oficial no lo encuentre, y sin verla escrita no tiene forma de darse cuenta.
 
-    Las direcciones de respuesta salen de `MAIL_INTERNAL_RECIPIENTS`, las mismas que reciben el
-    aviso interno: si operación cambia de buzón, este texto cambia con ella y no queda pidiendo
-    que respondan a una dirección que ya nadie lee.
+    Las direcciones salen de `MAIL_INTERNAL_RECIPIENTS`, las mismas que reciben el aviso
+    interno: si operación cambia de buzón, este texto cambia con ella. Si no hay ninguna
+    configurada cae a `CONTACT_EMAIL`, **nunca** al remitente: el remitente es `no-reply@`, y
+    mandar ahí un título de médico es tirarlo.
+
+    Dice "escríbenos a X" y no "responde a este correo" a propósito: una respuesta iría al
+    `From`, que es ese mismo `no-reply@`. La instrucción tiene que describir lo que de verdad
+    funciona, no lo que suena natural.
     """
-    destinos = ", ".join(settings.internal_mail_recipients) or settings.MAIL_FROM_EMAIL
+    destinos = ", ".join(settings.internal_mail_recipients) or settings.CONTACT_EMAIL
     documentos_text = "\n".join(f"  - {d}" for d in REQUIRED_DOCUMENTS)
     documentos_html = "".join(f"<li>{d}</li>" for d in REQUIRED_DOCUMENTS)
     subject = "Tu registro en Médicos por Venezuela necesita verificación"
@@ -326,22 +333,22 @@ def _build_doctor_rejected(
         "Recibimos tu registro, pero todavía no podemos habilitarte para atender.\n\n"
         f"{reason_text(reason)}\n\n"
         f"{cedula_line}\n\n"
-        f"Para completar tu verificación, responde a este correo ({destinos}) adjuntando:\n"
+        f"Para completar tu verificación, escríbenos a {destinos} adjuntando:\n"
         f"{documentos_text}\n\n"
         "En cuanto revisemos los documentos te avisamos por este mismo medio.\n"
     )
     cedula_html = (
-        f"<p><strong>Cédula con la que quedaste registrado:</strong> {cedula}</p>"
+        f"<p><strong>Cédula con la que quedaste registrado:</strong> {esc(cedula)}</p>"
         if cedula
         else ""
     )
     html = (
-        f"<p>Hola {full_name},</p>"
+        f"<p>Hola {esc(full_name)},</p>"
         "<p>Recibimos tu registro, pero todavía no podemos habilitarte para atender.</p>"
         f"<p>{reason_text(reason)}</p>"
         f"{cedula_html}"
-        "<p>Para completar tu verificación, responde a este correo "
-        f"(<strong>{destinos}</strong>) adjuntando:</p>"
+        f"<p>Para completar tu verificación, escríbenos a <strong>{esc(destinos)}</strong> "
+        "adjuntando:</p>"
         f"<ul>{documentos_html}</ul>"
         "<p>En cuanto revisemos los documentos te avisamos por este mismo medio.</p>"
     )
@@ -371,7 +378,7 @@ def _build_doctor_approved(full_name: str) -> tuple[str, str, str]:
         "Gracias por sumarte.\n"
     )
     html = (
-        f"<p>Hola {full_name},</p>"
+        f"<p>Hola {esc(full_name)},</p>"
         "<p>Tu registro fue aprobado y tu cuenta ya está habilitada para atender pacientes.</p>"
         f'<p><a href="{_doctor_panel_url()}">Entrar al panel médico</a></p>'
         "<p>Gracias por sumarte.</p>"
@@ -379,18 +386,33 @@ def _build_doctor_approved(full_name: str) -> tuple[str, str, str]:
     return subject, text, html
 
 
+async def doctor_email(session: AsyncSession, doctor: Doctor) -> str | None:
+    """A dónde se le escribe a un médico, o `None` si no hay dónde.
+
+    `doctors.email` -> `users.email` (vía `user_id`): las fichas backfilleadas nacieron sin
+    correo porque el contacto vivía en la cuenta, y son justo las antiguas que un admin puede
+    estar aprobando ahora.
+
+    Definición ÚNICA, usada por los dos correos al médico. Tenerla dos veces era una bomba de
+    relojería: hoy `DoctorCreate` exige email, así que leer `doctor.email` a secas funciona en
+    el registro; el día que aparezca un alta de médico sin email, el correo de rechazo dejaría
+    de salir en silencio mientras el de aprobación seguiría funcionando, y la diferencia sería
+    invisible.
+    """
+    if doctor.email:
+        return doctor.email
+    if doctor.user_id is None:
+        return None
+    return await session.scalar(select(Profile.email).where(Profile.id == doctor.user_id))
+
+
 async def doctor_approved_mail_args(session: AsyncSession, doctor: Doctor) -> dict | None:
     """Args del correo E, o `None` si no hay a dónde escribirle.
 
-    El destinatario se resuelve `doctors.email` -> `users.email` (vía `user_id`): las fichas
-    backfilleadas nacieron sin correo porque el contacto vivía en la cuenta, y son justo las
-    antiguas que un admin puede estar aprobando ahora. Si no hay ninguno de los dos no se
-    envía y queda un warning: aprobar a un médico sin correo es una acción válida, solo que no
-    tiene a dónde llegar.
+    Que no haya correo no es un error: aprobar a un médico sin dirección es una acción válida,
+    solo que no tiene a dónde llegar. Queda un warning para que no sea un silencio total.
     """
-    to_email = doctor.email
-    if not to_email and doctor.user_id is not None:
-        to_email = await session.scalar(select(Profile.email).where(Profile.id == doctor.user_id))
+    to_email = await doctor_email(session, doctor)
     if not to_email:
         # Sin PII en el log: el id de la ficha basta para encontrarla en el panel.
         logger.warning("MAIL:skip reason=doctor_sin_email doctor_id=%s", doctor.id)

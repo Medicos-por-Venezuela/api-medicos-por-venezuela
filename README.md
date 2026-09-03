@@ -378,6 +378,7 @@ uv run uvicorn src.main:app --reload      # http://localhost:8000
 | `BACKEND_CORS_ORIGINS` | `*`              | dominios del frontend                       |
 | `MAILTRAP_API_TOKEN`   | (vacío = no envía)| token de Mailtrap (Sending → API Tokens)   |
 | `MAIL_INTERNAL_RECIPIENTS` | (vacío)      | **buzones de operación, separados por comas** |
+| `CONTACT_EMAIL`        | `info@medicosporvenezuela.org` | dirección pública de contacto |
 
 - **Local:** `.env` (copiado de `.env.example`).
 - **Producción:** `.env.supabase` (ignorado por git) o el gestor de secretos del hosting.
@@ -405,6 +406,12 @@ esos salen siempre que haya `MAILTRAP_API_TOKEN`.
 
 En local, define `MAILTRAP_INBOX_ID` para que todo se entregue al inbox de pruebas en vez de
 enviarse de verdad.
+
+`CONTACT_EMAIL` es **otra cosa**: la dirección pública a la que se le pide al médico rechazado
+que mande su título, su licencia del SACS y su carta de artículo 8. `MAIL_INTERNAL_RECIPIENTS`
+es "a quién avisamos" (incluye buzones personales); `CONTACT_EMAIL` es "a dónde escribe la
+gente". Por eso sí trae valor por defecto: si quedara vacía, el correo mandaría al médico a
+`no-reply@`, o sea a la basura.
 
 ## Autenticación y autorización (RBAC granular)
 
