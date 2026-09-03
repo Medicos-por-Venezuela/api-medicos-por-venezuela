@@ -128,6 +128,11 @@ app.add_middleware(
     # routers/consultations.py). Sin ella aquí el navegador tumba el preflight con "Disallowed
     # CORS headers" y el paciente se queda sin videoconsulta al registrarse.
     allow_headers=["Authorization", "Content-Type", "X-Correlation-ID", "X-Consultation-Token"],
+    # Content-Disposition: lleva el nombre del archivo de los reportes en Excel (ver
+    # routers/reports.py). Por defecto el navegador NO deja leer esa cabecera en una respuesta
+    # cross-origin, así que sin exponerla el frontend descargaría los reportes con un nombre
+    # inventado por el cliente en vez del que fija el backend.
+    expose_headers=["Content-Disposition"],
 )
 
 register_exception_handlers(app)

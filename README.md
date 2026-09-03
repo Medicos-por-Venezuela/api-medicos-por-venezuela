@@ -410,7 +410,7 @@ users (profiles) ──< user_roles >── roles ──< role_permissions >─�
 | `patient` | ninguno de staff (solo ve **lo suyo** por pertenencia) |
 | `doctor` | `consultations.read/write/close`, `queue.read/take`, `patients.read`, `doctors.read` |
 | `admin` | todo lo de doctor + `patients.write/delete`, `consultations.delete`, `queue.manage`, `doctors.write/verify`, `profiles.read/manage`, `catalogs.manage`, `roles.assign`, `audit.read`, `users.create` |
-| `super_admin` | **todos** los permisos |
+| `super_admin` | **todos** los permisos, y el único con `reports.export` (exportación de reportes con PII masiva) |
 
 **Cómo se protege un endpoint** (una línea): `Depends(require_permission("recurso.accion"))` → 403 si
 falta el permiso. Se autoriza por **permiso**, no por rol.
@@ -429,6 +429,13 @@ falta el permiso. Se autoriza por **permiso**, no por rol.
   otorgar `super_admin` si el propio actor no lo tiene ya, aunque tenga `roles.assign` por otro
   rol (p. ej. un `admin` plano). `POST /users` además bloquea `super_admin` como `initial_role`
   con `422` para **cualquier** actor (restricción de creación independiente del guard anterior).
+
+- **`reports.export` es exclusivo de `super_admin`** (migración
+  `20260903_093414_seed_reports_export_permission.sql`): a diferencia de `stats.read`, que se
+  otorgó también a `admin`, los reportes exportan la ficha COMPLETA de médicos y pacientes
+  (cédulas, teléfonos, alergias) de miles de personas a un archivo que sale de la plataforma. Es
+  la operación con mayor exposición de PII de la API; cada exportación queda en `audit_log` como
+  `report.exported` con el filtro aplicado y el número de filas (nunca las filas).
 
 **Agregar un permiso nuevo:** siémbralo en una migración (`permissions` + `role_permissions`) y
 protege el endpoint con `require_permission("...")`. Nunca lo insertes a mano.
@@ -473,6 +480,8 @@ protege el endpoint con `require_permission("...")`. Nunca lo insertes a mano.
 | `DELETE`| `/users/{id}/roles/{role_id}`       | Revocar rol (soft, auditado; `roles.assign`) |
 | `POST`  | `/users`                            | Crear usuario de Auth + rol inicial opcional (auditado; `users.create`) |
 | `GET`   | `/audit-log?action=&actor_user_id=&resource=` | Registro de auditoría (`audit.read`) |
+| `GET`   | `/reports/doctors` · `/reports/patients` | Vista previa paginada del reporte, con las columnas y el `total` que traería el Excel (`reports.export`) |
+| `GET`   | `/reports/doctors/export` · `/reports/patients/export` | El reporte completo en `.xlsx` (mismos filtros, sin `limit`; auditado) |
 
 ## Concurrencia: toma de cola anti-colisión
 
