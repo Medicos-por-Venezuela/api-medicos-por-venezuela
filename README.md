@@ -376,6 +376,8 @@ uv run uvicorn src.main:app --reload      # http://localhost:8000
 | `JITSI_DOMAIN`         | `meet.jit.si`    | dominio Jitsi (self-host opcional)          |
 | `STALE_CONSULTATION_MINUTES` | `30`       | umbral para liberar consultas estancadas    |
 | `BACKEND_CORS_ORIGINS` | `*`              | dominios del frontend                       |
+| `MAILTRAP_API_TOKEN`   | (vacío = no envía)| token de Mailtrap (Sending → API Tokens)   |
+| `MAIL_INTERNAL_RECIPIENTS` | (vacío)      | **buzones de operación, separados por comas** |
 
 - **Local:** `.env` (copiado de `.env.example`).
 - **Producción:** `.env.supabase` (ignorado por git) o el gestor de secretos del hosting.
@@ -386,6 +388,23 @@ uv run uvicorn src.main:app --reload      # http://localhost:8000
   **exclusivamente** `src/services/users.py` para crear usuarios de Auth vía la Admin API
   (`POST /users`). Igual que `SUPABASE_JWT_SECRET`: **obligatorio** en producción, nunca se
   loguea, el valor por defecto del código es solo para desarrollo/pruebas.
+
+### Correo: `MAIL_INTERNAL_RECIPIENTS` hay que ponerlo al desplegar
+
+Es la lista de buzones de **operación** que reciben los avisos de alta: paciente nuevo en la
+cola pública, y médico registrado (con su veredicto de credencial). Separada por comas.
+
+Viene **vacía por defecto y a propósito**, con el mismo criterio que `MAILTRAP_API_TOKEN`: con
+las direcciones reales escritas en el código, cualquier entorno de pruebas que tuviera un token
+de Mailtrap le escribiría de verdad a esas personas en el primer registro de prueba.
+
+⚠️ **La contrapartida es que si se olvida en producción, esos avisos no salen** y nadie recibe
+un error — es un silencio, no un fallo. Compruébalo tras desplegar registrando un paciente de
+prueba. Los correos **al médico** (registro aprobado / rechazado) no dependen de esta variable:
+esos salen siempre que haya `MAILTRAP_API_TOKEN`.
+
+En local, define `MAILTRAP_INBOX_ID` para que todo se entregue al inbox de pruebas en vez de
+enviarse de verdad.
 
 ## Autenticación y autorización (RBAC granular)
 

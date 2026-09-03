@@ -15,7 +15,7 @@ Autorización:
 
 import uuid
 
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
@@ -36,6 +36,7 @@ from src.schemas.doctor import (
     DoctorUpdate,
 )
 from src.services import doctors as doctors_service
+from src.services import registration_mail
 
 router = APIRouter(prefix="/doctors", tags=["doctors"])
 tag_metadata = [
@@ -43,6 +44,38 @@ tag_metadata = [
 ]
 
 _NOT_FOUND = {404: {"description": "Médico no encontrado."}}
+
+
+async def _queue_registration_mail(
+    background: BackgroundTasks, db: AsyncSession, doctor, reason: str | None
+) -> None:
+    """Encola los DOS correos de un registro de médico: el aviso a operación y el que recibe
+    el propio médico.
+
+    Los args se resuelven aquí, con la sesión viva (el BackgroundTask corre tras cerrar la
+    request). Salen en pareja: si quedó verificado, aviso interno + "ya puedes entrar"; si no,
+    aviso interno con el motivo + la petición de documentos.
+
+    El correo AL MÉDICO no depende de `MAIL_INTERNAL_RECIPIENTS`: aunque operación no tenga
+    buzón configurado, quien se registró merece su respuesta.
+    """
+    internal = await registration_mail.doctor_registered_mail_args(db, doctor)
+    if internal:
+        background.add_task(
+            registration_mail.send_doctor_registered_alert, reason=reason, **internal
+        )
+    if doctor.verified:
+        approved = await registration_mail.doctor_approved_mail_args(db, doctor)
+        if approved:
+            background.add_task(registration_mail.send_doctor_approved_email, **approved)
+    elif doctor.email:
+        background.add_task(
+            registration_mail.send_doctor_rejected_email,
+            to_email=doctor.email,
+            full_name=doctor.full_name,
+            cedula=doctor.cedula,
+            reason=reason,
+        )
 
 
 @router.get(
@@ -112,7 +145,10 @@ async def list_doctors(
 )
 @limiter.limit(settings.DOCTOR_REGISTER_RATE_LIMIT)
 async def register_doctor(
-    request: Request, payload: DoctorCreate, db: AsyncSession = Depends(get_db)
+    request: Request,
+    payload: DoctorCreate,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
 ) -> DoctorResponse:
     """Registra un médico/psicólogo. El backend valida la cédula contra el SACS
     (médico) o la FPV (psicólogo) según el `professional_type`.
@@ -122,8 +158,14 @@ async def register_doctor(
     registro, no los del payload (lo que declara el cliente no verifica nada). En
     cualquier otro caso queda `false` y lo aprueba un admin (`POST /{id}/approve`).
 
-    Anti-bot: rate limit por IP + campo honeypot (`website`, debe ir vacío)."""
-    return await doctors_service.create_doctor(db, payload)
+    Anti-bot: rate limit por IP + campo honeypot (`website`, debe ir vacío).
+
+    Manda dos correos (best-effort, en background): uno a operación con el expediente y el
+    veredicto, y otro al médico — de bienvenida si quedó verificado, o pidiéndole título,
+    licencia del SACS y carta de artículo 8 si no."""
+    doctor, reason = await doctors_service.create_doctor(db, payload)
+    await _queue_registration_mail(background_tasks, db, doctor, reason)
+    return doctor
 
 
 # --- Perfil propio del médico autenticado (self-service) ---
@@ -312,6 +354,7 @@ async def update_doctor(
 )
 async def approve_doctor(
     doctor_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("doctors.verify")),
 ) -> DoctorResponse:
@@ -324,8 +367,20 @@ async def approve_doctor(
 
     **422 si la ficha no tiene cédula y licencia, o no está activa:** aprobarla no
     habilitaría a nadie (el gate la seguiría bloqueando) y dejaría al admin creyendo que
-    sí. El mensaje dice qué falta. Idempotente."""
-    return await doctors_service.approve_doctor(db, doctor_id, actor_user_id=principal.id)
+    sí. El mensaje dice qué falta. Idempotente.
+
+    Al aprobar se le avisa al médico por correo (best-effort). **Solo cuando la llamada cambia
+    el estado**: aprobar una ficha ya aprobada sigue devolviendo 200, pero no vuelve a
+    escribirle — un segundo clic del admin no debe producir un segundo "ya puedes entrar".
+    A operación no se le avisa: quien aprobó estaba mirando la pantalla cuando lo hizo."""
+    doctor, newly_approved = await doctors_service.approve_doctor(
+        db, doctor_id, actor_user_id=principal.id
+    )
+    if newly_approved:
+        args = await registration_mail.doctor_approved_mail_args(db, doctor)
+        if args:
+            background_tasks.add_task(registration_mail.send_doctor_approved_email, **args)
+    return doctor
 
 
 @router.post(

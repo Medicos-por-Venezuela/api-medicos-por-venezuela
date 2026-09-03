@@ -77,16 +77,20 @@ async def send_mail(
         logger.warning("MAIL:disabled category=%s (sin MAILTRAP_API_TOKEN)", category)
         return False
 
-    mail = mt.Mail(
-        sender=mt.Address(email=settings.MAIL_FROM_EMAIL, name=settings.MAIL_FROM_NAME),
-        to=[mt.Address(email=to_email)],
-        bcc=[mt.Address(email=e) for e in bcc] if bcc else None,
-        subject=subject,
-        text=text,
-        html=html,
-        category=category,
-    )
     try:
+        # El armado va DENTRO del try, no antes. `mt.Address` valida el formato y lanza si la
+        # dirección no le cuadra: con la construcción fuera, una dirección mal escrita en la
+        # configuración (una coma en vez de un punto en MAIL_INTERNAL_RECIPIENTS, p. ej.)
+        # reventaba hacia el caller y rompía justo el flujo que este módulo promete no romper.
+        mail = mt.Mail(
+            sender=mt.Address(email=settings.MAIL_FROM_EMAIL, name=settings.MAIL_FROM_NAME),
+            to=[mt.Address(email=to_email)],
+            bcc=[mt.Address(email=e) for e in bcc] if bcc else None,
+            subject=subject,
+            text=text,
+            html=html,
+            category=category,
+        )
         await asyncio.to_thread((_bulk_client() if bulk else _client()).send, mail)
     except Exception as exc:  # noqa: BLE001 — best-effort: nada de correo revienta al caller
         logger.warning("MAIL:failed category=%s reason=%s", category, type(exc).__name__)
