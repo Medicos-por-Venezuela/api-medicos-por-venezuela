@@ -35,6 +35,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import Label
+from sqlalchemy.sql.selectable import Subquery
 
 from src.core.errors import BadRequestError, ConflictError, NotFoundError, UnprocessableError
 from src.models.doctor import Doctor
@@ -259,6 +261,8 @@ def _fichas_select() -> Select:
             Doctor.cedula.label("cedula"),
             Doctor.license.label("license"),
             func.coalesce(Doctor.email, Profile.email).label("email"),
+            func.coalesce(Doctor.phone, Profile.whatsapp_number).label("phone"),
+            Doctor.country_of_residence.label("country"),
             Doctor.specialty_id.label("specialty_id"),
             Doctor.professional_type_id.label("professional_type_id"),
             cast(Doctor.status, Integer).label("status"),
@@ -286,6 +290,8 @@ def _sin_ficha_select() -> Select:
         cast(null(), String).label("cedula"),
         Profile.medical_license.label("license"),
         Profile.email.label("email"),
+        Profile.whatsapp_number.label("phone"),
+        Profile.country.label("country"),
         cast(null(), UUID(as_uuid=True)).label("specialty_id"),
         cast(null(), UUID(as_uuid=True)).label("professional_type_id"),
         cast(null(), Integer).label("status"),
@@ -298,6 +304,58 @@ def _sin_ficha_select() -> Select:
             select(Doctor.id).where(Doctor.user_id == Profile.id, Doctor.deleted_at.is_(None))
         ),
     )
+
+
+def admin_universe() -> tuple[Subquery, Label]:
+    """El universo del panel admin: fichas vivas de `doctors` MÁS las cuentas con rol de
+    médico que nunca crearon ficha, con su `blocked_reason` ya calculado.
+
+    Una sola definición para el listado, el resumen de credenciales y los reportes: si cada
+    uno armara su propia unión, el reporte exportaría una población distinta de la que el
+    admin ve en pantalla y nadie se enteraría hasta cuadrar los números a mano.
+    """
+    sub = _fichas_select().union_all(_sin_ficha_select()).subquery()
+    blocked = _blocked_reason(
+        sub.c.has_record, sub.c.status, sub.c.verified, sub.c.cedula, sub.c.license
+    ).label("blocked_reason")
+    return sub, blocked
+
+
+def apply_doctor_filters(
+    stmt: Select,
+    sub: Subquery,
+    blocked: Label,
+    *,
+    status: int | None = None,
+    verified: bool | None = None,
+    can_practice: bool | None = None,
+    blocked_reason: str | None = None,
+    search: str | None = None,
+) -> Select:
+    """Aplica los filtros del panel admin a una consulta sobre `admin_universe()`.
+
+    Extraída de `list_doctors` para que el REPORTE exportable use exactamente el mismo
+    predicado que la tabla: "exporta lo que estás viendo" solo es cierto si hay una única
+    implementación del filtro, no dos que se parecen.
+    """
+    if status is not None:
+        stmt = stmt.where(sub.c.status == status)
+    if verified is not None:
+        stmt = stmt.where(sub.c.verified.is_(verified))
+    if can_practice is not None:
+        stmt = stmt.where(blocked.is_(None) if can_practice else blocked.is_not(None))
+    if blocked_reason is not None:
+        stmt = stmt.where(blocked == blocked_reason)
+    if search and (term := search.strip()):
+        like = f"%{term}%"
+        stmt = stmt.where(
+            or_(
+                sub.c.full_name.ilike(like),
+                sub.c.cedula.ilike(like),
+                sub.c.email.ilike(like),
+            )
+        )
+    return stmt
 
 
 async def list_doctors(
@@ -328,30 +386,17 @@ async def list_doctors(
     (`no_verificado`) quedan sepultados y no aparecen ni en la primera página. Sin este
     filtro el panel enseña un montón de filas sin botón y parece que aprobar no existe.
     """
-    sub = _fichas_select().union_all(_sin_ficha_select()).subquery()
-    blocked = _blocked_reason(
-        sub.c.has_record, sub.c.status, sub.c.verified, sub.c.cedula, sub.c.license
-    ).label("blocked_reason")
-
-    base = select(sub, blocked)
-    if status is not None:
-        base = base.where(sub.c.status == status)
-    if verified is not None:
-        base = base.where(sub.c.verified.is_(verified))
-    if can_practice is not None:
-        criterion = blocked.is_(None) if can_practice else blocked.is_not(None)
-        base = base.where(criterion)
-    if blocked_reason is not None:
-        base = base.where(blocked == blocked_reason)
-    if search and (term := search.strip()):
-        like = f"%{term}%"
-        base = base.where(
-            or_(
-                sub.c.full_name.ilike(like),
-                sub.c.cedula.ilike(like),
-                sub.c.email.ilike(like),
-            )
-        )
+    sub, blocked = admin_universe()
+    base = apply_doctor_filters(
+        select(sub, blocked),
+        sub,
+        blocked,
+        status=status,
+        verified=verified,
+        can_practice=can_practice,
+        blocked_reason=blocked_reason,
+        search=search,
+    )
 
     total = await session.scalar(select(func.count()).select_from(base.subquery())) or 0
     # Desempate por `row_key` (id de la ficha, o de la cuenta si no la tiene): sin él la
@@ -389,10 +434,7 @@ async def credential_summary(session: AsyncSession) -> dict[str, int]:
     fecha esconde a los aprobables entre miles de fichas sin cédula y el panel aparenta no
     tener nada que aprobar.
     """
-    sub = _fichas_select().union_all(_sin_ficha_select()).subquery()
-    blocked = _blocked_reason(
-        sub.c.has_record, sub.c.status, sub.c.verified, sub.c.cedula, sub.c.license
-    ).label("blocked_reason")
+    _, blocked = admin_universe()
     rows = (await session.execute(select(blocked, func.count()).group_by(blocked))).all()
     # Todas las claves siempre presentes (0 si el grupo está vacío): el frontend pinta la
     # misma fila de contadores sin comprobar cada una.

@@ -9,13 +9,14 @@ Un fallo de correo NUNCA rompe el agendado (ver mail.send_mail). Solo se le escr
 tiene email (`patients.email` es opcional).
 """
 
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
 from src.core.errors import NotFoundError
+from src.core.tz import VET
 from src.models.consultation import Consultation
 from src.models.patient import Patient
 from src.models.profile import Profile
@@ -77,14 +78,12 @@ async def set_prefs(session: AsyncSession, user_id, prefs: dict) -> dict:
     return user.notification_prefs
 
 
-# ponytail: Venezuela = UTC-4 fijo (sin DST desde 2016) → offset constante; así el formateo de la
-# fecha en los correos no depende de tzdata/zoneinfo (que en Windows habría que instalar aparte).
-_VET = timezone(timedelta(hours=-4))
-
-
 def fmt_when(when: datetime) -> str:
-    """Fecha/hora de la cita en hora de Venezuela, legible para el paciente."""
-    return when.astimezone(_VET).strftime("%d/%m/%Y %I:%M %p")
+    """Fecha/hora de la cita en hora de Venezuela, legible para el paciente.
+
+    El huso vive en `src/core/tz.py` (una sola definición para los correos y para los reportes
+    en Excel). Ahí está también el porqué de un offset fijo en vez de `zoneinfo`."""
+    return when.astimezone(VET).strftime("%d/%m/%Y %I:%M %p")
 
 
 def _build_email(
