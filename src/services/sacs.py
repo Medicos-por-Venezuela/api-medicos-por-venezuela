@@ -8,7 +8,12 @@ import time
 
 import httpx
 
-from src.schemas.sacs import SacsVerificationResponse
+from src.schemas.sacs import (
+    FORMATO_INVALIDO,
+    NO_ENCONTRADO,
+    SERVICIO_NO_DISPONIBLE,
+    SacsVerificationResponse,
+)
 
 logger = logging.getLogger("mpv.api")
 
@@ -19,10 +24,16 @@ _PROF_RE = re.compile(r"xajax_tableProfesion\('(.*?)'\)", re.DOTALL)
 _EMPTY_VALUES = {'""', "[]", ""}
 
 
-def _fallo(error: str) -> SacsVerificationResponse:
+def _fallo(error: str, kind: str = SERVICIO_NO_DISPONIBLE) -> SacsVerificationResponse:
     """Respuesta de "no verificado" con el motivo. Fail-closed: todo camino que no confirma
-    la cédula pasa por aquí."""
-    return SacsVerificationResponse(encontrado=False, error=error)
+    la cédula pasa por aquí.
+
+    `kind` es el motivo TIPADO para quien tenga que ramificar (hoy, el correo que se le manda
+    al médico rechazado); `error` sigue siendo la prosa para el humano. El valor por defecto es
+    SERVICIO_NO_DISPONIBLE a propósito: si alguien añade un camino de fallo y olvida el kind,
+    el sistema dirá "no pudimos verificar, lo revisamos a mano" en vez de acusar al médico de
+    tener una cédula que no existe."""
+    return SacsVerificationResponse(encontrado=False, error=error, error_kind=kind)
 
 
 async def verificar_sacs(cedula: str) -> SacsVerificationResponse:
@@ -30,7 +41,7 @@ async def verificar_sacs(cedula: str) -> SacsVerificationResponse:
     cedula = cedula.upper().strip()
 
     if not _CEDULA_RE.match(cedula):
-        return _fallo("Formato inválido. Usa V-12345678 o E-12345678")
+        return _fallo("Formato inválido. Usa V-12345678 o E-12345678", FORMATO_INVALIDO)
 
     timestamp = int(time.time() * 1000)
     payload = f"xajax=getPrfsnalByCed&xajaxr={timestamp}&xajaxargs[]={cedula}"
@@ -66,7 +77,7 @@ async def verificar_sacs(cedula: str) -> SacsVerificationResponse:
     prof_raw = prof_match.group(1)
 
     if user_raw in _EMPTY_VALUES or prof_raw in _EMPTY_VALUES:
-        return _fallo("La cédula no está registrada en el SACS")
+        return _fallo("La cédula no está registrada en el SACS", NO_ENCONTRADO)
 
     try:
         user_data = json.loads(user_raw)

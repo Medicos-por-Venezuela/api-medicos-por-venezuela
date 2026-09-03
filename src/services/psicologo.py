@@ -9,16 +9,17 @@ import logging
 import httpx
 
 from src.schemas.psicologo import PsicologoVerificationResponse
+from src.schemas.sacs import NO_ENCONTRADO, SERVICIO_NO_DISPONIBLE
 
 logger = logging.getLogger("mpv.api")
 
 _FPV_URL = "https://api.sistema.fpv.org.ve/api/v1/psicologos_public"
 
 
-def _fallo(error: str) -> PsicologoVerificationResponse:
+def _fallo(error: str, kind: str = SERVICIO_NO_DISPONIBLE) -> PsicologoVerificationResponse:
     """Respuesta de "no verificado" con el motivo. Fail-closed: todo camino que no confirma
     la cédula pasa por aquí."""
-    return PsicologoVerificationResponse(encontrado=False, error=error)
+    return PsicologoVerificationResponse(encontrado=False, error=error, error_kind=kind)
 
 
 async def verificar_psicologo(cedula: str) -> PsicologoVerificationResponse:
@@ -46,7 +47,7 @@ async def verificar_psicologo(cedula: str) -> PsicologoVerificationResponse:
     items = data.get("items", []) if isinstance(data, dict) else []
 
     if not items:
-        return _fallo("La cédula no está registrada en la FPV")
+        return _fallo("La cédula no está registrada en la FPV", NO_ENCONTRADO)
 
     item = items[0]
     return PsicologoVerificationResponse(
