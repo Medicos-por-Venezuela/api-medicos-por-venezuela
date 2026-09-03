@@ -130,6 +130,18 @@ class Settings(BaseSettings):
     # registro de prueba. Se define solo en .env.production — si falta allí, no sale ningún
     # aviso interno (ese es el precio consciente de equivocarse hacia el lado callado).
     MAIL_INTERNAL_RECIPIENTS: str = ""
+    # Dirección PÚBLICA de contacto de la organización: la que se le da a un médico para que
+    # mande sus documentos. Es otra cosa que MAIL_INTERNAL_RECIPIENTS —esa es "a quién avisamos"
+    # e incluye buzones personales; esta es "a dónde escribe la gente"— y por eso sí trae valor
+    # por defecto: si quedara vacía, el correo le pediría al médico que mandara su título a una
+    # dirección no-reply, o sea a la basura.
+    CONTACT_EMAIL: str = "info@medicosporvenezuela.org"
+    # Dirección PÚBLICA de contacto de la organización, la que se le da a un médico para que
+    # mande sus documentos. Es otra cosa que MAIL_INTERNAL_RECIPIENTS —esa es "a quién avisamos"
+    # e incluye buzones personales; esta es "a dónde escribe la gente"— y por eso sí trae un
+    # valor por defecto: si quedara vacía, el correo le pediría al médico que mandara su título
+    # a una dirección no-reply, o sea a la basura.
+    CONTACT_EMAIL: str = "info@medicosporvenezuela.org"
 
     # --- CORS ---
     BACKEND_CORS_ORIGINS: str = "*"

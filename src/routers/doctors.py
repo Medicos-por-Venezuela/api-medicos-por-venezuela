@@ -68,10 +68,15 @@ async def _queue_registration_mail(
         approved = await registration_mail.doctor_approved_mail_args(db, doctor)
         if approved:
             background.add_task(registration_mail.send_doctor_approved_email, **approved)
-    elif doctor.email:
+        return
+    # Mismo resolutor de destinatario que la rama de arriba, a propósito: son la misma pregunta
+    # ("¿a dónde le escribo a este médico?") y responderla de dos formas distintas hacía que un
+    # médico sin email en la ficha recibiera un correo pero no el otro.
+    to_email = await registration_mail.doctor_email(db, doctor)
+    if to_email:
         background.add_task(
             registration_mail.send_doctor_rejected_email,
-            to_email=doctor.email,
+            to_email=to_email,
             full_name=doctor.full_name,
             cedula=doctor.cedula,
             reason=reason,
