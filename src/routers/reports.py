@@ -18,9 +18,11 @@ from datetime import UTC, date, datetime
 from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.errors import UnprocessableError
 from src.core.security import Principal, require_permission
 from src.core.tz import to_local
 from src.db.session import get_db
+from src.models.consultation import CONSULTATION_STATUSES
 from src.schemas.doctor import DoctorBlockedReason
 from src.schemas.report import ReportPreview
 from src.services import reports as reports_service
@@ -30,7 +32,8 @@ tag_metadata = [
     {
         "name": "reports",
         "description": (
-            "Reportes de listado de médicos y pacientes: vista previa filtrable y exportación "
+            "Reportes de listado de médicos, pacientes y consultas: vista previa filtrable y "
+            "exportación "
             "a Excel de la población completa. Solo `super_admin` (permiso `reports.export`); "
             "cada exportación queda registrada en `audit_log`."
         ),
@@ -178,6 +181,50 @@ def patient_filters(
     )
 
 
+def consultation_filters(
+    status: list[str] | None = Query(
+        None,
+        description="Estados a incluir (repetible). Omitir = todos. El panel manda por defecto "
+        "el set del monitor: `in_progress`, `referred_to_specialist`, `urgent_in_person`, "
+        "`patient_no_show`, `cancelled`, `contacted_whatsapp`.",
+    ),
+    assigned_doctor_id: uuid.UUID | None = Query(
+        None, description="Id de CUENTA del médico asignado (no el de su ficha en `doctors`)."
+    ),
+    specialty_id: uuid.UUID | None = Query(None, description="Especialidad solicitada."),
+    unassigned: bool | None = Query(
+        None, description="true = solo casos sin médico asignado · false = solo asignados."
+    ),
+    search: str | None = Query(
+        None, description="Paciente, código, motivo de consulta o médico (ILIKE)."
+    ),
+    created_from: date | None = Query(
+        None, description="Creadas desde esta fecha (inclusive, hora de Venezuela)."
+    ),
+    created_to: date | None = Query(
+        None, description="Creadas hasta esta fecha (inclusive, hora de Venezuela)."
+    ),
+) -> reports_service.ConsultationFilters:
+    """Filtros del reporte de consultas, compartidos por la vista previa y la exportación.
+
+    Los estados se validan contra `CONSULTATION_STATUSES` (el mismo CHECK que tiene la tabla):
+    un estado inventado devolvería cero filas en silencio, y quien lo pidió leería ese vacío
+    como "no hay casos" en vez de como "escribiste mal el filtro".
+    """
+    estados = tuple(status or ())
+    if desconocidos := sorted(set(estados) - CONSULTATION_STATUSES):
+        raise UnprocessableError(f"Estados no válidos: {', '.join(desconocidos)}.")
+    return reports_service.ConsultationFilters(
+        statuses=estados,
+        assigned_doctor_id=assigned_doctor_id,
+        specialty_id=specialty_id,
+        unassigned=unassigned,
+        search=search,
+        created_from=created_from,
+        created_to=created_to,
+    )
+
+
 # --- Médicos ------------------------------------------------------------------
 
 
@@ -295,4 +342,65 @@ async def export_patients_report(
     return _xlsx(
         await reports_service.export_patients(db, filters, **_actor(principal)),
         _filename("pacientes"),
+    )
+
+
+# --- Consultas ----------------------------------------------------------------
+
+
+@router.get(
+    "/consultations",
+    response_model=ReportPreview,
+    summary="Vista previa del reporte de consultas (paginada, super_admin)",
+    responses={**_FORBIDDEN, 422: {"description": "Algún estado del filtro no existe."}},
+)
+async def preview_consultations_report(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    filters: reports_service.ConsultationFilters = Depends(consultation_filters),
+    db: AsyncSession = Depends(get_db),
+    _: Principal = Depends(require_permission("reports.export")),
+) -> ReportPreview:
+    """Una página del reporte de consultas, con las columnas que tendrá el Excel y el `total`
+    exacto de filas que cumplen el filtro.
+
+    Las cinco primeras columnas son, en orden, las del modal **Consultas en progreso** del
+    dashboard (estado, médico asignado, paciente, tiempo en progreso y motivo); detrás vienen
+    las que una hoja de cálculo necesita y una tabla en pantalla no: el código para cruzar con
+    otros informes, las fechas para ordenar y el teléfono para actuar sin volver al panel.
+
+    **Puede traer más filas que ese modal**: el monitor pide una página de 100 por estado
+    (`GET /consultations` solo acepta un `status` a la vez), mientras que esto es una sola
+    consulta sin tope por estado."""
+    report = await reports_service.consultations_report(db, filters, skip=skip, limit=limit)
+    return _preview(report)
+
+
+@router.get(
+    "/consultations/export",
+    summary="Exportar el reporte de consultas a Excel (super_admin)",
+    response_class=Response,
+    responses={
+        200: {
+            "content": {XLSX_MEDIA_TYPE: {}},
+            "description": "Libro .xlsx: hoja `Consultas` + portada con los filtros aplicados.",
+        },
+        **_FORBIDDEN,
+        **_TOO_MANY,
+        422: {"description": "Algún estado del filtro no existe, o el filtro excede el tope."},
+    },
+)
+async def export_consultations_report(
+    filters: reports_service.ConsultationFilters = Depends(consultation_filters),
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_permission("reports.export")),
+) -> Response:
+    """El `.xlsx` con **todas** las consultas que cumplen el filtro: mismos filtros, mismas
+    columnas, sin `limit`.
+
+    Incluye el motivo de consulta, que es contenido clínico escrito por el paciente. Queda
+    registrado en `audit_log` como `report.exported`."""
+    return _xlsx(
+        await reports_service.export_consultations(db, filters, **_actor(principal)),
+        _filename("consultas"),
     )

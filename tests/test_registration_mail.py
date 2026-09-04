@@ -57,10 +57,11 @@ def _con_buzones(valor: str = ",".join(BUZONES)):
 
 @contextmanager
 def _capturar_correos():
-    """Dobla `send_mail` en los dos módulos que lo usan y devuelve la lista de llamadas.
+    """Dobla el envío y devuelve la lista de lo que se habría mandado.
 
-    Se parchea el nombre YA IMPORTADO en `registration_mail` (no `mail.send_mail`), porque el
-    módulo hizo `from ... import send_mail` y una vez importado el nombre es suyo.
+    Se parchea el nombre YA IMPORTADO en `registration_mail`, no `mail.send_mail`: el módulo
+    hizo `from ... import send_mail`, así que una vez importado el nombre es suyo y parchear el
+    origen no tendría efecto.
     """
     enviados: list[dict] = []
 
@@ -79,12 +80,6 @@ def _capturar_correos():
 
     with patch("src.services.registration_mail.send_mail", AsyncMock(side_effect=_fake)):
         yield enviados
-
-
-def _cuerpo(correo: dict) -> str:
-    """Texto + HTML juntos: una aserción negativa tiene que cubrir las dos versiones, o el
-    dato prohibido se cuela por la que no se miró."""
-    return correo["text"] + correo["html"]
 
 
 # --- Composición: aviso de paciente nuevo (A) ---------------------------------
@@ -137,6 +132,37 @@ def test_aviso_paciente_no_lleva_pii_clinica() -> None:
     # esto fija además que no aparezcan por ninguna otra vía (un `str(patient)`, p. ej.).
     for prohibido in ("V-12345678", "Alergia", "penicilina", "dolor de cabeza"):
         assert prohibido not in cuerpo
+
+
+def test_el_html_escapa_lo_que_escribio_un_desconocido() -> None:
+    """SEGURIDAD. `full_name` y compañía salen de formularios PÚBLICOS y sin autenticar, y
+    estos correos aterrizan en la bandeja de operación.
+
+    Sin escapar, alguien se registra con `<a href="http://malo/">Aprobar</a>` de nombre y le
+    mete a quien lo lea un enlace vivo, con apariencia de venir de la plataforma, dentro de un
+    correo que la plataforma sí envió. Es phishing servido por nosotros, y el vector está
+    abierto a cualquiera con un navegador.
+    """
+    veneno = '<a href="http://malicioso.example">Aprobar ahora</a>'
+    _, _, html = registration_mail._build_new_patient(
+        patient_name=veneno, phone="+58", zone="Caracas", specialty="X", code="C-1"
+    )
+    assert "<a href" not in html.replace('<a href="https://medicosporvenezuela.org', "")
+    assert "&lt;a href=" in html
+
+    _, _, html_medico = registration_mail._build_doctor_registered(
+        full_name=veneno,
+        cedula="V-1",
+        email="x@y.com",
+        phone=None,
+        professional_type=None,
+        specialty=None,
+        registered_at=None,
+        verified=False,
+        reason=None,
+    )
+    assert "malicioso.example" in html_medico  # el dato se conserva...
+    assert '<a href="http://malicioso.example">' not in html_medico  # ...pero inerte
 
 
 # --- Composición: registro de médico (B/C) ------------------------------------
@@ -200,12 +226,27 @@ def test_correo_al_medico_pide_los_tres_documentos_y_las_dos_direcciones() -> No
     assert "V-11111111" in text
 
 
-def test_correo_al_medico_sin_buzones_no_deja_la_direccion_vacia() -> None:
+def test_correo_al_medico_sin_buzones_cae_al_contacto_publico_y_nunca_a_no_reply() -> None:
     """Sin `MAIL_INTERNAL_RECIPIENTS` el correo al médico igual sale (no depende de esa
-    variable), pero tiene que decirle A DÓNDE responder: cae al remitente."""
+    variable), pero la dirección que le da tiene que ser una donde alguien lea.
+
+    Cae a `CONTACT_EMAIL`, **nunca** al remitente: el remitente es `no-reply@`, y pedirle a un
+    médico que mande ahí su título es pedirle que lo tire."""
     with _con_buzones(""):
-        _, text, _ = registration_mail._build_doctor_rejected("Dr X", "V-3", None)
-    assert settings.MAIL_FROM_EMAIL in text
+        _, text, html = registration_mail._build_doctor_rejected("Dr X", "V-3", None)
+    assert settings.CONTACT_EMAIL in text
+    assert settings.MAIL_FROM_EMAIL not in text
+    assert settings.MAIL_FROM_EMAIL not in html
+
+
+def test_el_correo_no_dice_responde_a_este_correo() -> None:
+    """El `From` es `no-reply@`: una respuesta no llega a ninguna parte. La instrucción tiene
+    que describir lo que de verdad funciona, no lo que suena natural."""
+    with _con_buzones():
+        _, text, html = registration_mail._build_doctor_rejected("Dr X", "V-3", None)
+    assert "responde a este correo" not in text.lower()
+    assert "responde a este correo" not in html.lower()
+    assert "escríbenos a" in text
 
 
 @pytest.mark.parametrize("motivo", sorted(registration_mail.DOCTOR_REJECTION_REASONS))
