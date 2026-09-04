@@ -15,6 +15,7 @@ Diseño:
 """
 
 import asyncio
+import html
 import logging
 
 import mailtrap as mt
@@ -22,6 +23,24 @@ import mailtrap as mt
 from src.core.config import settings
 
 logger = logging.getLogger("mpv.api")
+
+
+def esc(value: object) -> str:
+    """Escapa un valor para incrustarlo en el cuerpo HTML de un correo.
+
+    NO es decorativo. Casi todo lo que acaba en estos correos —el nombre de un paciente, su
+    zona, el motivo de una referencia— lo teclea alguien: unos vienen de formularios PÚBLICOS
+    y sin autenticar (`POST /patients`, `POST /doctors`), otros los escribe un médico en el
+    panel. Sin escapar, un dato con `<a href="http://malo/">Aprobar</a>` dentro le mete a quien
+    lo lea un enlace vivo, con apariencia de venir de la plataforma, dentro de un correo que la
+    plataforma sí envió: phishing servido por nosotros. Da igual que el destinatario sea la
+    bandeja de operación, un médico o un paciente; el vector es el mismo.
+
+    Vive aquí y no en cada módulo de composición porque el criterio es uno solo y los
+    constructores de cuerpos ya importan de este fichero. El cuerpo de texto plano no lo
+    necesita; el HTML sí.
+    """
+    return html.escape(str(value), quote=True)
 
 
 def mail_enabled() -> bool:

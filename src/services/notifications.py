@@ -20,7 +20,7 @@ from src.core.tz import VET
 from src.models.consultation import Consultation
 from src.models.patient import Patient
 from src.models.profile import Profile
-from src.services.mail import send_mail
+from src.services.mail import esc, send_mail
 
 # --- Preferencias de notificación (para que el sistema no sea invasivo) ---
 # Catálogo de notificaciones configurables por el médico (Ajustes → preferencias). Cada evento
@@ -89,9 +89,15 @@ def fmt_when(when: datetime) -> str:
 def _build_email(
     patient_name: str, code: str, when: datetime, doctor_name: str | None, is_reminder: bool
 ) -> tuple[str, str, str]:
-    """(subject, text, html) del correo de cita. Sin motor de plantillas: strings simples."""
+    """(subject, text, html) del correo de cita. Sin motor de plantillas: strings simples.
+
+    Todo lo que se interpola en el HTML pasa por `mail.esc`: `patient_name` sale del formulario
+    PÚBLICO de la cola y `doctor_name` del perfil que el propio médico edita. Ver el porqué
+    completo en el docstring de `esc`. El texto plano no lo necesita.
+    """
     cita = fmt_when(when)
     con_quien = f" con {doctor_name}" if doctor_name else ""
+    con_quien_html = f" con {esc(doctor_name)}" if doctor_name else ""
     if is_reminder:
         subject = f"Recordatorio: tu cita médica es pronto ({cita})"
         intro = "Te recordamos que tu cita médica es pronto."
@@ -105,9 +111,9 @@ def _build_email(
         "Ingresa a tu cuenta en Médicos por Venezuela para ver los detalles.\n"
     )
     html = (
-        f"<p>Hola {patient_name},</p><p>{intro}</p>"
-        f"<p><strong>Fecha y hora:</strong> {cita}{con_quien}<br>"
-        f"<strong>Código de caso:</strong> {code}</p>"
+        f"<p>Hola {esc(patient_name)},</p><p>{intro}</p>"
+        f"<p><strong>Fecha y hora:</strong> {cita}{con_quien_html}<br>"
+        f"<strong>Código de caso:</strong> {esc(code)}</p>"
         "<p>Ingresa a tu cuenta en Médicos por Venezuela para ver los detalles.</p>"
     )
     return subject, text, html
@@ -261,7 +267,7 @@ def interconsultation_broadcast_email(
     """(subject, text, html) del aviso a los especialistas de que hay un caso para su
     especialidad. SIN identidad del paciente ni del médico solicitante."""
     edad = f"Edad: {age_range}\n" if age_range else ""
-    edad_html = f"<strong>Edad:</strong> {age_range}<br>" if age_range else ""
+    edad_html = f"<strong>Edad:</strong> {esc(age_range)}<br>" if age_range else ""
     motivo = _recorta(chief_complaint)
     subject = f"Solicitud de interconsulta en {specialty_name}"
     panel = panel_url()
@@ -272,8 +278,8 @@ def interconsultation_broadcast_email(
         "El primer especialista que lo tome recibe los datos de contacto del médico tratante.\n"
     )
     html = (
-        f"<p>Un colega busca apoyo de <strong>{specialty_name}</strong>.</p>"
-        f"<p>{edad_html}<strong>Motivo:</strong> {motivo}</p>"
+        f"<p>Un colega busca apoyo de <strong>{esc(specialty_name)}</strong>.</p>"
+        f"<p>{edad_html}<strong>Motivo:</strong> {esc(motivo)}</p>"
         f'<p><a href="{panel}">Entra a tu panel</a> para ver el caso y tomarlo si puedes '
         "ayudar.</p>"
         "<p>El primer especialista que lo tome recibe los datos de contacto del médico "
@@ -296,8 +302,8 @@ def interconsultation_taken_email(
         f"Se pondrá en contacto contigo. Sus datos también están en tu panel:\n{panel}\n"
     )
     html = (
-        f"<p><strong>{quien}</strong> tomó tu solicitud de interconsulta.</p>"
-        f"<p><strong>Motivo del caso:</strong> {motivo}</p>"
+        f"<p><strong>{esc(quien)}</strong> tomó tu solicitud de interconsulta.</p>"
+        f"<p><strong>Motivo del caso:</strong> {esc(motivo)}</p>"
         "<p>Se pondrá en contacto contigo. Sus datos también están en "
         f'<a href="{panel}">tu panel</a>.</p>'
     )
