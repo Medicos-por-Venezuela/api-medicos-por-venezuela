@@ -662,6 +662,254 @@ async def test_export_sin_resultados_produce_un_libro_abrible(
 # --- Hora de Venezuela --------------------------------------------------------
 
 
+# --- Reporte de consultas (el del monitor del dashboard) ----------------------
+
+
+async def _seed_consultation(
+    db: AsyncSession, marker: str, *, patient: Patient, **overrides
+) -> Consultation:
+    """Una consulta con paciente, codigo unico y estado `in_progress` por defecto."""
+    fields = {
+        "code": f"T-{marker}",
+        "status": "in_progress",
+        "priority": "normal",
+        "chief_complaint": f"Motivo {marker}",
+        "queued_at": datetime.now(UTC) - timedelta(hours=5),
+        "opened_at": datetime.now(UTC) - timedelta(hours=4),
+    }
+    fields.update(overrides)
+    consultation = Consultation(patient_id=patient.id, **fields)
+    db.add(consultation)
+    await db.flush()
+    return consultation
+
+
+async def _consultation_rows(client: AsyncClient, super_admin, **params):
+    resp = await client.get(
+        f"{PREFIX}/reports/consultations", headers=auth_headers(super_admin.id), params=params
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    return body["rows"], body["total"]
+
+
+async def test_consultas_columnas_empiezan_por_las_del_monitor(
+    client: AsyncClient, super_admin, db_session: AsyncSession
+) -> None:
+    """Las primeras columnas son, EN ORDEN, las del modal del dashboard. Es lo que hace que el
+    informe sea reconocible como "esa tabla"; si alguien reordena, esto avisa."""
+    resp = await client.get(
+        f"{PREFIX}/reports/consultations",
+        headers=auth_headers(super_admin.id),
+        params={"limit": 1},
+    )
+    assert resp.status_code == 200, resp.text
+    cabeceras = [c["header"] for c in resp.json()["columns"]]
+    assert cabeceras[:4] == ["Estado", "Médico asignado", "Paciente", "Tiempo en progreso"]
+    assert cabeceras[4] == "Horas en progreso"
+    assert cabeceras[5] == "Motivo de consulta"
+
+
+async def test_consulta_row_trae_paciente_medico_y_tiempo(
+    client: AsyncClient, super_admin, db_session: AsyncSession
+) -> None:
+    marker = uuid.uuid4().hex[:10]
+    doctor_profile = make_profile(role="doctor")
+    doctor_profile.full_name = f"Dra {marker}"
+    db_session.add(doctor_profile)
+    await db_session.flush()
+    patient = await _seed_patient(db_session, marker)
+    await _seed_consultation(
+        db_session,
+        marker,
+        patient=patient,
+        assigned_doctor_id=doctor_profile.id,
+        opened_at=datetime.now(UTC) - timedelta(hours=4),
+    )
+
+    rows, total = await _consultation_rows(client, super_admin, search=marker)
+    assert total == 1
+    row = rows[0]
+    assert row["status"] == "Abierta"
+    assert row["doctor"] == f"Dra {marker}"
+    assert row["patient"] == f"Paciente {marker}"
+    assert row["elapsed"] == "4 horas"  # mismo texto que pinta el modal
+    assert row["elapsed_hours"] == pytest.approx(4.0, abs=0.2)
+    assert row["chief_complaint"] == f"Motivo {marker}"
+    assert row["patient_phone"] == "+584121111111"
+
+
+async def test_consulta_sin_medico_dice_sin_asignar(
+    client: AsyncClient, super_admin, db_session: AsyncSession
+) -> None:
+    """Mismo texto que la pantalla: quien compare el Excel con el panel no deberia tener que
+    traducir un hueco."""
+    marker = uuid.uuid4().hex[:10]
+    patient = await _seed_patient(db_session, marker)
+    await _seed_consultation(db_session, marker, patient=patient, assigned_doctor_id=None)
+    rows, _ = await _consultation_rows(client, super_admin, search=marker)
+    assert rows[0]["doctor"] == "— sin asignar —"
+
+
+async def test_filtro_de_estados_acota_al_set_del_monitor(
+    client: AsyncClient, super_admin, db_session: AsyncSession
+) -> None:
+    """El set del monitor incluye canceladas y no-show, y deja fuera las que esperan y las
+    cerradas. Sin esto, el informe "en progreso" traeria la cola entera."""
+    marker = uuid.uuid4().hex[:10]
+    patient = await _seed_patient(db_session, marker)
+    await _seed_consultation(db_session, f"{marker}A", patient=patient, status="in_progress")
+    await _seed_consultation(db_session, f"{marker}B", patient=patient, status="cancelled")
+    await _seed_consultation(db_session, f"{marker}C", patient=patient, status="waiting")
+    await _seed_consultation(db_session, f"{marker}D", patient=patient, status="closed")
+
+    _, total = await _consultation_rows(
+        client, super_admin, search=marker, status=list(reports_service.IN_PROGRESS_STATUSES)
+    )
+    assert total == 2  # in_progress + cancelled; fuera waiting y closed
+
+    _, todos = await _consultation_rows(client, super_admin, search=marker)
+    assert todos == 4  # sin filtro de estado entran los cuatro
+
+
+async def test_estado_inventado_da_422_y_no_un_vacio_silencioso(
+    client: AsyncClient, super_admin, db_session: AsyncSession
+) -> None:
+    """Un estado mal escrito devolveria cero filas, y quien lo pidio leeria ese vacio como "no
+    hay casos" en vez de como "escribiste mal el filtro"."""
+    resp = await client.get(
+        f"{PREFIX}/reports/consultations",
+        headers=auth_headers(super_admin.id),
+        params={"status": ["in_progress", "en_progreso"]},
+    )
+    assert resp.status_code == 422, resp.text
+    assert "en_progreso" in resp.json()["detail"]
+
+
+async def test_filtro_por_medico_y_por_sin_asignar(
+    client: AsyncClient, super_admin, db_session: AsyncSession
+) -> None:
+    marker = uuid.uuid4().hex[:10]
+    doctor_profile = make_profile(role="doctor")
+    db_session.add(doctor_profile)
+    await db_session.flush()
+    patient = await _seed_patient(db_session, marker)
+    await _seed_consultation(
+        db_session, f"{marker}A", patient=patient, assigned_doctor_id=doctor_profile.id
+    )
+    await _seed_consultation(db_session, f"{marker}B", patient=patient, assigned_doctor_id=None)
+
+    _, asignadas = await _consultation_rows(
+        client, super_admin, search=marker, assigned_doctor_id=str(doctor_profile.id)
+    )
+    assert asignadas == 1
+    _, huerfanas = await _consultation_rows(client, super_admin, search=marker, unassigned="true")
+    assert huerfanas == 1
+
+
+async def test_tiempo_de_una_consulta_cerrada_se_mide_hasta_el_cierre(
+    client: AsyncClient, super_admin, db_session: AsyncSession
+) -> None:
+    """Medir siempre contra "ahora" daria, para un caso cerrado hace meses, un tiempo enorme que
+    no significa nada. Para las del monitor (que no han cerrado) el resultado no cambia."""
+    marker = uuid.uuid4().hex[:10]
+    patient = await _seed_patient(db_session, marker)
+    ahora = datetime.now(UTC)
+    await _seed_consultation(
+        db_session,
+        marker,
+        patient=patient,
+        status="closed",
+        opened_at=ahora - timedelta(days=30),
+        closed_at=ahora - timedelta(days=30) + timedelta(hours=2),
+    )
+    rows, _ = await _consultation_rows(client, super_admin, search=marker)
+    assert rows[0]["elapsed"] == "2 horas"
+    assert rows[0]["elapsed_hours"] == pytest.approx(2.0, abs=0.1)
+
+
+async def test_export_de_consultas_es_un_xlsx_con_los_datos(
+    client: AsyncClient, super_admin, db_session: AsyncSession
+) -> None:
+    marker = uuid.uuid4().hex[:10]
+    patient = await _seed_patient(db_session, marker)
+    await _seed_consultation(db_session, marker, patient=patient)
+
+    resp = await client.get(
+        f"{PREFIX}/reports/consultations/export",
+        headers=auth_headers(super_admin.id),
+        params={"search": marker},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"] == XLSX_MEDIA_TYPE
+    assert "consultas-" in resp.headers["content-disposition"]
+
+    cadenas = _shared_strings(resp.content)
+    assert f"Paciente {marker}" in cadenas
+    assert f"Motivo {marker}" in cadenas
+    assert "Tiempo en progreso" in cadenas
+
+
+async def test_export_de_consultas_trae_lo_mismo_que_la_vista_previa(
+    client: AsyncClient, super_admin, db_session: AsyncSession
+) -> None:
+    """La promesa del feature: exportas lo que estas viendo."""
+    marker = uuid.uuid4().hex[:10]
+    patient = await _seed_patient(db_session, marker)
+    for i in range(3):
+        await _seed_consultation(db_session, f"{marker}{i}", patient=patient)
+
+    _, total = await _consultation_rows(client, super_admin, search=marker)
+    assert total == 3
+
+    resp = await client.get(
+        f"{PREFIX}/reports/consultations/export",
+        headers=auth_headers(super_admin.id),
+        params={"search": marker},
+    )
+    filas = _sheet_rows(resp.content).count("<row ")
+    assert filas == total + 1  # + la cabecera
+
+
+async def test_export_de_consultas_queda_en_audit_log(
+    client: AsyncClient, super_admin, db_session: AsyncSession
+) -> None:
+    marker = uuid.uuid4().hex[:10]
+    patient = await _seed_patient(db_session, marker)
+    await _seed_consultation(db_session, marker, patient=patient)
+
+    resp = await client.get(
+        f"{PREFIX}/reports/consultations/export",
+        headers=auth_headers(super_admin.id),
+        params={"search": marker},
+    )
+    assert resp.status_code == 200, resp.text
+    entrada = (
+        await db_session.execute(
+            select(AuditLog)
+            .where(AuditLog.action == "report.exported", AuditLog.resource_id == "consultations")
+            .order_by(AuditLog.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one()
+    assert entrada.actor_user_id == super_admin.id
+    # El filtro si; las filas NO: el audit no debe contener la PII que audita.
+    assert marker in str(entrada.metadata_["filters"])
+    assert "Motivo" not in str(entrada.metadata_)
+
+
+def test_etiqueta_de_tiempo_replica_la_del_frontend() -> None:
+    """Mismo formato que `lib/utils.ts::tiempoTranscurrido`: minutos, horas, y dias + horas."""
+    etiqueta = reports_service._elapsed_label
+    assert etiqueta(timedelta(minutes=4)) == "4 min"
+    assert etiqueta(timedelta(hours=1)) == "1 hora"
+    assert etiqueta(timedelta(hours=7)) == "7 horas"
+    assert etiqueta(timedelta(days=1)) == "1 día"
+    assert etiqueta(timedelta(days=2)) == "2 días"
+    assert etiqueta(timedelta(days=2, hours=3)) == "2 días 3 horas"
+    assert etiqueta(None) == ""
+
+
 def test_day_bounds_cubre_el_dia_completo_en_hora_local() -> None:
     """Un día venezolano va de 04:00 UTC a 04:00 UTC del siguiente. Si estos límites se
     calcularan en UTC, el filtro perdería las primeras/últimas 4 horas de cada día."""

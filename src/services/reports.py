@@ -26,7 +26,7 @@ en `audit_log`.
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from io import BytesIO
 
 import xlsxwriter
@@ -62,6 +62,20 @@ STATUS_LABELS = {
 }
 
 DOCTOR_STATUS_LABELS = {0: "De baja", 1: "Activo", 2: "Expulsado"}
+
+# El set amplio "en progreso" del monitor del dashboard: un médico ya tomó el caso y todavía no
+# hay un cierre formal. Incluye los desenlaces derivados (derivada, presencial urgente) y los
+# negativos (no-show, cancelada), porque para operación todos son "esto salió de la cola y hay
+# que saber en qué quedó". Misma definición que `IN_PROGRESS_STATUSES` del frontend; vive aquí
+# para que el Excel y el modal no puedan enseñar poblaciones distintas.
+IN_PROGRESS_STATUSES = (
+    "in_progress",
+    "referred_to_specialist",
+    "urgent_in_person",
+    "patient_no_show",
+    "cancelled",
+    "contacted_whatsapp",
+)
 
 BLOCKED_REASON_LABELS = {
     "sin_ficha": "Sin ficha de médico",
@@ -157,6 +171,36 @@ PATIENT_COLUMNS: tuple[Column, ...] = (
 )
 
 
+# Las CINCO primeras columnas son, en orden, las del modal "Consultas en progreso" del
+# dashboard. Es deliberado: el informe tiene que ser reconocible como "esa tabla" para quien lo
+# pidió. Lo que viene después es lo que una tabla en pantalla no necesita y una hoja de cálculo
+# sí — el código para cruzar con otros informes, las fechas para ordenar, y el contacto para
+# actuar sin volver al panel.
+CONSULTATION_COLUMNS: tuple[Column, ...] = (
+    Column("status", "Estado", 22),
+    Column("doctor", "Médico asignado", 26),
+    Column("patient", "Paciente", 26),
+    Column("elapsed", "Tiempo en progreso", 18),
+    # El mismo dato como número. La etiqueta de arriba se lee, pero no se ordena ni se filtra:
+    # "4 horas" y "40 min" no se comparan como texto, y lo primero que hace cualquiera con este
+    # informe es buscar los casos que llevan más tiempo abiertos.
+    Column("elapsed_hours", "Horas en progreso", 16),
+    Column("chief_complaint", "Motivo de consulta", 60),
+    Column("code", "Código", 16),
+    Column("priority", "Prioridad", 12),
+    Column("specialty", "Especialidad solicitada", 24),
+    Column("patient_phone", "Teléfono del paciente", 20),
+    Column("patient_zone", "Zona", 20),
+    Column("queued_at", "Entró a la cola", 18, "datetime"),
+    Column("opened_at", "Abierta", 18, "datetime"),
+    Column("closed_at", "Cerrada", 18, "datetime"),
+    Column("contacted", "Contactado", 12),
+    Column("admin_follow_up", "Admin de seguimiento", 24),
+    Column("nota_admin", "Nota del admin", 40),
+    Column("consultation_id", "ID consulta", 38),
+)
+
+
 # --- Filtros ------------------------------------------------------------------
 
 
@@ -192,6 +236,23 @@ class PatientFilters:
     has_consultations: bool | None = None
     consent: bool | None = None
     include_archived: bool = False
+    created_from: date | None = None
+    created_to: date | None = None
+
+
+@dataclass(frozen=True)
+class ConsultationFilters:
+    """Filtros del reporte de consultas.
+
+    `statuses` vacío = todos los estados. El frontend manda el set del monitor por defecto, así
+    que el informe sale siendo exactamente esa tabla y desde ahí se puede ampliar.
+    """
+
+    statuses: tuple[str, ...] = ()
+    assigned_doctor_id: uuid.UUID | None = None
+    specialty_id: uuid.UUID | None = None
+    unassigned: bool | None = None
+    search: str | None = None
     created_from: date | None = None
     created_to: date | None = None
 
@@ -489,6 +550,161 @@ def _patient_row(r) -> dict:
     }
 
 
+# --- Consulta: consultas ------------------------------------------------------
+
+
+def _elapsed(since: datetime | None, until: datetime | None) -> timedelta | None:
+    """Cuánto lleva (o llevó) el caso desde que un médico lo tomó.
+
+    `until` es `closed_at` cuando la consulta ya cerró y "ahora" cuando sigue abierta. Medir
+    siempre contra ahora daría, para un caso cerrado hace un mes, un "30 días en progreso" que
+    no significa nada. Para las del monitor —que son justo las que no han cerrado— el resultado
+    es idéntico al que pinta la pantalla.
+    """
+    if since is None:
+        return None
+    base = since if since.tzinfo is not None else since.replace(tzinfo=UTC)
+    fin = until or datetime.now(UTC)
+    fin = fin if fin.tzinfo is not None else fin.replace(tzinfo=UTC)
+    return fin - base
+
+
+def _elapsed_label(delta: timedelta | None) -> str:
+    """El mismo texto que pinta el modal (`lib/utils.ts::tiempoTranscurrido`): minutos por
+    debajo de la hora, horas por debajo del día, y días + horas por encima. Se replica en vez de
+    inventar otro formato para que la columna del Excel diga lo mismo que la pantalla."""
+    if delta is None:
+        return ""
+    total_min = max(int(delta.total_seconds() // 60), 0)
+    if total_min < 60:
+        return f"{total_min} min"
+    total_horas = total_min // 60
+    if total_horas < 24:
+        return f"{total_horas} {'hora' if total_horas == 1 else 'horas'}"
+    dias, horas = divmod(total_horas, 24)
+    etiqueta = f"{dias} {'día' if dias == 1 else 'días'}"
+    if horas == 0:
+        return etiqueta
+    return f"{etiqueta} {horas} {'hora' if horas == 1 else 'horas'}"
+
+
+def consultations_query(filters: ConsultationFilters) -> Select:
+    """Consulta del reporte de consultas: el caso + paciente, médico y especialidad resueltos.
+
+    Una sola consulta con joins, no seis peticiones paginadas como hace el monitor del
+    dashboard (que pide una por estado porque `GET /consultations` solo acepta un `status` a la
+    vez, y se queda en 100 filas por estado). Aquí no hay tope por estado: el informe trae todo
+    lo que cumple el filtro, así que puede tener MÁS filas que el modal del que salió.
+    """
+    doctor = aliased(Profile)
+    admin = aliased(Profile)
+
+    stmt = (
+        select(
+            Consultation,
+            Patient.full_name.label("patient_name"),
+            Patient.phone_whatsapp.label("patient_phone"),
+            Patient.affected_zone.label("patient_zone"),
+            doctor.full_name.label("doctor_name"),
+            admin.full_name.label("admin_name"),
+            Specialty.name.label("specialty_name"),
+        )
+        .select_from(Consultation)
+        .outerjoin(Patient, Patient.id == Consultation.patient_id)
+        .outerjoin(doctor, doctor.id == Consultation.assigned_doctor_id)
+        .outerjoin(admin, admin.id == Consultation.admin_seguimiento)
+        .outerjoin(Specialty, Specialty.id == Consultation.specialty_id)
+    )
+
+    if filters.statuses:
+        stmt = stmt.where(Consultation.status.in_(filters.statuses))
+    if filters.assigned_doctor_id is not None:
+        stmt = stmt.where(Consultation.assigned_doctor_id == filters.assigned_doctor_id)
+    if filters.specialty_id is not None:
+        stmt = stmt.where(Consultation.specialty_id == filters.specialty_id)
+    if filters.unassigned is not None:
+        stmt = stmt.where(
+            Consultation.assigned_doctor_id.is_(None)
+            if filters.unassigned
+            else Consultation.assigned_doctor_id.is_not(None)
+        )
+    if filters.search and (term := filters.search.strip()):
+        like = f"%{term}%"
+        stmt = stmt.where(
+            or_(
+                Patient.full_name.ilike(like),
+                Consultation.code.ilike(like),
+                Consultation.chief_complaint.ilike(like),
+                doctor.full_name.ilike(like),
+            )
+        )
+    start, end = day_bounds(filters.created_from, filters.created_to)
+    if start is not None:
+        stmt = stmt.where(Consultation.created_at >= start)
+    if end is not None:
+        stmt = stmt.where(Consultation.created_at < end)
+    # Las más antiguas primero: en un listado de casos abiertos, el que más tiempo lleva es el
+    # que hay que mirar, y en un Excel la primera fila es la que se lee.
+    return stmt.order_by(Consultation.created_at.asc(), Consultation.id)
+
+
+def _consultation_row(r) -> dict:
+    """Una fila del reporte de consultas, ya presentada."""
+    c: Consultation = r[0]
+    desde = c.opened_at or c.started_at or c.queued_at
+    delta = _elapsed(desde, c.closed_at)
+    return {
+        "status": STATUS_LABELS.get(c.status, c.status),
+        # Mismo texto que la pantalla para el caso sin asignar: quien compare el Excel con el
+        # panel no debería tener que traducir un hueco.
+        "doctor": r.doctor_name or "— sin asignar —",
+        "patient": r.patient_name,
+        "elapsed": _elapsed_label(delta),
+        "elapsed_hours": round(delta.total_seconds() / 3600, 1) if delta else None,
+        "chief_complaint": c.chief_complaint,
+        "code": c.code,
+        "priority": c.priority,
+        "specialty": r.specialty_name,
+        "patient_phone": r.patient_phone,
+        "patient_zone": r.patient_zone,
+        "queued_at": to_local(c.queued_at),
+        "opened_at": to_local(c.opened_at or c.started_at),
+        "closed_at": to_local(c.closed_at),
+        "contacted": _si_no(c.contacted),
+        "admin_follow_up": r.admin_name,
+        "nota_admin": c.nota_admin,
+        "consultation_id": str(c.id),
+    }
+
+
+def describe_consultation_filters(
+    f: ConsultationFilters,
+    *,
+    specialty_name: str | None = None,
+    doctor_name: str | None = None,
+) -> list[tuple[str, str]]:
+    """Los filtros aplicados, legibles, para la portada del Excel."""
+    if not f.statuses:
+        estados = None
+    elif tuple(f.statuses) == IN_PROGRESS_STATUSES:
+        # El caso normal merece su nombre: "En progreso" dice de un vistazo de qué informe se
+        # trata, mientras que los seis estados enumerados obligan a reconstruirlo.
+        estados = "En progreso (derivadas, urgentes, no-show, canceladas y por WhatsApp)"
+    else:
+        estados = ", ".join(STATUS_LABELS.get(x, x) for x in f.statuses)
+    return _describe(
+        [
+            ("Estados", estados),
+            ("Médico asignado", doctor_name),
+            ("Sin médico asignado", _si_no(f.unassigned, unknown="")),
+            ("Especialidad", specialty_name),
+            ("Búsqueda (paciente/código/motivo/médico)", f.search),
+            ("Creadas desde", f.created_from),
+            ("Creadas hasta", f.created_to),
+        ]
+    )
+
+
 # --- Ejecución ----------------------------------------------------------------
 
 
@@ -577,6 +793,34 @@ async def patients_report(
         PATIENT_COLUMNS,
         _patient_row,
         describe_patient_filters(filters),
+        skip=skip,
+        limit=limit,
+    )
+
+
+async def consultations_report(
+    session: AsyncSession,
+    filters: ConsultationFilters,
+    *,
+    skip: int | None = None,
+    limit: int | None = None,
+) -> Report:
+    """Reporte de consultas. Sin `limit` devuelve la población completa (exportación)."""
+    doctor_name = None
+    if filters.assigned_doctor_id is not None:
+        doctor_name = await session.scalar(
+            select(Profile.full_name).where(Profile.id == filters.assigned_doctor_id)
+        )
+    return await _run(
+        session,
+        consultations_query(filters),
+        CONSULTATION_COLUMNS,
+        _consultation_row,
+        describe_consultation_filters(
+            filters,
+            specialty_name=await _catalog_name(session, Specialty, filters.specialty_id),
+            doctor_name=doctor_name,
+        ),
         skip=skip,
         limit=limit,
     )
@@ -727,4 +971,25 @@ async def export_patients(
     await _log_export(session, report_name="patients", actor_user_id=actor_user_id, report=report)
     return build_workbook(
         report, title="Reporte de pacientes", sheet_name="Pacientes", generated_by=actor_label
+    )
+
+
+async def export_consultations(
+    session: AsyncSession,
+    filters: ConsultationFilters,
+    *,
+    actor_user_id: uuid.UUID,
+    actor_label: str,
+) -> bytes:
+    """El `.xlsx` de consultas que cumplen el filtro (población completa) + su entrada de audit.
+
+    Incluye el motivo de consulta, que es contenido clínico escrito por el paciente. Misma
+    sensibilidad que el reporte de pacientes y el mismo gate."""
+    report = await consultations_report(session, filters, limit=MAX_EXPORT_ROWS + 1)
+    _guard_size(report.total)
+    await _log_export(
+        session, report_name="consultations", actor_user_id=actor_user_id, report=report
+    )
+    return build_workbook(
+        report, title="Reporte de consultas", sheet_name="Consultas", generated_by=actor_label
     )
