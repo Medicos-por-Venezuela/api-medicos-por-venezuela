@@ -178,3 +178,19 @@ async def test_sandbox_gana_sobre_bulk(monkeypatch: pytest.MonkeyPatch) -> None:
     cliente = mail_service._bulk_client()
     assert cliente.sandbox is True
     assert cliente.bulk is False
+
+
+def test_esc_deja_inerte_lo_que_tecleo_una_persona() -> None:
+    """SEGURIDAD. `esc` es lo único que separa un dato de formulario de un enlace vivo dentro
+    de un correo que la plataforma sí envía. Se prueba aquí, en el módulo donde vive, además de
+    en cada cuerpo que lo usa (`test_notifications.py`)."""
+    assert mail_service.esc('<a href="http://malo/">Aprobar</a>') == (
+        "&lt;a href=&quot;http://malo/&quot;&gt;Aprobar&lt;/a&gt;"
+    )
+    # `quote=True` no es opcional: sin él, un dato interpolado dentro de un atributo
+    # (`<a href="...">`, `title="..."`) puede cerrarlo y añadir atributos propios.
+    assert '"' not in mail_service.esc('x" onmouseover="alert(1)')
+    # Acepta cualquier cosa, no solo str: los campos opcionales llegan como None o como número
+    # y lo que no puede pasar es que revienten la composición del correo.
+    assert mail_service.esc(None) == "None"
+    assert mail_service.esc(7) == "7"
