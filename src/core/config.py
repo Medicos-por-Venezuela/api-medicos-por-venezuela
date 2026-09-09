@@ -136,12 +136,12 @@ class Settings(BaseSettings):
     # por defecto: si quedara vacía, el correo le pediría al médico que mandara su título a una
     # dirección no-reply, o sea a la basura.
     CONTACT_EMAIL: str = "info@medicosporvenezuela.org"
-    # Dirección PÚBLICA de contacto de la organización, la que se le da a un médico para que
-    # mande sus documentos. Es otra cosa que MAIL_INTERNAL_RECIPIENTS —esa es "a quién avisamos"
-    # e incluye buzones personales; esta es "a dónde escribe la gente"— y por eso sí trae un
-    # valor por defecto: si quedara vacía, el correo le pediría al médico que mandara su título
-    # a una dirección no-reply, o sea a la basura.
-    CONTACT_EMAIL: str = "info@medicosporvenezuela.org"
+    # Logotipo del banner de todos los correos (ver services/mail_layout.py). PNG y no el SVG
+    # del sitio: Gmail, Outlook y Yahoo descartan un <img> que apunte a un SVG. Absoluta y
+    # apuntando a PRODUCCIÓN por defecto, en vez de derivarse de FRONTEND_URL: en local esa
+    # base es localhost, y un correo enviado desde una máquina de desarrollo —que con token de
+    # Mailtrap sale de verdad— llegaría con el logotipo roto.
+    MAIL_LOGO_URL: str = "https://medicosporvenezuela.org/brand/logo-white-email.png"
 
     # --- CORS ---
     BACKEND_CORS_ORIGINS: str = "*"

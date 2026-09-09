@@ -345,6 +345,12 @@ class PanelConsultationItem(BaseModel):
     opened_at: datetime | None = None
     closed_at: datetime | None = None
     patient_last_seen_at: datetime | None = None
+    # Cuándo pulsó el paciente para entrar a la videollamada. Es la ÚNICA señal duradera de que
+    # llegó: la presencia por Realtime dice si tiene abierta una pestaña NUESTRA, y justo al
+    # entrar a Jitsi esa pestaña pasa a segundo plano (en móvil el navegador la suspende y se
+    # cae el WebSocket), así que el médico veía "sin conexión" precisamente cuando el paciente
+    # acababa de entrar. Esto se persiste una sola vez y sobrevive a que se muera la pestaña.
+    entered_call_at: datetime | None = None
     created_at: datetime
     patient: PanelPatient | None = None
 

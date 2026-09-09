@@ -35,7 +35,6 @@ negativa; si añades un campo al correo A, ese test debe seguir pasando.
 
 import logging
 from datetime import datetime
-from functools import wraps
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,34 +47,9 @@ from src.models.patient import Patient
 from src.models.professional_type import ProfessionalType
 from src.models.profile import Profile
 from src.models.specialty import Specialty
-from src.services.mail import esc, send_mail
+from src.services.mail import best_effort, esc, send_mail
 
 logger = logging.getLogger("mpv.api")
-
-
-def _best_effort(fn):
-    """Blinda una función que se encola como BackgroundTask: nunca propaga.
-
-    `mail.send_mail` ya se traga sus propios fallos, así que esto no está para cubrirlo a él,
-    sino al borde entero: si la composición del cuerpo revienta (un dato inesperado, un campo
-    nuevo mal usado), la excepción ocurriría DESPUÉS de responder al cliente, en la fase de
-    background del request — y se llevaría por delante el alta que este correo solo venía a
-    anunciar. La promesa del spec es "un correo caído nunca rompe un registro", y esa promesa
-    solo es verdad si se cumple también cuando el que falla es este módulo.
-
-    Se traga y LOGUEA (sin PII: solo el nombre de la función y el tipo de error). Un correo
-    que no sale y nadie registra es un fallo invisible, que es peor que uno ruidoso.
-    """
-
-    @wraps(fn)
-    async def _wrapped(*args, **kwargs) -> bool:
-        try:
-            return await fn(*args, **kwargs)
-        except Exception as exc:  # noqa: BLE001 — best-effort a propósito, ver docstring
-            logger.warning("MAIL:crash fn=%s reason=%s", fn.__name__, type(exc).__name__)
-            return False
-
-    return _wrapped
 
 
 # Documentos que el médico no verificado debe enviar de vuelta. Lista única: la usan el texto y
@@ -212,7 +186,7 @@ async def new_patient_mail_args(session: AsyncSession, consultation: Consultatio
     }
 
 
-@_best_effort
+@best_effort
 async def send_new_patient_alert(**kwargs) -> bool:
     """Envía el aviso A a los buzones de operación. Best-effort."""
     subject, text, html = _build_new_patient(**kwargs)
@@ -296,7 +270,7 @@ async def doctor_registered_mail_args(session: AsyncSession, doctor: Doctor) -> 
     }
 
 
-@_best_effort
+@best_effort
 async def send_doctor_registered_alert(reason: str | None = None, **kwargs) -> bool:
     """Envía el aviso B/C a los buzones de operación. Best-effort."""
     subject, text, html = _build_doctor_registered(reason=reason, **kwargs)
@@ -355,7 +329,7 @@ def _build_doctor_rejected(
     return subject, text, html
 
 
-@_best_effort
+@best_effort
 async def send_doctor_rejected_email(
     to_email: str, full_name: str, cedula: str | None, reason: str | None
 ) -> bool:
@@ -420,7 +394,7 @@ async def doctor_approved_mail_args(session: AsyncSession, doctor: Doctor) -> di
     return {"to_email": to_email, "full_name": doctor.full_name}
 
 
-@_best_effort
+@best_effort
 async def send_doctor_approved_email(to_email: str, full_name: str) -> bool:
     """Envía el correo E al médico. Best-effort."""
     subject, text, html = _build_doctor_approved(full_name)

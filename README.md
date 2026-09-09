@@ -379,6 +379,7 @@ uv run uvicorn src.main:app --reload      # http://localhost:8000
 | `MAILTRAP_API_TOKEN`   | (vacío = no envía)| token de Mailtrap (Sending → API Tokens)   |
 | `MAIL_INTERNAL_RECIPIENTS` | (vacío)      | **buzones de operación, separados por comas** |
 | `CONTACT_EMAIL`        | `info@medicosporvenezuela.org` | dirección pública de contacto |
+| `MAIL_LOGO_URL`        | `…/brand/logo-white-email.png` | logotipo del banner de los correos |
 
 - **Local:** `.env` (copiado de `.env.example`).
 - **Producción:** `.env.supabase` (ignorado por git) o el gestor de secretos del hosting.
@@ -412,6 +413,58 @@ que mande su título, su licencia del SACS y su carta de artículo 8. `MAIL_INTE
 es "a quién avisamos" (incluye buzones personales); `CONTACT_EMAIL` es "a dónde escribe la
 gente". Por eso sí trae valor por defecto: si quedara vacía, el correo mandaría al médico a
 `no-reply@`, o sea a la basura.
+
+### La marca de los correos (`services/mail_layout.py`)
+
+Todo correo sale dentro del mismo documento: banner navy (`#18202b`) con el logotipo blanco
+arriba, el contenido sobre blanco, y el pie con la letra pequeña.
+
+La maquetación se aplica en **`mail.send_mail`**, no en cada constructor de cuerpo. Los cuerpos
+viven repartidos entre tres módulos y tres de ellos se mandaban solo en texto plano: envolver en
+cada uno sería una regla que hay que recordar cada vez, y el correo número doce saldría sin
+marca sin que nadie se entere. En el envío no hay camino para mandar uno sin ella (a los de solo
+texto se les fabrica el HTML desde su propio texto).
+
+⚠️ **El logotipo es un PNG y vive en el frontend.** Gmail, Outlook y Yahoo descartan un `<img>`
+que apunte a un SVG: la cabecera saldría con el icono de imagen rota. Lo genera
+`node scripts/build-logo-raster.mjs` en el repo del frontend, desde el mismo `logo-white.svg`, y
+se sirve desde el sitio — **tiene que estar desplegado** o el banner llega vacío (navy con el
+texto alternativo, no roto, pero vacío). `MAIL_LOGO_URL` apunta a producción incluso en local, a
+propósito: con `FRONTEND_URL=localhost` el logotipo llegaría roto a quien reciba un correo
+enviado desde una máquina de desarrollo.
+
+Los correos de **Supabase Auth** (confirmar cuenta, recuperar contraseña) no pasan por aquí: sus
+plantillas se editan en el panel de Supabase y hay que darles el mismo banner a mano.
+
+### ¿Entró el paciente a la videollamada? (`entered_call_at`)
+
+El médico necesita saber si el paciente llegó, y la presencia por Realtime **no sirve para eso**:
+dice si tiene abierta una pestaña del sitio, y al abrir Jitsi esa pestaña pasa a segundo plano —en
+móvil el navegador la suspende y se cae el WebSocket—, así que el panel decía "sin conexión"
+justo en el momento en que el paciente acababa de entrar.
+
+La señal duradera es `consultations.entered_call_at`, que fija
+`POST /consultations/{id}/entered-call` una sola vez. Se expone en el panel
+(`PanelConsultationItem`) y el frontend lo pinta como "Entró a la videollamada · hace X".
+
+Los **tres** caminos por los que un paciente entra a su sala lo marcan:
+
+| Desde | Credencial |
+| --- | --- |
+| `/sala-espera` (tras registrarse) | token de sala de la URL |
+| `/mi-caso` (vuelve con su cuenta) | **su sesión** — ver abajo |
+| `/entrar-videoconsulta` (enlace del correo) | token fresco emitido con el correo |
+
+`require_consultation_token` acepta desde ahora **la sesión del paciente dueño** además del token
+y de una sesión de staff. El token se entrega una sola vez, en la URL de la sala de espera, y
+caduca a las 24 h: quien cerró aquella pestaña tiene sesión pero no token. La pertenencia se
+comprueba contra `Patient.user_id` (misma regla anti-IDOR de las lecturas), y la sesión no es una
+credencial más débil que el token — es más fuerte, porque no viaja por la URL.
+
+El enlace del correo pasa por `/entrar-videoconsulta` (una página del frontend) y **no** por Jitsi
+directamente: es lo que registra la entrada. Ese registro lo hace JavaScript a propósito y no un
+redirect del backend, porque los escáneres de correo corporativos siguen los enlaces de un mensaje
+para analizarlos — un `GET` que marcara la entrada daría "el paciente entró" por culpa de un robot.
 
 ## Autenticación y autorización (RBAC granular)
 
