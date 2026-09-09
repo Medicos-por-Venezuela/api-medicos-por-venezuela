@@ -5,8 +5,11 @@ prueban sin sesión y sin IO. Lo que se fija aquí es la frontera de SEGURIDAD: 
 teclea una persona puede salir como marcado vivo en el HTML.
 """
 
+import uuid
 from datetime import UTC, datetime
 
+from src.core import consultation_token
+from src.core.config import settings
 from src.services import notifications
 
 # Un enlace completo, no un `<script>`: los clientes de correo no ejecutan JS, pero sí pintan
@@ -85,13 +88,10 @@ def test_sin_nombre_de_especialista_cae_a_la_especialidad() -> None:
 
 # --- "Tu médico ya está en la sala" (el correo que dispara el claim por video) ---
 
-# Con los dos parámetros del fragmento, es decir CON `&`: es lo que devuelve
-# `jitsi.browser_room_url`, y un `&` sin escapar dentro de un `href` es exactamente la clase de
-# detalle que rompe un enlace en la mitad de los clientes sin que ningún test lo note.
-SALA = (
-    "https://meet.medicosporvenezuela.org/vamed-abc"
-    "#config.disableDeepLinking=true&config.deeplinking.disabled=true"
-)
+# El enlace del correo NO va a Jitsi: va a `/entrar-videoconsulta`, que registra la entrada y
+# redirige. Lleva dos parámetros, es decir un `&`, que dentro de un `href` tiene que salir como
+# `&amp;` — el detalle exacto que rompe un enlace en la mitad de los clientes sin que nada chille.
+ENTRAR = "https://medicosporvenezuela.org/entrar-videoconsulta?c=abc&t=jwt.de.prueba"
 
 
 def test_el_aviso_de_videoconsulta_lleva_el_enlace_como_boton_y_en_claro() -> None:
@@ -100,11 +100,11 @@ def test_el_aviso_de_videoconsulta_lleva_el_enlace_como_boton_y_en_claro() -> No
     el botón, y quedarse sin forma de llegar sería el mismo problema que esto viene a resolver.
     """
     subject, text, html = notifications.video_ready_email(
-        "María Pérez", "Dr. Rivas", SALA, "CONS-2026-1"
+        "María Pérez", "Dr. Rivas", ENTRAR, "CONS-2026-1"
     )
     assert "esperando" in subject.lower()
-    assert SALA in text
-    assert html.count(f'href="{notifications.esc(SALA)}"') == 2
+    assert ENTRAR in text
+    assert html.count(f'href="{notifications.esc(ENTRAR)}"') == 2
     assert "Entrar a la videoconsulta" in html
     assert "CONS-2026-1" in text and "CONS-2026-1" in html
 
@@ -112,28 +112,46 @@ def test_el_aviso_de_videoconsulta_lleva_el_enlace_como_boton_y_en_claro() -> No
 def test_el_aviso_de_videoconsulta_escapa_los_nombres() -> None:
     """SEGURIDAD. `patient_name` sale del formulario PÚBLICO de la cola y `doctor_name` del
     perfil que el propio médico edita: los mismos dos vectores del correo de cita."""
-    _, text, html = notifications.video_ready_email(VENENO, "Dr. Rivas", SALA, "CONS-2026-1")
+    _, text, html = notifications.video_ready_email(VENENO, "Dr. Rivas", ENTRAR, "CONS-2026-1")
     _sin_enlace_vivo(html)
     assert VENENO in text
 
-    _, _, html_medico = notifications.video_ready_email("María", VENENO, SALA, "CONS-2026-1")
+    _, _, html_medico = notifications.video_ready_email("María", VENENO, ENTRAR, "CONS-2026-1")
     _sin_enlace_vivo(html_medico)
 
 
 def test_el_aviso_de_videoconsulta_sin_nombres_no_dice_none() -> None:
     """El nombre del paciente y el del médico son opcionales en la base. Un correo que
     saludara "Hola None" es peor que uno impersonal."""
-    _, text, html = notifications.video_ready_email(None, None, SALA, None)
+    _, text, html = notifications.video_ready_email(None, None, ENTRAR, None)
     assert "None" not in html
     assert "None" not in text
     assert "Tu médico" in text
 
 
-def test_el_enlace_de_la_sala_va_escapado_dentro_del_href() -> None:
-    """El `&` que separa los dos parámetros del fragmento tiene que salir como `&amp;`. Sin
-    eso el enlace queda mal formado y hay clientes que lo cortan justo ahí — con el resultado
-    de que el paciente aterriza en la sala sin la config que se salta el interstitial de la
-    app, que es el paso donde se pierde a la gente en móvil."""
-    _, _, html = notifications.video_ready_email("María", "Dr. Rivas", SALA, "CONS-2026-1")
-    assert "&amp;config.deeplinking.disabled=true" in html
-    assert "true&config" not in html  # el crudo no puede haberse colado
+def test_el_enlace_de_entrada_va_escapado_dentro_del_href() -> None:
+    """El `&` que separa `c` de `t` tiene que salir como `&amp;`. Sin eso el enlace queda mal
+    formado y hay clientes que lo cortan justo ahí: el paciente aterrizaría en la página de
+    entrada sin token, es decir en un 401, con su médico esperando dentro de la sala."""
+    _, _, html = notifications.video_ready_email("María", "Dr. Rivas", ENTRAR, "CONS-2026-1")
+    assert "&amp;t=jwt.de.prueba" in html
+    assert "abc&t=" not in html  # el crudo no puede haberse colado
+
+
+def test_el_enlace_de_entrada_pasa_por_el_sitio_y_no_por_jitsi() -> None:
+    """El salto por `/entrar-videoconsulta` es lo único que hace que la plataforma se entere de
+    que el paciente entró. Con un enlace directo a Jitsi el paciente entra igual, pero el médico
+    —que está dentro esperando— sigue sin saber si viene: es el reporte que originó esto.
+
+    El token se emite FRESCO aquí y no se reutiliza el del registro: ese caduca a las 24 h y
+    este correo puede salir mucho después."""
+    consultation_id = uuid.uuid4()
+    url = notifications.build_join_url(consultation_id)
+
+    assert url.startswith(f"{settings.FRONTEND_URL}/entrar-videoconsulta?")
+    assert settings.JITSI_DOMAIN not in url
+    assert f"c={consultation_id}" in url
+    token = url.split("t=")[1]
+    assert consultation_token.is_valid_for(token, consultation_id)
+    # Y solo para ESA consulta: un token válido de la propia sala no puede abrir la de otro.
+    assert not consultation_token.is_valid_for(token, uuid.uuid4())

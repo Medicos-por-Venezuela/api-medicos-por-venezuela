@@ -432,10 +432,10 @@ async def test_claim_por_video_le_manda_al_paciente_el_enlace_de_la_sala(
     aviso = enviados[0]
     assert aviso["to_email"] == "paciente@example.com"
     assert aviso["doctor_name"]  # quién le espera, no un correo anónimo
-    # La URL sale ya preparada para el navegador: a un enlace de correo no lo toca nadie antes
-    # de abrirlo, así que la config que salta el interstitial móvil tiene que ir escrita.
-    assert "vamed-e2e" in aviso["room_url"]
-    assert "config.disableDeepLinking=true" in aviso["room_url"]
+    # El enlace pasa por el SITIO y no por Jitsi: ese salto es lo que registra la entrada del
+    # paciente, y sin él el médico —que ya está dentro de la sala— sigue sin saber si viene.
+    assert "/entrar-videoconsulta?" in aviso["join_url"]
+    assert str(consultation.id) in aviso["join_url"]
 
 
 async def test_claim_por_whatsapp_no_manda_el_aviso_de_video(
@@ -943,3 +943,35 @@ async def test_list_consultations_filters_by_contacted_whatsapp_status(
     listed = await client.get(f"{PREFIX}/consultations", params={"status": "contacted_whatsapp"})
     assert listed.status_code == 200, listed.text
     assert any(c["id"] == str(consultation.id) for c in listed.json())
+
+
+async def test_el_panel_dice_si_el_paciente_entro_a_la_videollamada(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """`entered_call_at` tiene que llegar al panel: es la ÚNICA señal duradera de que el paciente
+    llegó a la sala.
+
+    La presencia por Realtime no sirve para esto y por eso hace falta el campo: dice si el
+    paciente tiene abierta una pestaña NUESTRA, y al entrar a Jitsi esa pestaña pasa a segundo
+    plano —en móvil el navegador la suspende y se cae el WebSocket—, así que el médico veía
+    "sin conexión" justo en el momento en que el paciente acababa de entrar.
+    """
+    consultation = await _waiting_con_correo_y_sala(client, db_session)
+    doc = await add_doctor(db_session)
+    suyo = auth_headers(doc.id)
+
+    await client.post(f"{PREFIX}/consultations/{consultation.id}/claim", json={}, headers=suyo)
+
+    def fila(panel: dict) -> dict:
+        return next(c for c in panel["mine"] if c["id"] == str(consultation.id))
+
+    antes = (await client.get(f"{PREFIX}/consultations/panel", headers=suyo)).json()
+    assert fila(antes)["entered_call_at"] is None  # todavía no ha entrado
+
+    entrada = await client.post(
+        f"{PREFIX}/consultations/{consultation.id}/entered-call", headers=suyo
+    )
+    assert entrada.status_code == 200, entrada.text
+
+    despues = (await client.get(f"{PREFIX}/consultations/panel", headers=suyo)).json()
+    assert fila(despues)["entered_call_at"] is not None

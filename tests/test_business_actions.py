@@ -335,8 +335,11 @@ async def test_staff_abre_la_sala_sin_token_de_paciente(
 async def test_sesion_de_paciente_no_abre_la_sala_de_otro(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """La puerta de staff es SOLO para staff: una cuenta de paciente autenticada no sustituye al
-    token, o el atajo se convertiria en el agujero que M3 venía a cerrar."""
+    """Estar autenticado como paciente no basta: hay que ser el paciente DE ESA consulta.
+
+    Es el reverso de `test_el_paciente_dueno_entra_con_su_sesion`. Sin la comprobación de
+    pertenencia, "acepta sesiones de paciente" sería el agujero que M3 venía a cerrar: cualquiera
+    se registra como paciente y abre la sala de cualquier otro."""
     patient_user = await _doctor(db_session, None, role="patient")
     cid, _ = await _consultation_and_room_headers(client, ["Medicina general"])
 
@@ -344,6 +347,44 @@ async def test_sesion_de_paciente_no_abre_la_sala_de_otro(
         f"{PREFIX}/consultations/{cid}/video-room", headers=auth_headers(patient_user.id)
     )
     assert resp.status_code == 401, resp.text
+
+
+async def test_el_paciente_dueno_entra_con_su_sesion(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El paciente con cuenta que vuelve por `/mi-caso` NO tiene el token de sala: se entregó una
+    sola vez, en la URL de la sala de espera, y caduca a las 24 h. Su sesión vale como credencial
+    para SU propia consulta — y es una credencial más fuerte, porque no viaja por la URL.
+
+    Sin esto, quien cerró aquella pestaña no podía ni entrar a su videoconsulta ni dejar
+    constancia de que había entrado, que es justo lo que el médico necesita ver."""
+    patient_user = await _doctor(db_session, None, role="patient")
+    pid = (
+        await client.post(
+            f"{PREFIX}/patients",
+            json={
+                "full_name": "Paciente Con Cuenta",
+                "phone_whatsapp": "+58412800077",
+                "affected_zone": "Caracas",
+                "consent": True,
+                "user_id": str(patient_user.id),
+            },
+        )
+    ).json()["id"]
+    cid = (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": pid, "specialty_id": await any_specialty_id(client)},
+        )
+    ).json()["id"]
+    suya = auth_headers(patient_user.id)
+
+    sala = await client.post(f"{PREFIX}/consultations/{cid}/video-room", headers=suya)
+    assert sala.status_code == 200, sala.text
+
+    entrada = await client.post(f"{PREFIX}/consultations/{cid}/entered-call", headers=suya)
+    assert entrada.status_code == 200, entrada.text
+    assert entrada.json()["entered_call_at"] is not None
 
 
 async def test_cutover_flag_deja_pasar_sin_token(client: AsyncClient, monkeypatch) -> None:

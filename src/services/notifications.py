@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core import consultation_token
 from src.core.config import settings
 from src.core.errors import NotFoundError
 from src.core.tz import VET
@@ -22,7 +23,6 @@ from src.models.consultation import Consultation
 from src.models.patient import Patient
 from src.models.profile import Profile
 from src.services import mail_layout
-from src.services.jitsi import browser_room_url
 from src.services.mail import best_effort, esc, send_mail
 
 logger = logging.getLogger("mpv.api")
@@ -166,19 +166,23 @@ _CONSEJOS_SALA = (
 
 
 def video_ready_email(
-    patient_name: str | None, doctor_name: str | None, room_url: str, code: str | None
+    patient_name: str | None, doctor_name: str | None, join_url: str, code: str | None
 ) -> tuple[str, str, str]:
     """(subject, text, html) del aviso de que el médico ya está en la sala.
 
-    El botón lleva DIRECTO a la sala de Jitsi y no a `/sala-espera`. La página intermedia da
-    instrucciones y marca la entrada del paciente, pero cuesta un clic más y un modal, y este
-    correo se lee con un médico esperando en vivo al otro lado: cada paso de más es gente que
-    no llega. Las instrucciones que hacían falta viajan en el propio cuerpo, y la métrica que
-    se pierde (`entered_call_at`) solo cuenta consultas en espera — para cuando esto sale, la
-    consulta ya está en `in_progress` y no entraba en ese conteo de todas formas.
+    El botón NO apunta a Jitsi directamente, sino a `/entrar-videoconsulta` (ver `join_url`),
+    que registra la entrada y redirige sola. Un enlace directo ahorraría ese salto, pero
+    entonces el paciente entraría a la sala sin que la plataforma se enterara — y el médico,
+    que está esperando dentro, seguiría viendo "sin conexión" sin saber si viene o no. El salto
+    es invisible: la página redirige sin pedir nada.
 
-    `room_url` ya viene pasada por `jitsi.browser_room_url` (el caller la prepara), porque a un
-    enlace de correo nadie le aplica nada al abrirlo: lo que va escrito es lo que se abre.
+    Ese registro pasa por JavaScript a propósito, y no por un redirect del backend: los
+    escáneres de correo corporativos SIGUEN los enlaces de un mensaje para analizarlos, así que
+    un `GET` que marcara la entrada daría "el paciente entró" por un robot. Un escáner no
+    ejecuta JavaScript; una persona sí.
+
+    El mismo enlace va como botón y en claro: hay clientes que no pintan el botón, y quedarse
+    sin forma de llegar sería el problema que este correo viene a resolver.
     """
     quien = doctor_name or "Tu médico"
     nombre = patient_name or "paciente"
@@ -188,12 +192,12 @@ def video_ready_email(
     text = (
         f"Hola {nombre},\n\n"
         f"{quien} ya entró a la sala de tu videoconsulta y te está esperando.\n\n"
-        f"Entra ahora desde este enlace:\n{room_url}\n\n"
+        f"Entra ahora desde este enlace:\n{join_url}\n\n"
         f"Para que funcione bien:\n{consejos_text}\n\n"
         f"{codigo_text}"
         "Si tu situación empeora o hay señales de alarma, busca atención presencial urgente.\n"
     )
-    url = esc(room_url)
+    url = esc(join_url)
     consejos_html = "".join(f"<li>{esc(c)}</li>" for c in _CONSEJOS_SALA)
     codigo_html = (
         f'<p style="color:{mail_layout.MUTED};font-size:14px;">'
@@ -222,6 +226,23 @@ def video_ready_email(
     return subject, text, html
 
 
+def build_join_url(consultation_id) -> str:
+    """Enlace de entrada a la videoconsulta para el correo.
+
+    Apunta a `/entrar-videoconsulta`, una página del sitio que registra la entrada
+    (`POST /consultations/{id}/entered-call`), pide la sala y redirige sola. No lleva la URL de
+    Jitsi en la query a propósito: un parámetro con el destino convierte esta página en un
+    redirector abierto, y además el enlace del correo se vuelve ilegible.
+
+    El token se emite **aquí**, fresco. El que se le dio al paciente al registrarse caduca a las
+    24 h y este correo puede salir mucho después: reutilizarlo mandaría a la mitad de la gente a
+    un 401 justo cuando su médico la está esperando.
+    """
+    base = settings.FRONTEND_URL.rstrip("/")
+    token = consultation_token.issue(consultation_id)
+    return f"{base}/entrar-videoconsulta?c={consultation_id}&t={token}"
+
+
 async def video_ready_mail_args(session: AsyncSession, consultation: Consultation) -> dict | None:
     """Args para `send_video_ready_email`, o None si no hay a quién o a dónde escribirle.
 
@@ -244,7 +265,7 @@ async def video_ready_mail_args(session: AsyncSession, consultation: Consultatio
         "to_email": patient.email,
         "patient_name": patient.full_name,
         "doctor_name": await _doctor_name(session, consultation.assigned_doctor_id),
-        "room_url": browser_room_url(consultation.video_room_url),
+        "join_url": build_join_url(consultation.id),
         "code": consultation.code,
     }
 
@@ -254,11 +275,11 @@ async def send_video_ready_email(
     to_email: str,
     patient_name: str | None,
     doctor_name: str | None,
-    room_url: str,
+    join_url: str,
     code: str | None,
 ) -> bool:
     """Envía el aviso de "tu médico ya está en la sala". Best-effort (ver send_mail)."""
-    subject, text, html = video_ready_email(patient_name, doctor_name, room_url, code)
+    subject, text, html = video_ready_email(patient_name, doctor_name, join_url, code)
     return await send_mail(to_email, subject, text, html, category="videoconsulta")
 
 

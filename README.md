@@ -436,6 +436,36 @@ enviado desde una máquina de desarrollo.
 Los correos de **Supabase Auth** (confirmar cuenta, recuperar contraseña) no pasan por aquí: sus
 plantillas se editan en el panel de Supabase y hay que darles el mismo banner a mano.
 
+### ¿Entró el paciente a la videollamada? (`entered_call_at`)
+
+El médico necesita saber si el paciente llegó, y la presencia por Realtime **no sirve para eso**:
+dice si tiene abierta una pestaña del sitio, y al abrir Jitsi esa pestaña pasa a segundo plano —en
+móvil el navegador la suspende y se cae el WebSocket—, así que el panel decía "sin conexión"
+justo en el momento en que el paciente acababa de entrar.
+
+La señal duradera es `consultations.entered_call_at`, que fija
+`POST /consultations/{id}/entered-call` una sola vez. Se expone en el panel
+(`PanelConsultationItem`) y el frontend lo pinta como "Entró a la videollamada · hace X".
+
+Los **tres** caminos por los que un paciente entra a su sala lo marcan:
+
+| Desde | Credencial |
+| --- | --- |
+| `/sala-espera` (tras registrarse) | token de sala de la URL |
+| `/mi-caso` (vuelve con su cuenta) | **su sesión** — ver abajo |
+| `/entrar-videoconsulta` (enlace del correo) | token fresco emitido con el correo |
+
+`require_consultation_token` acepta desde ahora **la sesión del paciente dueño** además del token
+y de una sesión de staff. El token se entrega una sola vez, en la URL de la sala de espera, y
+caduca a las 24 h: quien cerró aquella pestaña tiene sesión pero no token. La pertenencia se
+comprueba contra `Patient.user_id` (misma regla anti-IDOR de las lecturas), y la sesión no es una
+credencial más débil que el token — es más fuerte, porque no viaja por la URL.
+
+El enlace del correo pasa por `/entrar-videoconsulta` (una página del frontend) y **no** por Jitsi
+directamente: es lo que registra la entrada. Ese registro lo hace JavaScript a propósito y no un
+redirect del backend, porque los escáneres de correo corporativos siguen los enlaces de un mensaje
+para analizarlos — un `GET` que marcara la entrada daría "el paciente entró" por culpa de un robot.
+
 ## Autenticación y autorización (RBAC granular)
 
 El login sigue en **Supabase Auth**; el frontend manda el JWT como

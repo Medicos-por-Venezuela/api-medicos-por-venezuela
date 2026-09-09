@@ -112,6 +112,26 @@ async def get_consultation(
     return consultation
 
 
+async def belongs_to_patient(
+    session: AsyncSession, consultation_id: uuid.UUID, user_id: uuid.UUID | None
+) -> bool:
+    """¿Esta consulta es del paciente con esta cuenta? Sin lanzar; `False` también si no existe.
+
+    Es la MISMA regla de pertenencia que `get_consultation` para un no-staff (`Patient.user_id`),
+    extraída porque ahora hace falta como **credencial** y no solo como filtro de lectura: el
+    paciente que vuelve por `/mi-caso` tiene sesión pero no el token de sala que su día se le
+    entregó por la URL, y sin esto no podía ni entrar a su propia videoconsulta.
+    """
+    if user_id is None:
+        return False
+    stmt = (
+        select(Patient.user_id)
+        .join(Consultation, Consultation.patient_id == Patient.id)
+        .where(Consultation.id == consultation_id)
+    )
+    return (await session.scalar(stmt)) == user_id
+
+
 async def create_consultation(session: AsyncSession, data: ConsultationCreate) -> Consultation:
     _validate_status(data.status)
     patient = await session.get(Patient, data.patient_id)
