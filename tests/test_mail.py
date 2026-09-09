@@ -5,6 +5,7 @@ import pytest
 
 from src.core.config import settings
 from src.services import mail as mail_service
+from src.services import mail_layout
 
 
 async def test_send_mail_deshabilitado_sin_token(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -50,6 +51,55 @@ async def test_send_mail_fallo_devuelve_false_sin_reventar(
 
     ok = await mail_service.send_mail("a@example.com", "x", "y", category="alerta")
     assert ok is False  # el caller decide qué hacer; nunca hay excepción hacia arriba
+
+
+async def test_todo_correo_sale_con_la_marca(monkeypatch: pytest.MonkeyPatch) -> None:
+    """La maquetación se aplica en el ENVÍO, no en cada constructor de cuerpo.
+
+    Es la única forma de que la promesa "todos los correos llevan la marca" no dependa de que
+    alguien se acuerde al escribir el correo número doce: aquí no hay camino para mandar uno
+    sin ella. El fragmento que da el constructor tiene que seguir dentro del documento.
+    """
+    sent: dict = {}
+
+    class FakeClient:
+        def send(self, mail: object) -> dict:
+            sent["mail"] = mail
+            return {"success": True}
+
+    monkeypatch.setattr(settings, "MAILTRAP_API_TOKEN", "token-de-prueba")
+    monkeypatch.setattr(mail_service, "_client", lambda: FakeClient())
+
+    await mail_service.send_mail("a@example.com", "Asunto", "texto", "<p>Cuerpo propio.</p>")
+
+    html = sent["mail"].html
+    assert "<p>Cuerpo propio.</p>" in html
+    assert f'<img src="{mail_layout.logo_url()}"' in html
+
+
+async def test_un_correo_solo_de_texto_tambien_sale_con_la_marca(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tres correos se mandan hoy sin `html` (la referencia al especialista, la interconsulta
+    asignada y el recordatorio al médico). Sin fabricarles el cuerpo desde su texto, esos tres
+    serían justo los que se quedan sin marca — y nadie se enteraría hasta verlos en su bandeja.
+    """
+    sent: dict = {}
+
+    class FakeClient:
+        def send(self, mail: object) -> dict:
+            sent["mail"] = mail
+            return {"success": True}
+
+    monkeypatch.setattr(settings, "MAILTRAP_API_TOKEN", "token-de-prueba")
+    monkeypatch.setattr(mail_service, "_client", lambda: FakeClient())
+
+    await mail_service.send_mail("a@example.com", "Asunto", "Tienes una cita próxima.")
+
+    html = sent["mail"].html
+    assert "<p>Tienes una cita próxima.</p>" in html
+    assert f'<img src="{mail_layout.logo_url()}"' in html
+    assert sent["mail"].text == "Tienes una cita próxima."  # el texto plano no se toca
 
 
 # --- Difusión (fan-out de interconsultas): stream bulk + BCC por lotes ---

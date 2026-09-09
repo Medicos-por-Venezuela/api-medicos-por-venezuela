@@ -81,3 +81,59 @@ def test_sin_nombre_de_especialista_cae_a_la_especialidad() -> None:
     assert "<strong>Un especialista en Cardiología</strong>" in html
     assert "None" not in html
     assert subject
+
+
+# --- "Tu médico ya está en la sala" (el correo que dispara el claim por video) ---
+
+# Con los dos parámetros del fragmento, es decir CON `&`: es lo que devuelve
+# `jitsi.browser_room_url`, y un `&` sin escapar dentro de un `href` es exactamente la clase de
+# detalle que rompe un enlace en la mitad de los clientes sin que ningún test lo note.
+SALA = (
+    "https://meet.medicosporvenezuela.org/vamed-abc"
+    "#config.disableDeepLinking=true&config.deeplinking.disabled=true"
+)
+
+
+def test_el_aviso_de_videoconsulta_lleva_el_enlace_como_boton_y_en_claro() -> None:
+    """El correo existe para que el paciente ENTRE a la sala: el enlace es su única razón de
+    ser. Va dos veces a propósito — como botón y en claro— porque hay clientes que no pintan
+    el botón, y quedarse sin forma de llegar sería el mismo problema que esto viene a resolver.
+    """
+    subject, text, html = notifications.video_ready_email(
+        "María Pérez", "Dr. Rivas", SALA, "CONS-2026-1"
+    )
+    assert "esperando" in subject.lower()
+    assert SALA in text
+    assert html.count(f'href="{notifications.esc(SALA)}"') == 2
+    assert "Entrar a la videoconsulta" in html
+    assert "CONS-2026-1" in text and "CONS-2026-1" in html
+
+
+def test_el_aviso_de_videoconsulta_escapa_los_nombres() -> None:
+    """SEGURIDAD. `patient_name` sale del formulario PÚBLICO de la cola y `doctor_name` del
+    perfil que el propio médico edita: los mismos dos vectores del correo de cita."""
+    _, text, html = notifications.video_ready_email(VENENO, "Dr. Rivas", SALA, "CONS-2026-1")
+    _sin_enlace_vivo(html)
+    assert VENENO in text
+
+    _, _, html_medico = notifications.video_ready_email("María", VENENO, SALA, "CONS-2026-1")
+    _sin_enlace_vivo(html_medico)
+
+
+def test_el_aviso_de_videoconsulta_sin_nombres_no_dice_none() -> None:
+    """El nombre del paciente y el del médico son opcionales en la base. Un correo que
+    saludara "Hola None" es peor que uno impersonal."""
+    _, text, html = notifications.video_ready_email(None, None, SALA, None)
+    assert "None" not in html
+    assert "None" not in text
+    assert "Tu médico" in text
+
+
+def test_el_enlace_de_la_sala_va_escapado_dentro_del_href() -> None:
+    """El `&` que separa los dos parámetros del fragmento tiene que salir como `&amp;`. Sin
+    eso el enlace queda mal formado y hay clientes que lo cortan justo ahí — con el resultado
+    de que el paciente aterriza en la sala sin la config que se salta el interstitial de la
+    app, que es el paso donde se pierde a la gente en móvil."""
+    _, _, html = notifications.video_ready_email("María", "Dr. Rivas", SALA, "CONS-2026-1")
+    assert "&amp;config.deeplinking.disabled=true" in html
+    assert "true&config" not in html  # el crudo no puede haberse colado

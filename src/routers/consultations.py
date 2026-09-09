@@ -452,12 +452,20 @@ async def consultation_chain(
 async def claim_consultation(
     consultation_id: uuid.UUID,
     payload: ConsultationClaimRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("queue.take")),
 ) -> ConsultationResponse:
     """El médico autenticado toma un caso en espera. Atómico: si otro médico lo tomó primero
     responde 409 (nunca dos médicos sobre el mismo paciente). `via_whatsapp` marca atención
-    por WhatsApp (sin sala de video)."""
+    por WhatsApp (sin sala de video).
+
+    Si el caso se toma **por video**, se le manda al paciente el correo "tu médico ya está en
+    la sala" con el enlace de la videoconsulta. Es la única notificación que recibe: el enlace
+    vivía solo en la pestaña de `/sala-espera` a la que cayó al registrarse, así que quien la
+    cerró no tenía cómo volver. No sale en la toma por WhatsApp, donde no hay sala y el
+    contacto lo inicia el médico.
+    """
     consultation = await consultations_service.claim_consultation(
         db,
         consultation_id,
@@ -466,6 +474,10 @@ async def claim_consultation(
         doctor_specialty_id=principal.specialty_id,
         is_admin=principal.is_admin,
     )
+    if not payload.via_whatsapp:
+        video_args = await notifications.video_ready_mail_args(db, consultation)
+        if video_args:
+            background_tasks.add_task(notifications.send_video_ready_email, **video_args)
     return ConsultationResponse.model_validate(consultation)
 
 

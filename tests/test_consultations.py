@@ -1,7 +1,9 @@
 """Pruebas del recurso consultations y sus eventos (CRUD aislado)."""
 
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock, patch
 
 from httpx import AsyncClient
 from sqlalchemy import select
@@ -358,6 +360,180 @@ async def test_claim_via_whatsapp_marca_el_flag(
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["attended_via_whatsapp"] is True
+
+
+# --- El correo "tu médico ya está en la sala" (lo dispara el claim por video) ---
+#
+# El paciente ve el botón de entrar solo en `/sala-espera`, la pantalla a la que cae justo
+# después de registrarse: `/mi-caso` no muestra la sala. Quien cerró esa pestaña se quedaba
+# sin forma de volver y el médico entraba a una sala vacía. Estos tests fijan que el correo
+# salga exactamente cuando hay alguien esperando del otro lado, y no en los demás casos.
+
+
+@contextmanager
+def _capturar_aviso_de_video():
+    """Dobla el envío del aviso de videoconsulta y devuelve lo que se le pasó.
+
+    Se parchea `send_video_ready_email` en `notifications` —el nombre que el router encola—
+    y no `mail.send_mail`: el BackgroundTask referencia la función del módulo, así que es ese
+    el nombre que hay que sustituir.
+    """
+    enviados: list[dict] = []
+
+    async def _fake(**kwargs) -> bool:
+        enviados.append(kwargs)
+        return True
+
+    with patch("src.services.notifications.send_video_ready_email", AsyncMock(side_effect=_fake)):
+        yield enviados
+
+
+async def _waiting_con_correo_y_sala(
+    client: AsyncClient, db_session: AsyncSession
+) -> Consultation:
+    """Consulta en espera de un paciente CON correo y con la sala ya creada, que es el estado
+    real en el momento del claim: el panel llama a `/video-room` antes de tomar el caso."""
+    patient = Patient(
+        full_name="Paciente Con Correo",
+        phone_whatsapp="+584140000099",
+        email="paciente@example.com",
+        affected_zone="Caracas",
+        consent=True,
+    )
+    db_session.add(patient)
+    await db_session.flush()
+    cid = (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": str(patient.id), "specialty_id": await any_specialty_id(client)},
+        )
+    ).json()["id"]
+    consultation = await db_session.get(Consultation, uuid.UUID(cid))
+    consultation.video_room_url = "https://meet.medicosporvenezuela.org/vamed-e2e"
+    await db_session.flush()
+    return consultation
+
+
+async def test_claim_por_video_le_manda_al_paciente_el_enlace_de_la_sala(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    consultation = await _waiting_con_correo_y_sala(client, db_session)
+    doc = await add_doctor(db_session)
+
+    with _capturar_aviso_de_video() as enviados:
+        resp = await client.post(
+            f"{PREFIX}/consultations/{consultation.id}/claim",
+            json={},
+            headers=auth_headers(doc.id),
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert len(enviados) == 1
+    aviso = enviados[0]
+    assert aviso["to_email"] == "paciente@example.com"
+    assert aviso["doctor_name"]  # quién le espera, no un correo anónimo
+    # La URL sale ya preparada para el navegador: a un enlace de correo no lo toca nadie antes
+    # de abrirlo, así que la config que salta el interstitial móvil tiene que ir escrita.
+    assert "vamed-e2e" in aviso["room_url"]
+    assert "config.disableDeepLinking=true" in aviso["room_url"]
+
+
+async def test_claim_por_whatsapp_no_manda_el_aviso_de_video(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """En la atención por WhatsApp no hay sala y el contacto lo inicia el médico: mandarle al
+    paciente un enlace de videollamada al que nadie va a entrar sería desviarlo del canal."""
+    consultation = await _waiting_con_correo_y_sala(client, db_session)
+    doc = await add_doctor(db_session)
+
+    with _capturar_aviso_de_video() as enviados:
+        resp = await client.post(
+            f"{PREFIX}/consultations/{consultation.id}/claim",
+            json={"via_whatsapp": True},
+            headers=auth_headers(doc.id),
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert enviados == []
+
+
+async def test_claim_sin_correo_del_paciente_no_intenta_avisar(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """`patients.email` es opcional (los de consultorio suelen no tenerlo). No tener a dónde
+    escribir no es un fallo: el claim responde 200 igual.
+
+    La consulta SÍ lleva sala, aunque el correo no vaya a salir: sin ella el caso se cortaría
+    antes por "no hay sala" y este test estaría midiendo el otro camino."""
+    cid = await _create_waiting_consultation(client)
+    consultation = await db_session.get(Consultation, uuid.UUID(cid))
+    consultation.video_room_url = "https://meet.medicosporvenezuela.org/vamed-sin-correo"
+    await db_session.flush()
+    doc = await add_doctor(db_session)
+
+    with _capturar_aviso_de_video() as enviados:
+        resp = await client.post(
+            f"{PREFIX}/consultations/{cid}/claim", json={}, headers=auth_headers(doc.id)
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert enviados == []
+
+
+async def test_claim_sin_sala_no_manda_un_correo_sin_enlace(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """No debería pasar (el panel crea la sala antes del claim), pero si pasa, un correo que
+    anuncia una videollamada y no trae enlace es peor que ninguno."""
+    patient = Patient(
+        full_name="Paciente Sin Sala",
+        phone_whatsapp="+584140000098",
+        email="sin-sala@example.com",
+        affected_zone="Caracas",
+        consent=True,
+    )
+    db_session.add(patient)
+    await db_session.flush()
+    cid = (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": str(patient.id), "specialty_id": await any_specialty_id(client)},
+        )
+    ).json()["id"]
+    doc = await add_doctor(db_session)
+
+    with _capturar_aviso_de_video() as enviados:
+        resp = await client.post(
+            f"{PREFIX}/consultations/{cid}/claim", json={}, headers=auth_headers(doc.id)
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert enviados == []
+
+
+async def test_el_claim_sobrevive_a_un_fallo_de_correo(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Best-effort: Mailtrap caído no puede impedir que un médico tome un caso. Es la promesa
+    de `send_mail` y aquí se comprueba en el flujo que la necesita — un 500 en el claim dejaría
+    al paciente en la cola con el médico ya dentro de la sala."""
+    consultation = await _waiting_con_correo_y_sala(client, db_session)
+    doc = await add_doctor(db_session)
+
+    # Se rompe el envío de DENTRO (`send_mail`), no `send_video_ready_email`: doblar la propia
+    # tarea encolada sustituiría también el `@best_effort` que la blinda, y el test pasaría a
+    # medir el doble en vez del código. Mismo criterio que el de altas en
+    # `test_registration_mail.py`.
+    boom = AsyncMock(side_effect=RuntimeError("mailtrap caído"))
+    with patch("src.services.notifications.send_mail", boom):
+        resp = await client.post(
+            f"{PREFIX}/consultations/{consultation.id}/claim",
+            json={},
+            headers=auth_headers(doc.id),
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "in_progress"
 
 
 async def test_claim_requiere_permiso_queue_take(

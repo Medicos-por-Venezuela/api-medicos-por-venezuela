@@ -17,12 +17,44 @@ Diseño:
 import asyncio
 import html
 import logging
+from functools import wraps
 
 import mailtrap as mt
 
 from src.core.config import settings
+from src.services import mail_layout
 
 logger = logging.getLogger("mpv.api")
+
+
+def best_effort(fn):
+    """Blinda una función que se encola como BackgroundTask: nunca propaga.
+
+    `send_mail` ya se traga sus propios fallos, así que esto no está para cubrirlo a él, sino
+    al borde entero: si la composición del cuerpo revienta (un dato inesperado, un campo nuevo
+    mal usado), la excepción ocurriría DESPUÉS de responder al cliente, en la fase de background
+    del request — y se llevaría por delante la acción que el correo solo venía a anunciar. La
+    promesa es "un correo caído nunca rompe el flujo que lo dispara", y esa promesa solo es
+    verdad si se cumple también cuando el que falla es el módulo que compone el correo.
+
+    Se traga y LOGUEA (sin PII: solo el nombre de la función y el tipo de error). Un correo
+    que no sale y nadie registra es un fallo invisible, que es peor que uno ruidoso.
+
+    Vive aquí y no en `registration_mail`, donde nació: el borde es el mismo para cualquier
+    correo que se encole, y tenerlo en un módulo concreto hacía que el siguiente que lo
+    necesitara se escribiera sin él (que es exactamente lo que pasó con el aviso de
+    videoconsulta de `notifications`).
+    """
+
+    @wraps(fn)
+    async def _wrapped(*args, **kwargs) -> bool:
+        try:
+            return await fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 — best-effort a propósito, ver docstring
+            logger.warning("MAIL:crash fn=%s reason=%s", fn.__name__, type(exc).__name__)
+            return False
+
+    return _wrapped
 
 
 def esc(value: object) -> str:
@@ -91,6 +123,12 @@ async def send_mail(
 
     `bcc` sirve para difundir el MISMO mensaje sin que los destinatarios se vean entre sí
     (ver `send_bulk`); `bulk` lo manda por el stream de alto volumen.
+
+    **La marca la pone AQUÍ `mail_layout.render`**, no los constructores de cuerpos. Ellos
+    devuelven su fragmento (`<p>…</p>`) y este envío lo envuelve en el documento con el banner
+    del logotipo. Ponerlo en cada constructor sería una regla que hay que recordar doce veces;
+    aquí no hay forma de mandar un correo sin ella. A los que solo traen texto plano se les
+    fabrica el HTML desde ese texto (`html_from_text`), para que tampoco esos se queden fuera.
     """
     if not mail_enabled():
         logger.warning("MAIL:disabled category=%s (sin MAILTRAP_API_TOKEN)", category)
@@ -107,7 +145,7 @@ async def send_mail(
             bcc=[mt.Address(email=e) for e in bcc] if bcc else None,
             subject=subject,
             text=text,
-            html=html,
+            html=mail_layout.render(html or mail_layout.html_from_text(text)),
             category=category,
         )
         await asyncio.to_thread((_bulk_client() if bulk else _client()).send, mail)

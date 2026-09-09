@@ -379,6 +379,7 @@ uv run uvicorn src.main:app --reload      # http://localhost:8000
 | `MAILTRAP_API_TOKEN`   | (vacío = no envía)| token de Mailtrap (Sending → API Tokens)   |
 | `MAIL_INTERNAL_RECIPIENTS` | (vacío)      | **buzones de operación, separados por comas** |
 | `CONTACT_EMAIL`        | `info@medicosporvenezuela.org` | dirección pública de contacto |
+| `MAIL_LOGO_URL`        | `…/brand/logo-white-email.png` | logotipo del banner de los correos |
 
 - **Local:** `.env` (copiado de `.env.example`).
 - **Producción:** `.env.supabase` (ignorado por git) o el gestor de secretos del hosting.
@@ -412,6 +413,28 @@ que mande su título, su licencia del SACS y su carta de artículo 8. `MAIL_INTE
 es "a quién avisamos" (incluye buzones personales); `CONTACT_EMAIL` es "a dónde escribe la
 gente". Por eso sí trae valor por defecto: si quedara vacía, el correo mandaría al médico a
 `no-reply@`, o sea a la basura.
+
+### La marca de los correos (`services/mail_layout.py`)
+
+Todo correo sale dentro del mismo documento: banner navy (`#18202b`) con el logotipo blanco
+arriba, el contenido sobre blanco, y el pie con la letra pequeña.
+
+La maquetación se aplica en **`mail.send_mail`**, no en cada constructor de cuerpo. Los cuerpos
+viven repartidos entre tres módulos y tres de ellos se mandaban solo en texto plano: envolver en
+cada uno sería una regla que hay que recordar cada vez, y el correo número doce saldría sin
+marca sin que nadie se entere. En el envío no hay camino para mandar uno sin ella (a los de solo
+texto se les fabrica el HTML desde su propio texto).
+
+⚠️ **El logotipo es un PNG y vive en el frontend.** Gmail, Outlook y Yahoo descartan un `<img>`
+que apunte a un SVG: la cabecera saldría con el icono de imagen rota. Lo genera
+`node scripts/build-logo-raster.mjs` en el repo del frontend, desde el mismo `logo-white.svg`, y
+se sirve desde el sitio — **tiene que estar desplegado** o el banner llega vacío (navy con el
+texto alternativo, no roto, pero vacío). `MAIL_LOGO_URL` apunta a producción incluso en local, a
+propósito: con `FRONTEND_URL=localhost` el logotipo llegaría roto a quien reciba un correo
+enviado desde una máquina de desarrollo.
+
+Los correos de **Supabase Auth** (confirmar cuenta, recuperar contraseña) no pasan por aquí: sus
+plantillas se editan en el panel de Supabase y hay que darles el mismo banner a mano.
 
 ## Autenticación y autorización (RBAC granular)
 
