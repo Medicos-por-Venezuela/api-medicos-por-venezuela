@@ -107,18 +107,32 @@ async def require_consultation_token(
     consultation_id: uuid.UUID,
     x_consultation_token: str | None = Header(default=None, alias=_CONSULTATION_TOKEN_HEADER),
     principal: Principal | None = Depends(get_optional_principal),
+    db: AsyncSession = Depends(get_db),
 ) -> None:
-    """Exige el token de sala de ESTA consulta (hallazgo M3) **o** una sesión de staff.
+    """Exige el token de sala de ESTA consulta (hallazgo M3), una sesión de staff, **o** la
+    sesión del propio paciente dueño de la consulta.
 
-    Estos endpoints los usan DOS clientes: el paciente anónimo, que llega por link y solo tiene
-    el token, y el médico desde el panel, que tiene sesión pero NO el token del paciente (ver
-    panel-medico.tsx: crea la sala si el caso llegó sin ella). Exigir solo el token dejaba al
-    médico fuera de la consulta que está atendiendo.
+    Estos endpoints los usan TRES clientes:
+    - el paciente anónimo, que llega por link y solo tiene el token;
+    - el médico desde el panel, que tiene sesión pero NO el token del paciente (ver
+      panel-medico.tsx: crea la sala si el caso llegó sin ella) — exigir solo el token dejaba al
+      médico fuera de la consulta que está atendiendo;
+    - el paciente con cuenta que vuelve por `/mi-caso`. Ese token se entregó UNA vez, en la URL
+      de la sala de espera, y caduca a las 24 h: quien cerró aquella pestaña tiene sesión pero
+      no tiene token, y sin esta rama no podía marcar que entró a su propia videoconsulta.
+
+    La sesión del dueño no es una credencial más débil que el token, es más fuerte: el token
+    viaja por la URL (historial, `Referer`, capturas compartidas) y la sesión no. La pertenencia
+    se comprueba contra `Patient.user_id`, la misma regla anti-IDOR de las lecturas.
 
     401 y no 403: el llamante es anónimo por diseño, no es que le falten permisos."""
     if principal is not None and principal.is_staff:
         return
     if consultation_token.is_valid_for(x_consultation_token, consultation_id):
+        return
+    if principal is not None and await consultations_service.belongs_to_patient(
+        db, consultation_id, principal.id
+    ):
         return
     logger.warning("SEC:consultation_token_invalid consultation_id=%s", consultation_id)
     if not settings.CONSULTATION_TOKEN_REQUIRED:
@@ -452,12 +466,20 @@ async def consultation_chain(
 async def claim_consultation(
     consultation_id: uuid.UUID,
     payload: ConsultationClaimRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("queue.take")),
 ) -> ConsultationResponse:
     """El médico autenticado toma un caso en espera. Atómico: si otro médico lo tomó primero
     responde 409 (nunca dos médicos sobre el mismo paciente). `via_whatsapp` marca atención
-    por WhatsApp (sin sala de video)."""
+    por WhatsApp (sin sala de video).
+
+    Si el caso se toma **por video**, se le manda al paciente el correo "tu médico ya está en
+    la sala" con el enlace de la videoconsulta. Es la única notificación que recibe: el enlace
+    vivía solo en la pestaña de `/sala-espera` a la que cayó al registrarse, así que quien la
+    cerró no tenía cómo volver. No sale en la toma por WhatsApp, donde no hay sala y el
+    contacto lo inicia el médico.
+    """
     consultation = await consultations_service.claim_consultation(
         db,
         consultation_id,
@@ -466,6 +488,10 @@ async def claim_consultation(
         doctor_specialty_id=principal.specialty_id,
         is_admin=principal.is_admin,
     )
+    if not payload.via_whatsapp:
+        video_args = await notifications.video_ready_mail_args(db, consultation)
+        if video_args:
+            background_tasks.add_task(notifications.send_video_ready_email, **video_args)
     return ConsultationResponse.model_validate(consultation)
 
 

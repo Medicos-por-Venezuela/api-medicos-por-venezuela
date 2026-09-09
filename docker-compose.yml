@@ -22,6 +22,14 @@ services:
       SUPABASE_JWT_AUDIENCE: authenticated
       SUPABASE_JWKS_URL: http://host.docker.internal:54321/auth/v1/.well-known/jwks.json
       BACKEND_CORS_ORIGINS: "*"
+      # El tope de escrituras públicas (10/minuto en producción) cuenta por IP, y en local TODA
+      # la suite E2E sale de la misma: la corrida entera crea más de diez pacientes/consultas en
+      # menos de un minuto, así que a partir de cierto punto los `POST /patients` devolvían 429 y
+      # los specs fallaban con un `id` `undefined` — un fallo que no se reproduce al correr el
+      # spec suelto y que parece cualquier cosa menos un rate limit.
+      # Se sube en vez de apagarse (`RATE_LIMIT_ENABLED`) a propósito: así el middleware sigue
+      # en el camino y local no deja de parecerse a producción en todo lo demás.
+      PUBLIC_WRITE_RATE_LIMIT: "1000/minute"
     volumes:
       # Hot-reload en desarrollo.
       - ./src:/code/src:ro
