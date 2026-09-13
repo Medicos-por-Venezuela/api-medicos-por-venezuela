@@ -29,6 +29,7 @@ from src.routers.reports import (
     xlsx_download,
 )
 from src.schemas.marketing import (
+    MarketingPerformanceResponse,
     SurveyResponseCreate,
     SurveyResponseReceipt,
     SurveySlug,
@@ -37,6 +38,7 @@ from src.schemas.marketing import (
 )
 from src.schemas.report import ReportPreview
 from src.services import marketing as marketing_service
+from src.services import marketing_performance
 
 router = APIRouter(prefix="/marketing", tags=["marketing"])
 tag_metadata = [
@@ -142,6 +144,39 @@ async def list_survey_totals(
     """Cuántas respuestas tiene cada encuesta, sin filtros, en el orden de las pestañas del panel
     (psicólogos, especialistas, médicos generales). Una encuesta sin respuestas sale con `0`."""
     return await marketing_service.survey_totals(db)
+
+
+@router.get(
+    "/performance",
+    response_model=MarketingPerformanceResponse,
+    summary="Rendimiento de la campaña: de los envíos de Kit a las respuestas (super_admin)",
+    responses={**_FORBIDDEN},
+)
+async def get_marketing_performance(
+    refresh: bool = Query(
+        False,
+        description=(
+            "Pedir de nuevo las métricas a Kit en vez de reutilizar las guardadas (como mucho "
+            "una vez cada 30 segundos)."
+        ),
+    ),
+    db: AsyncSession = Depends(get_db),
+    _: Principal = Depends(require_permission("marketing.read")),
+) -> marketing_performance.Performance:
+    """El embudo de cada encuesta, de punta a punta: enviados, aperturas, clics y bajas (Kit), y
+    respuestas (plataforma). Incluye también la línea de tiempo de las respuestas desde el primer
+    envío.
+
+    - Cada envío de Kit se asocia **solo** a su encuesta por el enlace `/encuesta/<slug>` que
+      lleva (o, sin clics todavía, por el nombre de la plantilla). Varios envíos de una encuesta
+      se suman.
+    - `responses_after_send` cuenta las respuestas llegadas desde el primer envío: es el
+      numerador honesto de la tasa de respuesta (las anteriores son pruebas u otros canales).
+    - Kit se consulta de solo lectura y sus métricas se reutilizan unos minutos. Si falta la clave
+      o Kit falla, responde igual `200` con `kit_status` explicándolo y esas métricas en `null`.
+
+    Son agregados: no devuelve correos."""
+    return await marketing_performance.campaign_performance(db, refresh=refresh)
 
 
 @router.get(

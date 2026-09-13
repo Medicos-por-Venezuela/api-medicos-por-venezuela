@@ -110,3 +110,71 @@ class SurveyStatsResponse(BaseModel):
     timezones: list[SurveyOptionCount] | None = Field(
         description="Dónde están. `null` en la encuesta que no lo pregunta (médicos generales)."
     )
+
+
+class MarketingCampaignResponse(BaseModel):
+    """Un envío de Kit asociado a una encuesta."""
+
+    id: int = Field(description="Id del envío (broadcast) en Kit.")
+    subject: str
+    sent_at: datetime
+    recipients: int = Field(description="Destinatarios del envío.")
+    opened: int = Field(description="Personas que lo abrieron.")
+    clicked: int = Field(description="Personas que hicieron clic (no clics totales).")
+    unsubscribed: int = Field(description="Bajas desde este envío.")
+
+
+class SurveyPerformanceResponse(BaseModel):
+    """El embudo de una encuesta: de sus envíos de Kit a sus respuestas."""
+
+    survey: SurveySlug
+    campaigns: list[MarketingCampaignResponse] = Field(
+        description="Envíos de Kit asociados a la encuesta, del más antiguo al más reciente."
+    )
+    recipients: int | None = Field(
+        description=(
+            "Suma de los destinatarios de sus envíos. `null` si no hay datos de Kit o la "
+            "encuesta no tiene envíos: no es lo mismo que 0."
+        )
+    )
+    opened: int | None
+    clicked: int | None
+    unsubscribed: int | None
+    responses: int = Field(description="Todas las respuestas guardadas de la encuesta.")
+    responses_after_send: int | None = Field(
+        description=(
+            "Respuestas llegadas desde el primer envío: el numerador de la tasa de respuesta. "
+            "`null` si la encuesta no tiene envíos."
+        )
+    )
+    first_sent_at: datetime | None
+
+
+class ResponseTimelineResponse(BaseModel):
+    """Respuestas nuevas por tramo de tiempo, desde el primer envío."""
+
+    granularity: Literal["hour", "day"] = Field(
+        description="Por horas hasta 72 h después del primer envío; después, por días."
+    )
+    buckets: list[datetime] = Field(
+        description="Inicio de cada tramo (los días van de medianoche a medianoche en Caracas)."
+    )
+    responses: dict[SurveySlug, list[int]] = Field(
+        description="Por encuesta, respuestas nuevas en cada tramo (misma longitud que `buckets`)."
+    )
+
+
+class MarketingPerformanceResponse(BaseModel):
+    """Rendimiento de la campaña: métricas de Kit + respuestas de la plataforma."""
+
+    kit_status: Literal["ok", "not_configured", "unavailable"] = Field(
+        description=(
+            "`not_configured`: falta `KIT_API_KEY`. `unavailable`: Kit falló o rechazó la clave. "
+            "En los dos casos las métricas de Kit salen en `null` y el resto sigue."
+        )
+    )
+    kit_fetched_at: datetime | None = Field(
+        description="Cuándo se pidieron a Kit las métricas (se reutilizan unos minutos)."
+    )
+    surveys: list[SurveyPerformanceResponse]
+    timeline: ResponseTimelineResponse
