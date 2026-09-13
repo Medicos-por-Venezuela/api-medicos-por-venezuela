@@ -257,9 +257,11 @@ class ConsultationFilters:
     created_to: date | None = None
 
 
-def _describe(pairs: list[tuple[str, object]]) -> list[tuple[str, str]]:
+def describe_filters(pairs: list[tuple[str, object]]) -> list[tuple[str, str]]:
     """Deja solo los filtros realmente aplicados. Listar los vacíos como "Todos" llenaría la
-    portada de ruido y escondería los dos que de verdad acotan el informe."""
+    portada de ruido y escondería los dos que de verdad acotan el informe.
+
+    Pública porque la usan también otros listados exportables (ver `services/marketing.py`)."""
     return [(label, str(value)) for label, value in pairs if value not in (None, "", [])]
 
 
@@ -274,7 +276,7 @@ def describe_doctor_filters(
     Los nombres de especialidad/tipo los resuelve el caller (tiene la sesión): escribir el UUID
     en la portada dejaría un informe que nadie puede auditar sin abrir la base.
     """
-    return _describe(
+    return describe_filters(
         [
             ("Estado de la ficha", DOCTOR_STATUS_LABELS.get(f.status)),
             ("Credencial verificada", _si_no(f.verified, unknown="")),
@@ -292,7 +294,7 @@ def describe_doctor_filters(
 def describe_patient_filters(f: PatientFilters) -> list[tuple[str, str]]:
     """Los filtros aplicados, legibles, para la portada del Excel."""
     origins = {"publica": "Cola pública", "consultorio": "Consultorio (alta por médico)"}
-    return _describe(
+    return describe_filters(
         [
             ("Búsqueda (nombre/cédula/email/teléfono)", f.search),
             ("Origen", origins.get(f.origin or "")),
@@ -692,7 +694,7 @@ def describe_consultation_filters(
         estados = "En progreso (derivadas, urgentes, no-show, canceladas y por WhatsApp)"
     else:
         estados = ", ".join(STATUS_LABELS.get(x, x) for x in f.statuses)
-    return _describe(
+    return describe_filters(
         [
             ("Estados", estados),
             ("Médico asignado", doctor_name),
@@ -728,7 +730,7 @@ class Report:
     filters: list[tuple[str, str]] = field(default_factory=list)
 
 
-async def _run(
+async def run_report(
     session: AsyncSession,
     stmt: Select,
     columns: tuple[Column, ...],
@@ -738,7 +740,10 @@ async def _run(
     skip: int | None,
     limit: int | None,
 ) -> Report:
-    """Cuenta el total y materializa la página pedida (o todo, si `limit` es None)."""
+    """Cuenta el total y materializa la página pedida (o todo, si `limit` es None).
+
+    Pública, como `guard_export_size`, `log_export` y `build_workbook`: son el esqueleto de
+    cualquier listado exportable (ver `services/marketing.py`), no algo propio de estos tres."""
     total = await session.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     if skip:
         stmt = stmt.offset(skip)
@@ -762,7 +767,7 @@ async def doctors_report(
     Resolviéndolos solo en la exportación, la vista previa se saltaba esos dos chips y quedaba
     enseñando un total recortado por un filtro que el usuario no veía en ninguna parte.
     """
-    return await _run(
+    return await run_report(
         session,
         doctors_query(filters),
         DOCTOR_COLUMNS,
@@ -787,7 +792,7 @@ async def patients_report(
     limit: int | None = None,
 ) -> Report:
     """Reporte de pacientes. Sin `limit` devuelve la población completa (exportación)."""
-    return await _run(
+    return await run_report(
         session,
         patients_query(filters),
         PATIENT_COLUMNS,
@@ -811,7 +816,7 @@ async def consultations_report(
         doctor_name = await session.scalar(
             select(Profile.full_name).where(Profile.id == filters.assigned_doctor_id)
         )
-    return await _run(
+    return await run_report(
         session,
         consultations_query(filters),
         CONSULTATION_COLUMNS,
@@ -839,9 +844,23 @@ def build_workbook(report: Report, *, title: str, sheet_name: str, generated_by:
     `constant_memory` escribe fila a fila al archivo en vez de retener la hoja entera: con él un
     export grande no depende de que quepa en RAM. A cambio las filas deben escribirse en orden
     (lo están) y el ancho de columna hay que fijarlo antes de escribirlas (también).
+
+    `strings_to_formulas` y `strings_to_urls` van en False porque las celdas traen texto escrito
+    por terceros (la descripción de un paciente, las notas de una encuesta pública, hasta la
+    búsqueda de la portada). Por defecto xlsxwriter escribe como FÓRMULA cualquier texto que
+    empiece por `=`: un `=HYPERLINK("https://…";"Ver caso")` metido en un formulario público
+    llegaba al Excel del super_admin como un enlace activo. Con esto todo se escribe como texto.
     """
     buffer = BytesIO()
-    book = xlsxwriter.Workbook(buffer, {"in_memory": True, "constant_memory": True})
+    book = xlsxwriter.Workbook(
+        buffer,
+        {
+            "in_memory": True,
+            "constant_memory": True,
+            "strings_to_formulas": False,
+            "strings_to_urls": False,
+        },
+    )
     header_fmt = book.add_format(
         {"bold": True, "bg_color": "#0f172a", "font_color": "#ffffff", "border": 1}
     )
@@ -898,7 +917,7 @@ def build_workbook(report: Report, *, title: str, sheet_name: str, generated_by:
 # --- Exportación --------------------------------------------------------------
 
 
-def _guard_size(total: int) -> None:
+def guard_export_size(total: int) -> None:
     """Rechaza exportaciones desmedidas ANTES de materializar las filas.
 
     El tope no protege del tamaño del archivo, sino del proceso: construir cientos de miles de
@@ -913,7 +932,7 @@ def _guard_size(total: int) -> None:
         )
 
 
-async def _log_export(
+async def log_export(
     session: AsyncSession, *, report_name: str, actor_user_id: uuid.UUID, report: Report
 ) -> None:
     """Deja en `audit_log` que este usuario extrajo este reporte, con su filtro y su tamaño.
@@ -951,8 +970,8 @@ async def export_doctors(
     # corta con el `total` exacto; el limit es solo el cinturón por si la cuenta y la página
     # divergieran (datos escritos entre ambas consultas).
     report = await doctors_report(session, filters, limit=MAX_EXPORT_ROWS + 1)
-    _guard_size(report.total)
-    await _log_export(session, report_name="doctors", actor_user_id=actor_user_id, report=report)
+    guard_export_size(report.total)
+    await log_export(session, report_name="doctors", actor_user_id=actor_user_id, report=report)
     return build_workbook(
         report, title="Reporte de médicos", sheet_name="Médicos", generated_by=actor_label
     )
@@ -967,8 +986,8 @@ async def export_patients(
 ) -> bytes:
     """El `.xlsx` de pacientes que cumplen el filtro (población completa) + su entrada de audit."""
     report = await patients_report(session, filters, limit=MAX_EXPORT_ROWS + 1)
-    _guard_size(report.total)
-    await _log_export(session, report_name="patients", actor_user_id=actor_user_id, report=report)
+    guard_export_size(report.total)
+    await log_export(session, report_name="patients", actor_user_id=actor_user_id, report=report)
     return build_workbook(
         report, title="Reporte de pacientes", sheet_name="Pacientes", generated_by=actor_label
     )
@@ -986,8 +1005,8 @@ async def export_consultations(
     Incluye el motivo de consulta, que es contenido clínico escrito por el paciente. Misma
     sensibilidad que el reporte de pacientes y el mismo gate."""
     report = await consultations_report(session, filters, limit=MAX_EXPORT_ROWS + 1)
-    _guard_size(report.total)
-    await _log_export(
+    guard_export_size(report.total)
+    await log_export(
         session, report_name="consultations", actor_user_id=actor_user_id, report=report
     )
     return build_workbook(

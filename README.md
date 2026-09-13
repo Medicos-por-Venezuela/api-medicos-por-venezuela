@@ -489,7 +489,7 @@ users (profiles) ──< user_roles >── roles ──< role_permissions >─�
 | `patient` | ninguno de staff (solo ve **lo suyo** por pertenencia) |
 | `doctor` | `consultations.read/write/close`, `queue.read/take`, `patients.read`, `doctors.read` |
 | `admin` | todo lo de doctor + `patients.write/delete`, `consultations.delete`, `queue.manage`, `doctors.write/verify`, `profiles.read/manage`, `catalogs.manage`, `roles.assign`, `audit.read`, `users.create` |
-| `super_admin` | **todos** los permisos, y el único con `reports.export` (exportación de reportes con PII masiva) |
+| `super_admin` | **todos** los permisos, y el único con `reports.export` (exportación de reportes con PII masiva) y `marketing.read` (respuestas de las encuestas de marketing) |
 
 **Cómo se protege un endpoint** (una línea): `Depends(require_permission("recurso.accion"))` → 403 si
 falta el permiso. Se autoriza por **permiso**, no por rol.
@@ -515,6 +515,12 @@ falta el permiso. Se autoriza por **permiso**, no por rol.
   (cédulas, teléfonos, alergias) de miles de personas a un archivo que sale de la plataforma. Es
   la operación con mayor exposición de PII de la API; cada exportación queda en `audit_log` como
   `report.exported` con el filtro aplicado y el número de filas (nunca las filas).
+
+- **`marketing.read` también es exclusivo de `super_admin`** (migración
+  `20260912_191154_seed_marketing_read_permission.sql`): da el listado y el Excel de las respuestas
+  a las encuestas de marketing, que es la lista de correos de quienes respondieron. Cada exportación
+  queda en `audit_log` como `report.exported` con `report = marketing-<encuesta>`. Si el equipo de
+  marketing usa cuentas `admin`, basta una migración que añada ese mapeo.
 
 **Agregar un permiso nuevo:** siémbralo en una migración (`permissions` + `role_permissions`) y
 protege el endpoint con `require_permission("...")`. Nunca lo insertes a mano.
@@ -561,6 +567,8 @@ protege el endpoint con `require_permission("...")`. Nunca lo insertes a mano.
 | `GET`   | `/audit-log?action=&actor_user_id=&resource=` | Registro de auditoría (`audit.read`) |
 | `GET`   | `/reports/doctors` · `/reports/patients` | Vista previa paginada del reporte, con las columnas y el `total` que traería el Excel (`reports.export`) |
 | `GET`   | `/reports/doctors/export` · `/reports/patients/export` | El reporte completo en `.xlsx` (mismos filtros, sin `limit`; auditado) |
+| `POST`  | `/marketing/surveys/{survey}/responses` | Responder una encuesta de marketing (**público**, rate limit `SURVEY_RESPONSE_RATE_LIMIT`). `survey` = `psicologos` · `especialistas` · `medicos-generales`; responder de nuevo con el mismo correo reemplaza la respuesta |
+| `GET`   | `/marketing/surveys/{survey}/responses` · `.../export` | Respuestas de una encuesta: vista previa paginada y `.xlsx` auditado (`marketing.read`) |
 
 ## Concurrencia: toma de cola anti-colisión
 
