@@ -74,7 +74,7 @@ def response_filters(
         422: {
             "description": (
                 "La encuesta no existe, una opción no es válida para esa encuesta, o falta una "
-                "respuesta obligatoria (p. ej. la disponibilidad de quien quiere atender)."
+                "respuesta obligatoria (p. ej. la disponibilidad)."
             )
         },
         429: {"description": "Demasiados envíos desde esta IP (rate limit)."},

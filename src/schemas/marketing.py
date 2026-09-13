@@ -24,8 +24,8 @@ class SurveyResponseCreate(BaseModel):
     """Lo que manda el formulario público.
 
     Todos los campos existen para las tres encuestas; los que una encuesta no pregunta (la zona
-    horaria en médicos generales, la disponibilidad de quien solo pide interconsultas) se
-    descartan en el servicio en vez de guardarse a medias.
+    horaria en médicos generales, el "rol más activo" en las otras dos) se descartan en el
+    servicio en vez de guardarse a medias.
     """
 
     model_config = ConfigDict(extra="forbid")
