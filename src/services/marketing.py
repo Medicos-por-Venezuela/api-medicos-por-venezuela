@@ -13,9 +13,10 @@ Cuatro decisiones que sostienen el módulo:
 2. **Códigos, no textos.** Se guardan los códigos de las opciones y las etiquetas viven aquí. Cada
    encuesta tiene SUS etiquetas —el mismo `atender_pacientes` se lee distinto para un psicólogo
    que para un especialista—, así que el listado de cada pestaña dice lo que vio quien respondió.
-3. **Lo que la encuesta no preguntó, no se guarda.** La disponibilidad de quien solo va a pedir
-   interconsultas, o el texto de "Otra" sin haberla marcado, se descartan: el formulario oculta
-   esos campos, y guardarlos daría respuestas que nadie contestó.
+3. **Lo que la encuesta no preguntó, no se guarda.** El texto de "Otra" sin haberla marcado, o la
+   zona horaria en la encuesta de médicos generales, se descartan: el formulario no los enseña, y
+   guardarlos daría respuestas que nadie contestó. La disponibilidad, en cambio, la preguntan y la
+   exigen las tres encuestas.
 4. **El listado reutiliza el esqueleto de los reportes** (`run_report`, `build_workbook`,
    `log_export`): la misma tabla genérica en el panel, el mismo tope de filas y la misma entrada en
    `audit_log` por cada exportación.
@@ -111,16 +112,14 @@ TIMEZONES = {
 class Survey:
     """Lo que distingue a una encuesta de las otras dos.
 
-    `availability_roles`: roles que abren las preguntas de disponibilidad. `None` = se preguntan
-    siempre. `active_detail_role`: rol que trae su propio "cuéntanos qué tienes en mente" (además
-    del de "Otra"). `asks_timezone`: si pregunta dónde está.
+    `active_detail_role`: rol que trae su propio "cuéntanos qué tienes en mente" (además del de
+    "Otra"). `asks_timezone`: si pregunta dónde está.
     """
 
     slug: str
     title: str  # portada del Excel
     sheet_name: str  # hoja de datos (Excel acepta 31 caracteres como máximo)
     roles: dict[str, str]
-    availability_roles: frozenset[str] | None
     active_detail_role: str | None
     asks_timezone: bool
 
@@ -140,7 +139,6 @@ SURVEYS: dict[str, Survey] = {
             ),
             OTHER: "Otra forma que quiero proponerles",
         },
-        availability_roles=None,
         active_detail_role=None,
         asks_timezone=True,
     ),
@@ -155,13 +153,12 @@ SURVEYS: dict[str, Survey] = {
             "coordinar_especialidad": "Coordinar mi especialidad dentro de la red",
             OTHER: "Otra forma que quiero proponerles",
         },
-        availability_roles=None,
         active_detail_role=None,
         asks_timezone=True,
     ),
-    # Quien solo va a PEDIR interconsultas no se compromete a un horario, así que la
-    # disponibilidad solo se pregunta si además quiere atender, liderar o proponer otra cosa.
-    # Sin zona horaria: la encuesta va a médicos en Venezuela ("Horas de Venezuela").
+    # Sin zona horaria: la encuesta va a médicos en Venezuela ("Horas de Venezuela"). La
+    # disponibilidad se pregunta a todos, como en las otras dos: al principio solo se pedía a quien
+    # iba a atender, liderar o proponer otra cosa, y se cambió para enseñar el formulario completo.
     "medicos-generales": Survey(
         slug="medicos-generales",
         title="Encuesta de médicos generales",
@@ -172,7 +169,6 @@ SURVEYS: dict[str, Survey] = {
             "rol_activo": "Asumir un rol más activo (coordinar, liderar)",
             OTHER: "Otra forma que quiero proponerles",
         },
-        availability_roles=frozenset({"atender_pacientes", "rol_activo", OTHER}),
         active_detail_role="rol_activo",
         asks_timezone=False,
     ),
@@ -214,7 +210,7 @@ def normalize_response(survey: Survey, payload: SurveyResponseCreate) -> dict:
     que la encuesta no preguntó, descartado.
 
     Las obligatorias se exigen aquí y no solo en el formulario: el endpoint es público, y una
-    respuesta sin disponibilidad de alguien que dijo querer atender pacientes no le sirve a nadie.
+    respuesta sin disponibilidad no le sirve a nadie para organizar la red.
     """
     # Honeypot: si el campo trampa llegó con valor, es un bot. Rechazo genérico, igual que en el
     # registro de médicos: decirle qué lo delató solo le enseña a esquivarlo.
@@ -222,25 +218,15 @@ def normalize_response(survey: Survey, payload: SurveyResponseCreate) -> dict:
         raise BadRequestError("Solicitud inválida.")
     roles = _codes(payload.roles, survey.roles, "Cómo quieres participar")
 
-    asks_availability = (
-        survey.availability_roles is None or not survey.availability_roles.isdisjoint(roles)
-    )
-    moments: list[str] = []
-    days: list[str] = []
-    weekly_hours = availability_notes = None
-    if asks_availability:
-        moments = _codes(payload.moments, MOMENTS, "Momento del día")
-        days = _codes(payload.days, DAYS, "Días de la semana")
-        weekly_hours = _code(payload.weekly_hours, WEEKLY_HOURS, "Horas a la semana")
-        if not moments:
-            raise UnprocessableError(
-                "Indica en qué momento del día te resulta más fácil conectarte."
-            )
-        if not days:
-            raise UnprocessableError("Indica qué días de la semana te quedan mejor.")
-        if weekly_hours is None:
-            raise UnprocessableError("Indica cuántas horas a la semana podrías dedicar.")
-        availability_notes = _text(payload.availability_notes)
+    moments = _codes(payload.moments, MOMENTS, "Momento del día")
+    days = _codes(payload.days, DAYS, "Días de la semana")
+    weekly_hours = _code(payload.weekly_hours, WEEKLY_HOURS, "Horas a la semana")
+    if not moments:
+        raise UnprocessableError("Indica en qué momento del día te resulta más fácil conectarte.")
+    if not days:
+        raise UnprocessableError("Indica qué días de la semana te quedan mejor.")
+    if weekly_hours is None:
+        raise UnprocessableError("Indica cuántas horas a la semana podrías dedicar.")
 
     timezone = timezone_other = None
     if survey.asks_timezone:
@@ -263,7 +249,7 @@ def normalize_response(survey: Survey, payload: SurveyResponseCreate) -> dict:
         "moments": moments,
         "days": days,
         "weekly_hours": weekly_hours,
-        "availability_notes": availability_notes,
+        "availability_notes": _text(payload.availability_notes),
         "timezone": timezone,
         "timezone_other": timezone_other,
         "notes": _text(payload.notes),
