@@ -157,6 +157,14 @@ class Settings(BaseSettings):
     # MAIL_FANOUT_MAX correos a médicos reales. Sin tope, una cuenta comprometida convierte
     # la plataforma en un emisor de spam contra sus propios usuarios.
     INTERCONSULTATION_REQUEST_RATE_LIMIT: str = "10/minute"
+    # Respuestas a las encuestas de marketing (formulario público). Más holgado que
+    # PUBLIC_WRITE_RATE_LIMIT a propósito: las respuestas llegan en RÁFAGA justo después de cada
+    # correo masivo, y un 429 ahí es un médico que quería participar y se va. El abuso cuesta
+    # poco en comparación —no llega a ningún médico ni entra a la cola; como mucho, filas basura
+    # en un listado—, así que el tope solo tiene que frenar un script, no a una campaña.
+    # Ojo: si detrás del proxy la API no ve la IP real del cliente, este tope lo comparten TODOS
+    # los que responden a la vez; por eso no se ajusta al volumen de una sola persona.
+    SURVEY_RESPONSE_RATE_LIMIT: str = "60/minute"
 
     def _normalize_async_scheme(self, url: str) -> str:
         """Garantiza el driver async (postgresql+asyncpg://)."""
