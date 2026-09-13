@@ -380,6 +380,9 @@ uv run uvicorn src.main:app --reload      # http://localhost:8000
 | `MAIL_INTERNAL_RECIPIENTS` | (vacío)      | **buzones de operación, separados por comas** |
 | `CONTACT_EMAIL`        | `info@medicosporvenezuela.org` | dirección pública de contacto |
 | `MAIL_LOGO_URL`        | `…/brand/logo-white-email.png` | logotipo del banner de los correos |
+| `KIT_API_KEY`          | (vacío = sin métricas de Kit) | **clave API v4 de Kit**, solo lectura de envíos para el embudo de Marketing |
+| `KIT_STATS_CACHE_SECONDS` | `300`         | cuánto se reutilizan las métricas de Kit     |
+| `MARKETING_CAMPAIGNS_SINCE` | `2026-09-01` | primer día (Caracas) de los envíos de Kit que cuentan |
 
 - **Local:** `.env` (copiado de `.env.example`).
 - **Producción:** `.env.supabase` (ignorado por git) o el gestor de secretos del hosting.
@@ -571,6 +574,7 @@ protege el endpoint con `require_permission("...")`. Nunca lo insertes a mano.
 | `POST`  | `/marketing/surveys/{survey}/responses` | Responder una encuesta de marketing (**público**, rate limit `SURVEY_RESPONSE_RATE_LIMIT`). `survey` = `psicologos` · `especialistas` · `medicos-generales`; responder de nuevo con el mismo correo reemplaza la respuesta |
 | `GET`   | `/marketing/surveys/{survey}/responses` · `.../export` | Respuestas de una encuesta: vista previa paginada y `.xlsx` auditado (`marketing.read`) |
 | `GET`   | `/marketing/surveys` | Total de respuestas de cada encuesta, para las pestañas del panel (`marketing.read`) |
+| `GET`   | `/marketing/performance` | Embudo de cada encuesta: enviados, aperturas, clics y bajas (Kit, en caché unos minutos) + respuestas, y línea de tiempo de las respuestas desde el primer envío (`marketing.read`) |
 | `GET`   | `/marketing/surveys/{survey}/stats` | Agregados para los gráficos: cobertura día × momento, formas de participar, horas (y horas mínimas), ubicación; filtros de fecha y `role` (`marketing.read`) |
 
 ## Concurrencia: toma de cola anti-colisión
