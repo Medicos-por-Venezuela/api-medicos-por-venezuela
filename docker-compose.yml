@@ -30,6 +30,9 @@ services:
       # Se sube en vez de apagarse (`RATE_LIMIT_ENABLED`) a propósito: así el middleware sigue
       # en el camino y local no deja de parecerse a producción en todo lo demás.
       PUBLIC_WRITE_RATE_LIMIT: "1000/minute"
+      # Métricas de Kit en el panel de Marketing. Compose la toma del `.env` de esta carpeta (no
+      # versionado); sin ella, el panel muestra solo las respuestas.
+      KIT_API_KEY: ${KIT_API_KEY:-}
     volumes:
       # Hot-reload en desarrollo.
       - ./src:/code/src:ro

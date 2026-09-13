@@ -638,6 +638,274 @@ async def test_export_escribe_como_texto_lo_que_parece_una_formula(
     assert "=HYPERLINK(" in _shared_strings(resp.content)
 
 
+# --- Totales y gráficos -------------------------------------------------------
+# La base local es un restore de producción: estos agregados cuentan TODA la encuesta, no solo lo
+# que siembra el test. Por eso se asierta la DIFERENCIA entre antes y después de sembrar, que
+# dentro de la transacción del test solo puede venir de lo sembrado.
+
+
+async def _get_json(client: AsyncClient, url: str, headers: dict, **params) -> dict | list:
+    resp = await client.get(url, headers=headers, params=params)
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def _by_code(options: list[dict]) -> dict[str, int]:
+    return {o["code"]: o["count"] for o in options}
+
+
+def _delta(after: dict[str, int], before: dict[str, int]) -> dict[str, int]:
+    """Solo lo que cambió, para asertar exactamente qué movió lo sembrado."""
+    return {code: n - before.get(code, 0) for code, n in after.items() if n != before.get(code, 0)}
+
+
+def _matrix_delta(after: dict, before: dict) -> dict[tuple[str, str], int]:
+    days = [d["code"] for d in after["days"]]
+    moments = [m["code"] for m in after["moments"]]
+    return {
+        (day, moment): after["availability"][i][j] - before["availability"][i][j]
+        for i, day in enumerate(days)
+        for j, moment in enumerate(moments)
+        if after["availability"][i][j] != before["availability"][i][j]
+    }
+
+
+async def test_totales_y_graficos_solo_para_super_admin(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession, super_admin
+) -> None:
+    """Son agregados, sin correos, pero salen de las mismas respuestas: mismo permiso que el
+    listado."""
+    admin = make_profile(role="admin")
+    db_session.add(admin)
+    await db_session.flush()
+
+    for url in (SURVEYS, f"{SURVEYS}/especialistas/stats"):
+        assert (await anon_client.get(url)).status_code == 401
+        assert (await client.get(url, headers=auth_headers(admin.id))).status_code == 403
+        ok = await client.get(url, headers=auth_headers(super_admin.id))
+        assert ok.status_code == 200, f"{url} -> {ok.status_code}: {ok.text}"
+
+
+async def test_totales_cuentan_cada_encuesta_en_el_orden_de_las_pestanas(
+    client: AsyncClient, anon_client: AsyncClient, super_admin
+) -> None:
+    headers = auth_headers(super_admin.id)
+    antes = await _get_json(client, SURVEYS, headers)
+    assert [t["survey"] for t in antes] == ["psicologos", "especialistas", "medicos-generales"]
+
+    marker = _marker()
+    for i in range(2):
+        await anon_client.post(
+            f"{SURVEYS}/psicologos/responses", json=_answers(f"{marker}-{i}@example.com")
+        )
+    await anon_client.post(
+        f"{SURVEYS}/medicos-generales/responses", json=_answers(f"{marker}@example.com")
+    )
+    # Responder otra vez reemplaza: no suma.
+    await anon_client.post(
+        f"{SURVEYS}/psicologos/responses", json=_answers(f"{marker}-0@example.com")
+    )
+
+    despues = await _get_json(client, SURVEYS, headers)
+    delta = {d["survey"]: d["total"] - a["total"] for a, d in zip(antes, despues, strict=True)}
+    assert delta == {"psicologos": 2, "especialistas": 0, "medicos-generales": 1}
+
+
+async def test_totales_de_una_encuesta_sin_respuestas_salen_en_cero(db_session: AsyncSession):
+    """Sin filas, `GROUP BY` no devuelve la encuesta: el servicio la rellena con 0. Se prueba
+    borrando dentro de la transacción del test (se deshace al terminar)."""
+    await db_session.execute(
+        delete(MarketingSurveyResponse).where(MarketingSurveyResponse.survey == "especialistas")
+    )
+    totales = await marketing_service.survey_totals(db_session)
+    assert [(t.survey, t.total) for t in totales if t.survey == "especialistas"] == [
+        ("especialistas", 0)
+    ]
+
+
+async def test_graficos_cuentan_opciones_horas_y_la_cobertura_por_dia_y_momento(
+    client: AsyncClient, anon_client: AsyncClient, super_admin
+) -> None:
+    """Dos psicólogos: la matriz cuenta a cada uno en cada par día×momento que marcó, las horas
+    mínimas suman el piso de cada rango y la ubicación se cuenta por opción."""
+    headers = auth_headers(super_admin.id)
+    url = f"{SURVEYS}/psicologos/stats"
+    antes = await _get_json(client, url, headers)
+
+    marker = _marker()
+    for email, body in [
+        (
+            f"{marker}-a@example.com",
+            {
+                "roles": ["atender_pacientes", "otra"],
+                "role_other_detail": "Grupos",
+                "days": ["sabado", "lunes"],
+                "moments": ["noche", "manana"],
+                "weekly_hours": "mas_de_6",
+                "timezone": "venezuela",
+            },
+        ),
+        (
+            f"{marker}-b@example.com",
+            {
+                "roles": ["responder_interconsultas"],
+                "days": ["sabado"],
+                "moments": ["noche"],
+                "weekly_hours": "menos_de_1",
+                "timezone": "otra",
+                "timezone_other": "Japón",
+            },
+        ),
+    ]:
+        resp = await anon_client.post(
+            f"{SURVEYS}/psicologos/responses", json=_answers(email, **body)
+        )
+        assert resp.status_code == 201, resp.text
+
+    despues = await _get_json(client, url, headers)
+    assert despues["total"] - antes["total"] == 2
+    assert _delta(_by_code(despues["roles"]), _by_code(antes["roles"])) == {
+        "atender_pacientes": 1,
+        "responder_interconsultas": 1,
+        "otra": 1,
+    }
+    assert _delta(_by_code(despues["days"]), _by_code(antes["days"])) == {"lunes": 1, "sabado": 2}
+    assert _delta(_by_code(despues["moments"]), _by_code(antes["moments"])) == {
+        "manana": 1,
+        "noche": 2,
+    }
+    assert _matrix_delta(despues, antes) == {
+        ("lunes", "manana"): 1,
+        ("lunes", "noche"): 1,
+        ("sabado", "manana"): 1,
+        ("sabado", "noche"): 2,
+    }
+    assert _delta(_by_code(despues["weekly_hours"]), _by_code(antes["weekly_hours"])) == {
+        "mas_de_6": 1,
+        "menos_de_1": 1,
+    }
+    assert despues["min_weekly_hours"] - antes["min_weekly_hours"] == 6  # 6 + 0
+    assert _delta(_by_code(despues["timezones"]), _by_code(antes["timezones"])) == {
+        "venezuela": 1,
+        "otra": 1,
+    }
+
+    # Todas las opciones, en el orden del formulario y con la etiqueta de ESTA encuesta, aunque
+    # tengan 0; y la matriz con una fila por día y una columna por momento.
+    survey = marketing_service.SURVEYS["psicologos"]
+    assert [(o["code"], o["label"]) for o in despues["roles"]] == list(survey.roles.items())
+    assert [o["code"] for o in despues["days"]] == list(marketing_service.DAYS)
+    assert [o["code"] for o in despues["weekly_hours"]] == list(marketing_service.WEEKLY_HOURS)
+    assert [o["code"] for o in despues["timezones"]] == list(marketing_service.TIMEZONES)
+    assert len(despues["availability"]) == len(marketing_service.DAYS)
+    assert {len(row) for row in despues["availability"]} == {len(marketing_service.MOMENTS)}
+    assert despues["filters"] == []
+
+
+async def test_graficos_por_forma_de_participar_solo_cuentan_a_quienes_la_marcaron(
+    client: AsyncClient, anon_client: AsyncClient, super_admin
+) -> None:
+    """La cobertura para organizar turnos es la de quienes van a atender, no la de toda la
+    encuesta: con `role`, quien solo responde interconsultas no suma."""
+    headers = auth_headers(super_admin.id)
+    url = f"{SURVEYS}/especialistas/stats"
+    params = {"role": "atender_pacientes"}
+    antes = await _get_json(client, url, headers, **params)
+
+    marker = _marker()
+    await anon_client.post(
+        f"{SURVEYS}/especialistas/responses",
+        json=_answers(
+            f"{marker}-atiende@example.com",
+            roles=["atender_pacientes", "coordinar_especialidad"],
+            days=["domingo"],
+            moments=["tarde"],
+            weekly_hours="entre_3_y_6",
+        ),
+    )
+    await anon_client.post(
+        f"{SURVEYS}/especialistas/responses",
+        json=_answers(
+            f"{marker}-responde@example.com",
+            roles=["responder_interconsultas"],
+            days=["domingo"],
+            moments=["tarde"],
+            weekly_hours="mas_de_6",
+        ),
+    )
+
+    despues = await _get_json(client, url, headers, **params)
+    assert despues["total"] - antes["total"] == 1
+    assert _delta(_by_code(despues["roles"]), _by_code(antes["roles"])) == {
+        "atender_pacientes": 1,
+        "coordinar_especialidad": 1,
+    }
+    assert _matrix_delta(despues, antes) == {("domingo", "tarde"): 1}
+    assert despues["min_weekly_hours"] - antes["min_weekly_hours"] == 3
+    assert despues["filters"] == [
+        ["Cómo quieren participar", "Atender pacientes directamente en mi especialidad"]
+    ]
+
+
+@pytest.mark.parametrize(
+    ("survey", "role"),
+    [
+        ("psicologos", "pedir_interconsultas"),  # existe, pero en médicos generales
+        ("especialistas", "cualquiera"),
+    ],
+)
+async def test_graficos_con_una_forma_de_participar_ajena_dan_422(
+    client: AsyncClient, super_admin, survey: str, role: str
+) -> None:
+    resp = await client.get(
+        f"{SURVEYS}/{survey}/stats", headers=auth_headers(super_admin.id), params={"role": role}
+    )
+    assert resp.status_code == 422, resp.text
+    assert role in resp.json()["detail"]
+
+
+async def test_graficos_de_medicos_generales_no_traen_ubicacion_y_filtran_por_fecha(
+    client: AsyncClient, anon_client: AsyncClient, super_admin
+) -> None:
+    headers = auth_headers(super_admin.id)
+    await anon_client.post(
+        f"{SURVEYS}/medicos-generales/responses", json=_answers(f"{_marker()}@example.com")
+    )
+    hoy = to_local(datetime.now(UTC)).date()
+
+    body = await _get_json(client, f"{SURVEYS}/medicos-generales/stats", headers)
+    assert body["timezones"] is None
+    assert body["total"] >= 1
+
+    manana = str(hoy + timedelta(days=1))
+    futuro = await _get_json(
+        client, f"{SURVEYS}/medicos-generales/stats", headers, answered_from=manana
+    )
+    assert futuro["total"] == 0
+    assert futuro["min_weekly_hours"] == 0
+    assert all(o["count"] == 0 for o in futuro["roles"])
+    assert all(n == 0 for row in futuro["availability"] for n in row)
+    assert futuro["filters"] == [["Respondieron desde", manana]]
+
+
+def test_cada_rango_de_horas_tiene_su_piso() -> None:
+    """Las horas mínimas suman `WEEKLY_HOURS_FLOOR.get(código, 0)`: un rango nuevo en el
+    formulario sin su piso contaría 0 horas en silencio, y el total bajaría sin que se note."""
+    assert set(marketing_service.WEEKLY_HOURS_FLOOR) == set(marketing_service.WEEKLY_HOURS)
+
+
+def test_opcion_retirada_sigue_contando_al_final_con_su_codigo() -> None:
+    """Si mañana se retira una opción, los gráficos no pueden esconder a quienes ya la marcaron."""
+    ordered = marketing_service._ordered({"noche": 2, "madrugada": 1}, marketing_service.MOMENTS)
+    assert [(o.code, o.label, o.count) for o in ordered] == [
+        ("manana", "Mañana", 0),
+        ("tarde", "Tarde", 0),
+        ("noche", "Noche", 2),
+        ("variable", "Es variable", 0),
+        ("madrugada", "madrugada", 1),
+    ]
+
+
 # --- Migración del permiso ----------------------------------------------------
 
 
