@@ -518,7 +518,8 @@ falta el permiso. Se autoriza por **permiso**, no por rol.
 
 - **`marketing.read` también es exclusivo de `super_admin`** (migración
   `20260912_191154_seed_marketing_read_permission.sql`): da el listado y el Excel de las respuestas
-  a las encuestas de marketing, que es la lista de correos de quienes respondieron. Cada exportación
+  a las encuestas de marketing, que es la lista de correos de quienes respondieron, y sus totales y
+  gráficos (agregados, sin correos). Cada exportación
   queda en `audit_log` como `report.exported` con `report = marketing-<encuesta>`. Si el equipo de
   marketing usa cuentas `admin`, basta una migración que añada ese mapeo.
 
@@ -569,6 +570,8 @@ protege el endpoint con `require_permission("...")`. Nunca lo insertes a mano.
 | `GET`   | `/reports/doctors/export` · `/reports/patients/export` | El reporte completo en `.xlsx` (mismos filtros, sin `limit`; auditado) |
 | `POST`  | `/marketing/surveys/{survey}/responses` | Responder una encuesta de marketing (**público**, rate limit `SURVEY_RESPONSE_RATE_LIMIT`). `survey` = `psicologos` · `especialistas` · `medicos-generales`; responder de nuevo con el mismo correo reemplaza la respuesta |
 | `GET`   | `/marketing/surveys/{survey}/responses` · `.../export` | Respuestas de una encuesta: vista previa paginada y `.xlsx` auditado (`marketing.read`) |
+| `GET`   | `/marketing/surveys` | Total de respuestas de cada encuesta, para las pestañas del panel (`marketing.read`) |
+| `GET`   | `/marketing/surveys/{survey}/stats` | Agregados para los gráficos: cobertura día × momento, formas de participar, horas (y horas mínimas), ubicación; filtros de fecha y `role` (`marketing.read`) |
 
 ## Concurrencia: toma de cola anti-colisión
 
