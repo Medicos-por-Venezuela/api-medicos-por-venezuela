@@ -888,6 +888,12 @@ async def test_graficos_de_medicos_generales_no_traen_ubicacion_y_filtran_por_fe
     assert futuro["filters"] == [["Respondieron desde", manana]]
 
 
+def test_cada_rango_de_horas_tiene_su_piso() -> None:
+    """Las horas mínimas suman `WEEKLY_HOURS_FLOOR.get(código, 0)`: un rango nuevo en el
+    formulario sin su piso contaría 0 horas en silencio, y el total bajaría sin que se note."""
+    assert set(marketing_service.WEEKLY_HOURS_FLOOR) == set(marketing_service.WEEKLY_HOURS)
+
+
 def test_opcion_retirada_sigue_contando_al_final_con_su_codigo() -> None:
     """Si mañana se retira una opción, los gráficos no pueden esconder a quienes ya la marcaron."""
     ordered = marketing_service._ordered({"noche": 2, "madrugada": 1}, marketing_service.MOMENTS)

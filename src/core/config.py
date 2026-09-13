@@ -7,6 +7,7 @@ El driver es asíncrono (asyncpg), así que la URL usa el esquema postgresql+asy
 """
 
 import ssl
+from datetime import date
 from functools import lru_cache
 from typing import Any
 from urllib.parse import quote_plus
@@ -142,6 +143,20 @@ class Settings(BaseSettings):
     # base es localhost, y un correo enviado desde una máquina de desarrollo —que con token de
     # Mailtrap sale de verdad— llegaría con el logotipo roto.
     MAIL_LOGO_URL: str = "https://medicosporvenezuela.org/brand/logo-white-email.png"
+
+    # --- Kit (correo masivo de las encuestas de marketing) ---
+    # Clave de la API v4 de Kit (Kit → Settings → Developer). Solo LEE las métricas de los
+    # envíos —enviados, aperturas, clics, bajas— para cruzarlas con las respuestas en el panel.
+    # Vacía, el panel muestra solo lo que sabe la plataforma, sin error. Nunca se loguea ni sale
+    # del backend: da acceso a la cuenta de Kit, incluida la lista de suscriptores.
+    KIT_API_KEY: str = ""
+    KIT_API_BASE_URL: str = "https://api.kit.com/v4"
+    # Cuánto se reutilizan las métricas de Kit antes de volver a pedirlas. Cambian despacio (las
+    # aperturas llegan a lo largo de horas) y cada carga del panel son varias peticiones a Kit.
+    KIT_STATS_CACHE_SECONDS: int = 300
+    # Solo cuentan los envíos de Kit desde este día (hora de Venezuela): las encuestas salieron el
+    # 12 de septiembre de 2026, y lo anterior de la cuenta no es de esta campaña.
+    MARKETING_CAMPAIGNS_SINCE: date = date(2026, 9, 1)
 
     # --- CORS ---
     BACKEND_CORS_ORIGINS: str = "*"
