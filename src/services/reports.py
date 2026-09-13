@@ -839,9 +839,23 @@ def build_workbook(report: Report, *, title: str, sheet_name: str, generated_by:
     `constant_memory` escribe fila a fila al archivo en vez de retener la hoja entera: con él un
     export grande no depende de que quepa en RAM. A cambio las filas deben escribirse en orden
     (lo están) y el ancho de columna hay que fijarlo antes de escribirlas (también).
+
+    `strings_to_formulas` y `strings_to_urls` van en False porque las celdas traen texto escrito
+    por terceros (la descripción de un paciente, las notas de una encuesta pública, hasta la
+    búsqueda de la portada). Por defecto xlsxwriter escribe como FÓRMULA cualquier texto que
+    empiece por `=`: un `=HYPERLINK("https://…";"Ver caso")` metido en un formulario público
+    llegaba al Excel del super_admin como un enlace activo. Con esto todo se escribe como texto.
     """
     buffer = BytesIO()
-    book = xlsxwriter.Workbook(buffer, {"in_memory": True, "constant_memory": True})
+    book = xlsxwriter.Workbook(
+        buffer,
+        {
+            "in_memory": True,
+            "constant_memory": True,
+            "strings_to_formulas": False,
+            "strings_to_urls": False,
+        },
+    )
     header_fmt = book.add_format(
         {"bold": True, "bg_color": "#0f172a", "font_color": "#ffffff", "border": 1}
     )

@@ -659,6 +659,29 @@ async def test_export_sin_resultados_produce_un_libro_abrible(
         assert book.testzip() is None
 
 
+async def test_export_escribe_como_texto_lo_que_parece_una_formula(
+    client: AsyncClient, super_admin, db_session: AsyncSession
+) -> None:
+    """La descripción la escribe el paciente en el alta PÚBLICA, y la búsqueda de la portada la
+    teclea quien exporta. xlsxwriter, por defecto, escribe como fórmula todo texto que empiece por
+    `=`: el Excel de un super_admin acababa con un `=HYPERLINK(...)` activo que puso un tercero."""
+    marker = f"rep{uuid.uuid4().hex[:8]}"
+    await _seed_patient(
+        db_session, marker, description='=HYPERLINK("https://phishing.example","Ver caso")'
+    )
+
+    resp = await client.get(
+        f"{PREFIX}/reports/patients/export",
+        headers=auth_headers(super_admin.id),
+        params={"search": marker},
+    )
+    assert resp.status_code == 200, resp.text
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as book:
+        hojas = [book.read(n).decode("utf-8") for n in book.namelist() if "worksheets/" in n]
+    assert all("<f>" not in hoja for hoja in hojas), "una celda se escribió como fórmula"
+    assert "=HYPERLINK(" in _shared_strings(resp.content)
+
+
 # --- Hora de Venezuela --------------------------------------------------------
 
 
