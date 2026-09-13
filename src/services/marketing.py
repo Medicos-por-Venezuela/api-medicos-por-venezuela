@@ -2,7 +2,8 @@
 
 Tres encuestas de re-targeting —psicólogos, especialistas y médicos generales— que se mandan por
 correo masivo con un enlace a `/encuesta/<slug>?email=<correo>`. Este módulo guarda lo que contesta
-cada médico y se lo sirve al panel (módulo Marketing) como listado y como Excel.
+cada médico y se lo sirve al panel (módulo Marketing) como listado, como Excel y como los agregados
+de la pestaña de gráficos.
 
 Cuatro decisiones que sostienen el módulo:
 
@@ -31,7 +32,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import ColumnElement, Select, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -369,17 +370,24 @@ def response_row(survey: Survey, r: MarketingSurveyResponse, columns: tuple[Colu
     return {column.key: values[column.key] for column in columns}
 
 
-def responses_query(survey_slug: str, filters: ResponseFilters) -> Select:
-    """Consulta del listado. ÚNICA definición de los filtros: la comparten la vista previa y la
-    exportación, así que el Excel trae exactamente lo que enseña la tabla."""
-    stmt = select(MarketingSurveyResponse).where(MarketingSurveyResponse.survey == survey_slug)
+def response_conditions(survey_slug: str, filters: ResponseFilters) -> list[ColumnElement[bool]]:
+    """ÚNICA definición de los filtros: la comparten la vista previa, la exportación y los
+    gráficos, así que el Excel trae exactamente lo que enseña la tabla y un gráfico con las mismas
+    fechas cuenta las mismas respuestas."""
+    conditions = [MarketingSurveyResponse.survey == survey_slug]
     if filters.search and (term := filters.search.strip()):
-        stmt = stmt.where(MarketingSurveyResponse.email.ilike(f"%{term}%"))
+        conditions.append(MarketingSurveyResponse.email.ilike(f"%{term}%"))
     start, end = day_bounds(filters.answered_from, filters.answered_to)
     if start is not None:
-        stmt = stmt.where(MarketingSurveyResponse.updated_at >= start)
+        conditions.append(MarketingSurveyResponse.updated_at >= start)
     if end is not None:
-        stmt = stmt.where(MarketingSurveyResponse.updated_at < end)
+        conditions.append(MarketingSurveyResponse.updated_at < end)
+    return conditions
+
+
+def responses_query(survey_slug: str, filters: ResponseFilters) -> Select:
+    """Consulta del listado."""
+    stmt = select(MarketingSurveyResponse).where(*response_conditions(survey_slug, filters))
     # La respuesta más reciente primero, con el id de desempate: sin él, dos respuestas del mismo
     # instante pueden repetirse u omitirse entre páginas.
     return stmt.order_by(MarketingSurveyResponse.updated_at.desc(), MarketingSurveyResponse.id)
@@ -431,4 +439,158 @@ async def export_responses(
     )
     return build_workbook(
         report, title=survey.title, sheet_name=survey.sheet_name, generated_by=actor_label
+    )
+
+
+# --- Totales y gráficos (panel) -----------------------------------------------
+
+# Piso de cada rango de horas. Sumarlo da las horas semanales que, COMO MÍNIMO, ofrecen quienes
+# respondieron. Un piso y no un punto medio a propósito: "más de 6" no tiene techo, y para
+# organizar la cobertura es mejor quedarse corto que contar con horas que nadie prometió.
+WEEKLY_HOURS_FLOOR = {"menos_de_1": 0, "entre_1_y_3": 1, "entre_3_y_6": 3, "mas_de_6": 6}
+
+
+@dataclass(frozen=True)
+class SurveyTotal:
+    survey: str
+    total: int
+
+
+@dataclass(frozen=True)
+class OptionCount:
+    """Cuántas respuestas marcaron una opción."""
+
+    code: str
+    label: str
+    count: int
+
+
+@dataclass(frozen=True)
+class SurveyStats:
+    """Los agregados de una encuesta para la pestaña de gráficos.
+
+    `availability[i][j]` cuenta las respuestas que marcaron el día `days[i]` Y el momento
+    `moments[j]`. Son dos preguntas independientes (el formulario no pide "lunes por la mañana"),
+    así que es cobertura POSIBLE: quien marcó lunes y sábado, mañana y noche, cuenta en las cuatro
+    celdas. Por lo mismo, sumar una fila no da cuántos marcaron ese día: eso es `days`.
+    """
+
+    survey: str
+    total: int
+    filters: list[tuple[str, str]]
+    roles: list[OptionCount]
+    days: list[OptionCount]
+    moments: list[OptionCount]
+    availability: list[list[int]]
+    weekly_hours: list[OptionCount]
+    min_weekly_hours: int
+    timezones: list[OptionCount] | None
+
+
+async def survey_totals(session: AsyncSession) -> list[SurveyTotal]:
+    """Respuestas de cada encuesta, sin filtros, en el orden de las pestañas. Una encuesta sin
+    respuestas sale con 0 en vez de faltar: la pestaña tiene que decir "(0)", no quedarse muda."""
+    rows = await session.execute(
+        select(MarketingSurveyResponse.survey, func.count()).group_by(
+            MarketingSurveyResponse.survey
+        )
+    )
+    counts = {slug: n for slug, n in rows.tuples()}
+    return [SurveyTotal(survey=slug, total=counts.get(slug, 0)) for slug in SURVEYS]
+
+
+def _ordered(counts: dict[str, int], labels: dict[str, str]) -> list[OptionCount]:
+    """Todas las opciones de la pregunta en el orden del formulario, también las que nadie marcó:
+    que nadie ofrezca los domingos también es un dato para decidir. Un código retirado que siga en
+    respuestas viejas va al final con el código como etiqueta, igual que en el listado."""
+    known = [OptionCount(code, label, counts.get(code, 0)) for code, label in labels.items()]
+    retired = [OptionCount(code, code, n) for code, n in counts.items() if code not in labels]
+    return known + retired
+
+
+async def _count_by(
+    session: AsyncSession, column, conditions: list[ColumnElement[bool]]
+) -> dict[str, int]:
+    """Respuestas por valor de una pregunta de respuesta única."""
+    rows = await session.execute(select(column, func.count()).where(*conditions).group_by(column))
+    return {code: n for code, n in rows.tuples() if code is not None}
+
+
+async def _count_marked(
+    session: AsyncSession, column, conditions: list[ColumnElement[bool]]
+) -> dict[str, int]:
+    """Respuestas que marcaron cada opción de una pregunta de varias opciones. No hay repetidos
+    dentro de una respuesta (`_codes` los quita al guardar), así que cada fila cuenta una vez."""
+    marked = select(func.unnest(column).label("code")).where(*conditions).subquery()
+    rows = await session.execute(select(marked.c.code, func.count()).group_by(marked.c.code))
+    return {code: n for code, n in rows.tuples()}
+
+
+async def _count_day_moment(
+    session: AsyncSession, conditions: list[ColumnElement[bool]]
+) -> dict[tuple[str, str], int]:
+    """Respuestas por par (día, momento). Se despliega en dos pasos porque dos `unnest` en la misma
+    lista de SELECT no se combinan: Postgres los recorre a la par, como un zip."""
+    by_day = (
+        select(
+            func.unnest(MarketingSurveyResponse.days).label("day"),
+            MarketingSurveyResponse.moments.label("moments"),
+        )
+        .where(*conditions)
+        .subquery()
+    )
+    pairs = select(by_day.c.day, func.unnest(by_day.c.moments).label("moment")).subquery()
+    rows = await session.execute(
+        select(pairs.c.day, pairs.c.moment, func.count()).group_by(pairs.c.day, pairs.c.moment)
+    )
+    return {(day, moment): n for day, moment, n in rows.tuples()}
+
+
+async def survey_stats(
+    session: AsyncSession,
+    survey_slug: str,
+    filters: ResponseFilters,
+    *,
+    role: str | None = None,
+) -> SurveyStats:
+    """Los agregados de una encuesta, con los mismos filtros de fecha que el listado.
+
+    `role` acota a quienes marcaron esa forma de participar: la cobertura que importa para
+    organizar turnos es la de quienes van a atender pacientes, no la de toda la encuesta."""
+    survey = SURVEYS[survey_slug]
+    conditions = response_conditions(survey.slug, filters)
+    described = describe_response_filters(filters)
+    if role is not None:
+        _code(role, survey.roles, "Cómo quieren participar")
+        conditions.append(MarketingSurveyResponse.roles.any(role))
+        described.append(("Cómo quieren participar", survey.roles[role]))
+
+    total = await session.scalar(
+        select(func.count()).select_from(MarketingSurveyResponse).where(*conditions)
+    )
+    hours = await _count_by(session, MarketingSurveyResponse.weekly_hours, conditions)
+    pairs = await _count_day_moment(session, conditions)
+    timezones = None
+    if survey.asks_timezone:
+        timezones = _ordered(
+            await _count_by(session, MarketingSurveyResponse.timezone, conditions), TIMEZONES
+        )
+
+    return SurveyStats(
+        survey=survey.slug,
+        total=total or 0,
+        filters=described,
+        roles=_ordered(
+            await _count_marked(session, MarketingSurveyResponse.roles, conditions), survey.roles
+        ),
+        days=_ordered(
+            await _count_marked(session, MarketingSurveyResponse.days, conditions), DAYS
+        ),
+        moments=_ordered(
+            await _count_marked(session, MarketingSurveyResponse.moments, conditions), MOMENTS
+        ),
+        availability=[[pairs.get((day, moment), 0) for moment in MOMENTS] for day in DAYS],
+        weekly_hours=_ordered(hours, WEEKLY_HOURS),
+        min_weekly_hours=sum(WEEKLY_HOURS_FLOOR.get(code, 0) * n for code, n in hours.items()),
+        timezones=timezones,
     )
