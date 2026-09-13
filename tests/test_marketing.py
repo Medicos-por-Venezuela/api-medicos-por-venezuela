@@ -5,8 +5,8 @@ Tres cosas que estas pruebas defienden por encima del resto:
 1. **Una respuesta por persona y encuesta.** Responder otra vez reemplaza la fila, también cuando
    llegan dos envíos a la vez; el mismo correo en OTRA encuesta es otra fila.
 2. **El backend exige lo que exige el formulario y descarta lo que no preguntó.** El endpoint es
-   público: el formulario no es la única puerta, así que la disponibilidad de quien quiere atender
-   o la zona horaria de un psicólogo no pueden depender de que el JavaScript haya validado.
+   público: el formulario no es la única puerta, así que la disponibilidad o la zona horaria de un
+   psicólogo no pueden depender de que el JavaScript haya validado.
 3. **Leer y exportar es solo de super_admin** (`marketing.read`), y el Excel escribe como TEXTO lo
    que tecleó un tercero aunque parezca una fórmula.
 
@@ -224,11 +224,13 @@ async def test_psicologos_exigen_disponibilidad_y_ubicacion(
     assert mensaje in resp.json()["detail"]
 
 
-async def test_medico_general_que_solo_pide_interconsultas_no_guarda_disponibilidad(
+async def test_medico_general_que_solo_pide_interconsultas_guarda_su_disponibilidad(
     anon_client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """Quien solo va a pedir interconsultas no ve las preguntas de disponibilidad: si llegan igual
-    (un formulario viejo, un envío a mano), se descartan en vez de guardar horarios que no dio."""
+    """El formulario de médicos generales se enseña completo: quien solo va a pedir interconsultas
+    también contesta la disponibilidad, y se guarda. Al principio se descartaba —la sección solo
+    aparecía al marcar atender, liderar u "Otra"—, y con el formulario completo eso borraría en
+    silencio lo que la persona acaba de escribir."""
     email = f"{_marker()}@example.com"
     resp = await anon_client.post(
         f"{SURVEYS}/medicos-generales/responses",
@@ -240,22 +242,26 @@ async def test_medico_general_que_solo_pide_interconsultas_no_guarda_disponibili
 
     [fila] = await _stored(db_session, "medicos-generales", email)
     assert fila.roles == ["pedir_interconsultas"]
-    assert fila.moments == [] and fila.days == []
-    assert fila.weekly_hours is None and fila.availability_notes is None
+    assert fila.moments == ["noche"]
+    assert fila.days == ["martes", "jueves"]
+    assert fila.weekly_hours == "entre_1_y_3"
+    assert fila.availability_notes == "Lunes"
     # Esta encuesta no pregunta dónde está: la zona que llegó se descarta.
     assert fila.timezone is None
     assert fila.notes == "Gracias"
 
 
-async def test_medico_general_que_quiere_atender_debe_dar_su_disponibilidad(
-    anon_client: AsyncClient,
+@pytest.mark.parametrize(
+    "roles", [["pedir_interconsultas"], ["pedir_interconsultas", "atender_pacientes"]]
+)
+async def test_medico_general_sin_disponibilidad_da_422(
+    anon_client: AsyncClient, roles: list[str]
 ) -> None:
+    """La disponibilidad es obligatoria en médicos generales marque lo que marque, igual que en
+    las otras dos encuestas."""
     resp = await anon_client.post(
         f"{SURVEYS}/medicos-generales/responses",
-        json={
-            "email": f"{_marker()}@example.com",
-            "roles": ["pedir_interconsultas", "atender_pacientes"],
-        },
+        json={"email": f"{_marker()}@example.com", "roles": roles},
     )
     assert resp.status_code == 422, resp.text
     assert "momento del día" in resp.json()["detail"]
