@@ -290,8 +290,9 @@ async def test_medico_general_sin_zona_horaria_es_valido(
 async def test_textos_de_opciones_no_marcadas_se_descartan(
     anon_client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """El texto de "Otra" solo se guarda si marcó "Otra"; el de "rol más activo" solo existe en
-    médicos generales; y "Otra ubicación" solo si eligió la zona "Otra"."""
+    """El texto de "Otra" solo se guarda si marcó "Otra", y el de "rol más activo" solo existe en
+    médicos generales. La ubicación escrita es distinta: su campo se ve siempre bajo el selector,
+    así que se guarda elija lo que elija (precisar "Maracaibo" tras elegir Venezuela es válido)."""
     sin_marcar = f"{_marker()}@example.com"
     resp = await anon_client.post(
         f"{SURVEYS}/psicologos/responses",
@@ -299,14 +300,15 @@ async def test_textos_de_opciones_no_marcadas_se_descartan(
             sin_marcar,
             role_other_detail="No marcó otra",
             role_active_detail="No existe en esta encuesta",
-            timezone_other="Marte",
+            timezone_other="Maracaibo",
         ),
     )
     assert resp.status_code == 201, resp.text
     [fila] = await _stored(db_session, "psicologos", sin_marcar)
     assert fila.role_other_detail is None
     assert fila.role_active_detail is None
-    assert fila.timezone_other is None
+    assert fila.timezone == "venezuela"
+    assert fila.timezone_other == "Maracaibo"
 
     marcadas = f"{_marker()}@example.com"
     resp = await anon_client.post(

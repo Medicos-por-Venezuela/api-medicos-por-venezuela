@@ -233,8 +233,10 @@ def normalize_response(survey: Survey, payload: SurveyResponseCreate) -> dict:
         timezone = _code(payload.timezone, TIMEZONES, "Dónde estás")
         if timezone is None:
             raise UnprocessableError("Elige tu país o zona horaria.")
-        if timezone == OTHER:
-            timezone_other = _text(payload.timezone_other)
+        # Se guarda aunque no haya elegido "Otra": el campo de texto está siempre a la vista bajo
+        # el selector (así lo pide el diseño), y quien elige "Venezuela" y escribe "Maracaibo" está
+        # precisando, no equivocándose. Descartarlo borraría en silencio lo que escribió.
+        timezone_other = _text(payload.timezone_other)
 
     return {
         "survey": survey.slug,
