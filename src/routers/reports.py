@@ -53,7 +53,11 @@ _TOO_MANY = {
 _FORBIDDEN = {403: {"description": "Requiere el permiso `reports.export` (solo super_admin)."}}
 
 
-def _preview(report: reports_service.Report) -> ReportPreview:
+# Los cuatro helpers de abajo son públicos porque los reutiliza el listado de respuestas de las
+# encuestas (routers/marketing.py), que expone el mismo contrato: vista previa + `.xlsx` auditado.
+
+
+def report_preview(report: reports_service.Report) -> ReportPreview:
     """`Report` (dominio) -> `ReportPreview` (contrato HTTP)."""
     return ReportPreview(
         columns=[c for c in report.columns],
@@ -63,7 +67,7 @@ def _preview(report: reports_service.Report) -> ReportPreview:
     )
 
 
-def _xlsx(content: bytes, filename: str) -> Response:
+def xlsx_download(content: bytes, filename: str) -> Response:
     """Devuelve los bytes del libro como descarga.
 
     `Response` y no `StreamingResponse`: el archivo ya está completo en memoria (xlsxwriter no
@@ -77,14 +81,14 @@ def _xlsx(content: bytes, filename: str) -> Response:
     )
 
 
-def _actor(principal: Principal) -> dict:
+def export_actor(principal: Principal) -> dict:
     """Quién exporta, en datos planos: el servicio audita y firma la portada sin conocer
     `Principal` (la capa de negocio no sabe de autenticación). El email es la etiqueta legible;
     si la cuenta no tiene, cae al id — la portada nunca queda sin firmar."""
     return {"actor_user_id": principal.id, "actor_label": principal.email or str(principal.id)}
 
 
-def _filename(prefix: str) -> str:
+def export_filename(prefix: str) -> str:
     """`medicos-2026-09-03.xlsx`, con la fecha del día **en Venezuela** y no en UTC: a las 21:00
     de Caracas ya es el día siguiente en UTC, y el archivo llevaría la fecha de mañana."""
     return f"{prefix}-{to_local(datetime.now(UTC)):%Y-%m-%d}.xlsx"
@@ -252,7 +256,7 @@ async def preview_doctors_report(
     credencial (`Habilitado para atender` + `Motivo de bloqueo`, mismo criterio que el gate de
     acceso de los médicos) y su actividad (consultas asignadas, cerradas y última)."""
     report = await reports_service.doctors_report(db, filters, skip=skip, limit=limit)
-    return _preview(report)
+    return report_preview(report)
 
 
 @router.get(
@@ -283,9 +287,9 @@ async def export_doctors_report(
     Queda registrado en `audit_log` como `report.exported`: es una extracción de PII médica de
     miles de personas a un archivo que sale de la plataforma, y quién la hizo debe ser
     reconstruible."""
-    return _xlsx(
-        await reports_service.export_doctors(db, filters, **_actor(principal)),
-        _filename("medicos"),
+    return xlsx_download(
+        await reports_service.export_doctors(db, filters, **export_actor(principal)),
+        export_filename("medicos"),
     )
 
 
@@ -313,7 +317,7 @@ async def preview_patients_report(
     (cuántos, cuántos cerrados, y el estado del último — que es lo que dice si ese paciente
     sigue esperando)."""
     report = await reports_service.patients_report(db, filters, skip=skip, limit=limit)
-    return _preview(report)
+    return report_preview(report)
 
 
 @router.get(
@@ -339,9 +343,9 @@ async def export_patients_report(
 
     Incluye alergias, descripción del caso y teléfono: es la extracción de PII médica más
     sensible de la API. Queda en `audit_log` como `report.exported`."""
-    return _xlsx(
-        await reports_service.export_patients(db, filters, **_actor(principal)),
-        _filename("pacientes"),
+    return xlsx_download(
+        await reports_service.export_patients(db, filters, **export_actor(principal)),
+        export_filename("pacientes"),
     )
 
 
@@ -373,7 +377,7 @@ async def preview_consultations_report(
     (`GET /consultations` solo acepta un `status` a la vez), mientras que esto es una sola
     consulta sin tope por estado."""
     report = await reports_service.consultations_report(db, filters, skip=skip, limit=limit)
-    return _preview(report)
+    return report_preview(report)
 
 
 @router.get(
@@ -400,7 +404,7 @@ async def export_consultations_report(
 
     Incluye el motivo de consulta, que es contenido clínico escrito por el paciente. Queda
     registrado en `audit_log` como `report.exported`."""
-    return _xlsx(
-        await reports_service.export_consultations(db, filters, **_actor(principal)),
-        _filename("consultas"),
+    return xlsx_download(
+        await reports_service.export_consultations(db, filters, **export_actor(principal)),
+        export_filename("consultas"),
     )
