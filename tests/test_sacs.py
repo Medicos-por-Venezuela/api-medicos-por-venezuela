@@ -7,7 +7,9 @@ de red en CI y no consumir el servicio externo en cada ejecución.
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import pytest
 
+from src.schemas.sacs import NO_ENCONTRADO, SERVICIO_NO_DISPONIBLE
 from src.services.sacs import verificar_sacs
 
 PREFIX = "/api/v1/verificacion-sacs"
@@ -29,6 +31,15 @@ _XML_SIN_PROFESIONES = (
 _XML_NO_EXISTE = (
     """xajax_userTable('""')"""
     """xajax_tableProfesion('[]')"""
+)
+# Cuerpo real (HTTP 200) que devolvió el SACS el 2026-09-14 para una cédula que no está: oculta
+# las dos tablas y avisa, sin llamar a xajax_userTable. No repite la cédula consultada.
+_XML_NO_REGISTRADA = (
+    '<?xml version="1.0" encoding="UTF-8" ?><xjx>'
+    """<cmd n="js"><![CDATA[$('#divTablaProfesiones').hide();]]></cmd>"""
+    """<cmd n="js"><![CDATA[$('#divTabla').hide();]]></cmd>"""
+    """<cmd n="js"><![CDATA[Swal.fire({title: 'Información', text: 'LA CÉDULA O MATRÍCULA NO """
+    """CORRESPONDE CON EL TIPO DE BÚSQUEDA', icon: 'info'});]]></cmd></xjx>"""
 )
 
 
@@ -108,11 +119,38 @@ async def test_sacs_normaliza_mayusculas_y_espacios():
     assert result.encontrado is True
 
 
-async def test_sacs_respuesta_inesperada():
-    with _mock_httpx("<html>Error del servidor</html>"):
+async def test_sacs_no_registrada_respuesta_real():
+    """El SACS no dice "no existe" con datos vacíos: oculta las tablas. Antes esto caía en
+    "Respuesta inesperada" y al médico le llegaba el correo de "servicio no disponible"."""
+    with _mock_httpx(_XML_NO_REGISTRADA):
+        result = await verificar_sacs("V-99999999")
+
+    assert result.encontrado is False
+    assert result.error_kind == NO_ENCONTRADO
+    assert "no está registrada" in (result.error or "")
+
+
+@pytest.mark.parametrize(
+    "xml_text",
+    [
+        "<html>Error del servidor</html>",
+        '<?xml version="1.0" encoding="UTF-8" ?><xjx></xjx>',
+        # Solo una de las dos tablas oculta.
+        """<xjx><cmd n="js"><![CDATA[$('#divTabla').hide();]]></cmd></xjx>""",
+        # Los mismos scripts fuera de una respuesta xajax (p.ej. la página HTML entera).
+        "<html><script>$('#divTablaProfesiones').hide();$('#divTabla').hide();</script></html>",
+        # Tablas ocultas pero con datos a medias: no es un "no está".
+        """<xjx><cmd n="js"><![CDATA[$('#divTablaProfesiones').hide();$('#divTabla').hide();"""
+        """xajax_userTable('{"nombre1":"JUAN"}')]]></cmd></xjx>""",
+    ],
+    ids=["html", "xjx_vacio", "una_tabla", "sin_sobre_xjx", "user_sin_profesion"],
+)
+async def test_sacs_respuesta_inesperada(xml_text):
+    with _mock_httpx(xml_text):
         result = await verificar_sacs("V-12345678")
 
     assert result.encontrado is False
+    assert result.error_kind == SERVICIO_NO_DISPONIBLE
     assert "inesperada" in (result.error or "")
 
 
