@@ -83,6 +83,27 @@ si `src/services/doctors.py::has_valid_credential` es cierto: ficha en `doctors`
   `/auth/me*`. Son la vía de salida del limbo; si las cierras, el médico queda en una trampa sin
   salida. Van por `get_current_principal`, no por `require_permission`.
 
+## 🧱 La RLS de Supabase dice lo mismo que esta API
+La API entra como dueña y se salta la RLS, pero el navegador tiene el anon key y su JWT: lo que la
+RLS permita, se puede leer por PostgREST sin pasar por aquí. Hasta 2026-09-14 cualquier cuenta con
+`users.role = 'doctor'` —con ficha o sin ella— leía TODOS los pacientes así, aunque esta API ya la
+bloqueara. Desde la migración `20260914_111456`:
+- `current_user_role()` exige al médico ficha habilitada (`public.doctor_can_practice`, espejo SQL de
+  `_blocked_reason`; `tests/test_rls_policies.py` falla si divergen). Admin por RBAC, exento.
+- `patients` y `consultation_events`: sin policies ni SELECT para `authenticated`.
+- `consultations`: SELECT solo en `id`, `status`, `assigned_doctor_id` — la señal de Realtime (que
+  respeta privilegios por columna). El paciente ve lo suyo vía `public.owns_patient`.
+- **Regla:** nada nuevo se expone por PostgREST. Si una pantalla necesita datos, van por un endpoint
+  que valide pertenencia. Cambiar el criterio de credencial = cambiar `_blocked_reason` Y
+  `doctor_can_practice` en el mismo PR.
+
+## 🚪 Cuentas de Auth sin registro
+Estar en Supabase Auth no da acceso. `GET /auth/me` expone `has_account_record` (ficha viva en
+`doctors` o paciente vivo en `patients`) y el login del frontend rechaza a quien no lo tiene, salvo
+admins. El alta de médico crea la cuenta antes que la ficha: por eso `POST /doctors/registration-check`
+se consulta ANTES de crear la cuenta, y `create_doctor` rechaza con 409 de dominio un correo o una
+cédula ya registrados antes de llamar al SACS.
+
 ## 🧾 Auditoría inmutable (no repudio)
 Toda acción sensible (asignar/revocar rol, y las que se agreguen) se registra en `audit_log` vía
 `src/services/audit.py::log_action` — **append-only y sin commit propio**: la entrada se persiste en

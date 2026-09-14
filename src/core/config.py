@@ -165,6 +165,10 @@ class Settings(BaseSettings):
     # Storage en memoria por proceso; para varias instancias, usar Redis.
     RATE_LIMIT_ENABLED: bool = True
     DOCTOR_REGISTER_RATE_LIMIT: str = "5/minute"
+    # Chequeo previo del registro de médico (¿correo/cédula ya registrados?). Lo dispara el
+    # formulario al salir del campo de correo y otra vez al enviar, así que necesita más holgura
+    # que el alta; el tope está para frenar a quien quiera recorrer una lista de correos.
+    REGISTRATION_CHECK_RATE_LIMIT: str = "20/minute"
     # Escrituras públicas (alta de paciente y de consulta): sin límite, cualquiera puede
     # inundar la cola con casos falsos que los médicos ven en el panel.
     PUBLIC_WRITE_RATE_LIMIT: str = "10/minute"

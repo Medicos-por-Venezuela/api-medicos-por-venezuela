@@ -1,12 +1,14 @@
 """Pruebas de autenticación (JWT de Supabase) y autorización (RBAC + IDOR)."""
 
+from datetime import UTC, datetime
+
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.profile import Profile
 from src.models.rbac import Role, UserRole
-from tests._helpers import any_specialty_id, auth_headers, make_profile
+from tests._helpers import add_doctor, any_specialty_id, auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -94,6 +96,45 @@ async def test_auth_me_medico_sin_ficha_incluye_contexto(
     body = (await client.get(f"{PREFIX}/auth/me", headers=auth_headers(doctor.id))).json()
     assert body["has_doctor_profile"] is True
     assert body["doctor_cedula"] is None
+
+
+async def test_auth_me_has_account_record(
+    client: AsyncClient, db_session: AsyncSession, admin_identity: Profile
+) -> None:
+    """`has_account_record` = hay ficha viva en `doctors` o paciente vivo en `patients`. Con
+    `false` el login no deja entrar (salvo a un admin): es una cuenta de Auth que el sistema no
+    conoce, típicamente un registro de médico que creó la cuenta y no llegó a guardar la ficha."""
+    medico = await add_doctor(db_session, verified=False)  # sin verificar: tiene ficha igual
+    medico_sin_ficha = make_profile(role="doctor")
+    paciente_sin_registro = make_profile(role="patient")
+    medico_con_ficha_borrada = await add_doctor(db_session, deleted_at=datetime.now(UTC))
+    paciente = make_profile(role="patient")
+    db_session.add_all([medico_sin_ficha, paciente_sin_registro, paciente])
+    await db_session.flush()
+    created = await client.post(
+        f"{PREFIX}/patients",
+        json={
+            "full_name": "Con cuenta",
+            "phone_whatsapp": "+58412111000",
+            "affected_zone": "Caracas",
+            "consent": True,
+            "user_id": str(paciente.id),
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    async def record(user_id) -> bool:
+        body = (await client.get(f"{PREFIX}/auth/me", headers=auth_headers(user_id))).json()
+        return body["has_account_record"]
+
+    assert await record(medico.id) is True
+    assert await record(paciente.id) is True
+    assert await record(medico_sin_ficha.id) is False
+    assert await record(paciente_sin_registro.id) is False
+    assert await record(medico_con_ficha_borrada.id) is False
+    # Es un hecho, no la decisión de acceso: el admin puro tampoco tiene registro (la excepción
+    # la aplica el login).
+    assert await record(admin_identity.id) is False
 
 
 async def test_auth_me_permissions(client: AsyncClient, admin_identity: Profile) -> None:

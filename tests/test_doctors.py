@@ -15,11 +15,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.models.doctor import Doctor
 from src.models.professional_type import ProfessionalType
 from src.models.profile import Profile
+from src.models.rbac import Role, UserRole
 from src.models.specialty import Specialty
 from src.schemas.psicologo import PsicologoVerificationResponse
 from src.schemas.sacs import SacsVerificationResponse
 from src.services.doctors import _normalize
-from tests._helpers import auth_headers, make_profile
+from tests._helpers import add_doctor, auth_headers, make_doctor_row, make_profile
 
 PREFIX = "/api/v1"
 
@@ -265,6 +266,119 @@ async def test_telefono_formato_invalido_422(
     type_id = await _type_id(db_session, "medico")
     resp = await client.post(f"{PREFIX}/doctors", json=_payload(type_id, phone="04145200715"))
     assert resp.status_code == 422
+
+
+async def test_registro_con_correo_de_otro_medico_409_sin_consultar_sacs(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Choca ANTES de verificar: si la ficha no se va a poder guardar, no se llama al SACS, y el
+    409 dice qué pasó en vez del genérico de integridad (el formulario no los distinguía)."""
+    type_id = await _type_id(db_session, "medico")
+    with _mock_sacs():
+        first = await client.post(f"{PREFIX}/doctors", json=_payload(type_id))
+    assert first.status_code == 201, first.text
+    with _mock_sacs() as sacs:
+        resp = await client.post(
+            f"{PREFIX}/doctors",
+            json=_payload(type_id, cedula="V-90000002", email="DR.Prueba@test.com"),
+        )
+    assert resp.status_code == 409
+    assert "correo" in resp.json()["detail"].lower()
+    sacs.assert_not_awaited()
+
+
+async def test_registro_con_cedula_de_otro_medico_409_sin_consultar_sacs(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    type_id = await _type_id(db_session, "medico")
+    with _mock_sacs():
+        first = await client.post(f"{PREFIX}/doctors", json=_payload(type_id))
+    assert first.status_code == 201, first.text
+    with _mock_sacs() as sacs:
+        resp = await client.post(
+            f"{PREFIX}/doctors", json=_payload(type_id, email="otro.medico@test.com")
+        )
+    assert resp.status_code == 409
+    assert "cédula" in resp.json()["detail"]
+    sacs.assert_not_awaited()
+
+
+# --- Chequeo previo al registro (POST /doctors/registration-check) ---
+
+
+async def _check(anon_client: AsyncClient, email: str, cedula: str | None = None) -> dict:
+    body = {"email": email} | ({"cedula": cedula} if cedula else {})
+    resp = await anon_client.post(f"{PREFIX}/doctors/registration-check", json=body)
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+async def test_registration_check_correo_libre(anon_client: AsyncClient) -> None:
+    """Público (sin sesión): lo consulta el formulario antes de crear la cuenta."""
+    body = await _check(anon_client, "nadie.registrado@test.com", "V-90000009")
+    assert body == {"email_status": "available", "cedula_taken": False}
+
+
+async def test_registration_check_medico_ya_registrado(
+    anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Por el correo de la ficha y por el de la cuenta ligada (las fichas backfilleadas no
+    tienen email propio), sin distinguir mayúsculas. Y la cédula de la ficha cuenta como tomada."""
+    con_email = await add_doctor(db_session, email="ficha@test.com", cedula="V-90000010")
+    cuenta = make_profile(role="doctor")
+    cuenta.email = "cuenta.ligada@test.com"
+    db_session.add(cuenta)
+    await db_session.flush()
+    db_session.add(make_doctor_row(cuenta.id, email=None))
+    await db_session.flush()
+
+    assert (await _check(anon_client, "FICHA@test.com"))["email_status"] == "doctor"
+    assert (await _check(anon_client, "cuenta.ligada@test.com"))["email_status"] == "doctor"
+    taken = await _check(anon_client, "otra@test.com", "v-90000010")
+    assert taken == {"email_status": "available", "cedula_taken": True}
+    assert con_email
+
+
+async def test_registration_check_registro_de_medico_a_medias(
+    anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Cuenta de médico que nunca tuvo ficha: el registro se cortó y puede terminarse."""
+    huerfana = make_profile(role="doctor")
+    huerfana.email = "a.medias@test.com"
+    db_session.add(huerfana)
+    await db_session.flush()
+
+    assert (await _check(anon_client, "a.medias@test.com"))["email_status"] == "incomplete"
+
+
+async def test_registration_check_otras_cuentas_no_se_registran_por_aqui(
+    anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """`account`: el correo ya tiene dueño con otro papel, o un admin le dio de baja la ficha
+    (volver a registrarse sería deshacer esa baja por la puerta de atrás)."""
+    paciente = make_profile(role="patient")
+    paciente.email = "paciente@test.com"
+    admin_medico = make_profile(role="doctor")
+    admin_medico.email = "admin.medico@test.com"
+    db_session.add_all([paciente, admin_medico])
+    await db_session.flush()
+    super_admin_id = await db_session.scalar(select(Role.id).where(Role.code == "super_admin"))
+    db_session.add(UserRole(user_id=admin_medico.id, role_id=super_admin_id))
+    dado_de_baja = await add_doctor(db_session, deleted_at=datetime.now(UTC))
+    dado_de_baja.email = "de.baja@test.com"
+    await db_session.flush()
+
+    for email in ("paciente@test.com", "admin.medico@test.com", "de.baja@test.com"):
+        assert (await _check(anon_client, email))["email_status"] == "account", email
+
+
+async def test_registration_check_valida_entrada(anon_client: AsyncClient) -> None:
+    url = f"{PREFIX}/doctors/registration-check"
+    assert (await anon_client.post(url, json={"email": "no-es-correo"})).status_code == 422
+    bad_cedula = {"email": "x@test.com", "cedula": "123"}
+    assert (await anon_client.post(url, json=bad_cedula)).status_code == 422
+    extra = {"email": "x@test.com", "user_id": str(uuid.uuid4())}
+    assert (await anon_client.post(url, json=extra)).status_code == 422
 
 
 # --- CRUD (staff/admin) ---

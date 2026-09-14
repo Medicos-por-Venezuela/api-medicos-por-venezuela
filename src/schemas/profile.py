@@ -57,6 +57,11 @@ class MyProfileResponse(ProfileResponse):
     # si redirige a completar el perfil, sin un segundo round-trip.
     has_doctor_profile: bool = False
     doctor_cedula: str | None = None
+    # La cuenta tiene detrás una ficha viva en `doctors` o un paciente vivo en `patients`. OJO: no
+    # es lo mismo que `has_doctor_profile`, que es true para un médico de Google SIN ficha. Con
+    # `false` el login no deja entrar (salvo a un admin, que no necesita registro): es una cuenta
+    # de Auth que el sistema no conoce.
+    has_account_record: bool = False
     # Roles RBAC efectivos (user_roles; con fallback al legado si la cuenta no tiene filas).
     # `role` se sobreescribe con el EFECTIVO más alto de esta lista — la columna users.role es un
     # único valor legado y puede quedarse corta (p. ej. dual doctor+super_admin).
