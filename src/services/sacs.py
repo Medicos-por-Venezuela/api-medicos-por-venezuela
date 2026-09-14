@@ -22,6 +22,18 @@ _CEDULA_RE = re.compile(r"^[VE]-\d+$")
 _USER_RE = re.compile(r"xajax_userTable\('(.*?)'\)", re.DOTALL)
 _PROF_RE = re.compile(r"xajax_tableProfesion\('(.*?)'\)", re.DOTALL)
 _EMPTY_VALUES = {'""', "[]", ""}
+_TABLAS_OCULTAS = ("$('#divTabla').hide();", "$('#divTablaProfesiones').hide();")
+_NO_REGISTRADA = "La cédula no está registrada en el SACS"
+
+
+def _es_no_registrada(xml_text: str) -> bool:
+    """Así responde el SACS a una cédula que no está (HTTP 200, verificado el 2026-09-14): una
+    respuesta xajax que oculta las dos tablas de resultados y no las rellena. Trae además un
+    aviso en prosa ("NO CORRESPONDE CON EL TIPO DE BÚSQUEDA"); no se ramifica sobre ese texto.
+
+    Se exige el sobre `<xjx>` para que una página HTML con los mismos scripts no cuente como
+    respuesta. Lo que no encaje exactamente sigue siendo "respuesta inesperada"."""
+    return "<xjx>" in xml_text and all(cmd in xml_text for cmd in _TABLAS_OCULTAS)
 
 
 def _fallo(error: str, kind: str = SERVICIO_NO_DISPONIBLE) -> SacsVerificationResponse:
@@ -70,6 +82,9 @@ async def verificar_sacs(cedula: str) -> SacsVerificationResponse:
     user_match = _USER_RE.search(xml_text)
     prof_match = _PROF_RE.search(xml_text)
 
+    if not user_match and not prof_match and _es_no_registrada(xml_text):
+        return _fallo(_NO_REGISTRADA, NO_ENCONTRADO)
+
     if not user_match or not prof_match:
         return _fallo("Respuesta inesperada del SACS")
 
@@ -77,7 +92,7 @@ async def verificar_sacs(cedula: str) -> SacsVerificationResponse:
     prof_raw = prof_match.group(1)
 
     if user_raw in _EMPTY_VALUES or prof_raw in _EMPTY_VALUES:
-        return _fallo("La cédula no está registrada en el SACS", NO_ENCONTRADO)
+        return _fallo(_NO_REGISTRADA, NO_ENCONTRADO)
 
     try:
         user_data = json.loads(user_raw)
