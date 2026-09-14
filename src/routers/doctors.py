@@ -31,6 +31,8 @@ from src.schemas.doctor import (
     DoctorCredentialSummary,
     DoctorMeResponse,
     DoctorPoolPage,
+    DoctorRegistrationCheckRequest,
+    DoctorRegistrationCheckResponse,
     DoctorResponse,
     DoctorSelfUpdate,
     DoctorUpdate,
@@ -171,6 +173,37 @@ async def register_doctor(
     doctor, reason = await doctors_service.create_doctor(db, payload)
     await _queue_registration_mail(background_tasks, db, doctor, reason)
     return doctor
+
+
+@router.post(
+    "/registration-check",
+    response_model=DoctorRegistrationCheckResponse,
+    summary="Chequeo previo al registro: ¿el correo o la cédula ya están registrados? (público)",
+    responses={
+        422: {"description": "Correo o cédula con formato inválido."},
+        429: {"description": "Demasiadas consultas desde esta IP (rate limit)."},
+    },
+)
+@limiter.limit(settings.REGISTRATION_CHECK_RATE_LIMIT)
+async def registration_check(
+    request: Request,
+    payload: DoctorRegistrationCheckRequest,
+    db: AsyncSession = Depends(get_db),
+) -> DoctorRegistrationCheckResponse:
+    """Lo consulta `/registro-medico` ANTES de crear la cuenta en Supabase Auth: al salir del
+    campo de correo (para avisar "ya estás registrado como médico") y otra vez al enviar, con la
+    cédula.
+
+    Existe para cortar las cuentas huérfanas: el alta crea la cuenta de Auth y luego la ficha, y
+    si la ficha choca con un correo o una cédula ya registrados, la cuenta queda sin ficha.
+
+    **Sobre la enumeración:** dice si un correo tiene cuenta. No abre un oráculo nuevo —el
+    `signUp` de Supabase ya responde "User already registered" para ese mismo correo—, pero por
+    eso va con rate limit por IP. Solo lectura."""
+    status_, cedula_taken = await doctors_service.check_registration(
+        db, payload.email, payload.cedula
+    )
+    return DoctorRegistrationCheckResponse(email_status=status_, cedula_taken=cedula_taken)
 
 
 # --- Perfil propio del médico autenticado (self-service) ---

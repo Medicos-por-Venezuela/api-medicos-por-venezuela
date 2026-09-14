@@ -40,12 +40,13 @@ from sqlalchemy.sql.selectable import Subquery
 
 from src.core.errors import BadRequestError, ConflictError, NotFoundError, UnprocessableError
 from src.models.doctor import Doctor
+from src.models.patient import Patient
 from src.models.professional_type import ProfessionalType
 from src.models.profile import Profile
 from src.models.specialty import Specialty
 from src.schemas import sacs as sacs_schemas
 from src.schemas.doctor import DoctorCreate, DoctorMeResponse, DoctorSelfUpdate, DoctorUpdate
-from src.services import audit
+from src.services import audit, authz
 from src.services import psicologo as psicologo_service
 from src.services import sacs as sacs_service
 from src.services import specialties as specialties_service
@@ -620,6 +621,92 @@ async def get_doctor(session: AsyncSession, doctor_id: uuid.UUID) -> Doctor:
     return doctor
 
 
+# Estados del correo en el chequeo previo al registro (ver `check_registration`).
+EMAIL_AVAILABLE = "available"
+EMAIL_DOCTOR = "doctor"
+EMAIL_INCOMPLETE = "incomplete"
+EMAIL_OTHER_ACCOUNT = "account"
+
+_ADMIN_ROLES = {"admin", "super_admin"}
+
+
+class RegistrationCheck(NamedTuple):
+    email_status: str
+    cedula_taken: bool
+
+
+def _live_doctor_with_email(email: str) -> Select:
+    """Ficha viva cuyo correo —el suyo o el de la cuenta a la que está ligada— es `email`.
+
+    Las dos columnas porque no siempre coinciden: las fichas backfilleadas desde `users` nacieron
+    sin email propio, y ahí el correo con el que se entra solo está en la cuenta."""
+    return (
+        select(Doctor.id)
+        .outerjoin(Profile, Profile.id == Doctor.user_id)
+        .where(
+            Doctor.deleted_at.is_(None),
+            or_(func.lower(Doctor.email) == email, func.lower(Profile.email) == email),
+        )
+        .limit(1)
+    )
+
+
+async def _is_unfinished_doctor_signup(session: AsyncSession, account: Profile) -> bool:
+    """La cuenta es un registro de médico que se cortó antes de guardar la ficha.
+
+    Es la huella exacta del fallo: el formulario crea la cuenta en Supabase Auth con rol `doctor`
+    y DESPUÉS pide la ficha; si eso falla, la cuenta queda sin ficha. Solo en ese caso tiene
+    sentido dejar que el mismo correo termine el registro.
+
+    No lo es si la cuenta alguna vez tuvo ficha (aunque esté borrada): una baja la hace un admin
+    —p. ej. al quitar un duplicado— y volver a registrarse sería deshacerla por la puerta de atrás.
+    Tampoco si es paciente o admin: ahí el correo ya tiene dueño con otro papel."""
+    if account.role not in _DOCTOR_PROFILE_ROLES:
+        return False
+    had_record = await session.scalar(
+        select(
+            or_(
+                select(Doctor.id).where(Doctor.user_id == account.id).exists(),
+                select(Patient.id)
+                .where(Patient.user_id == account.id, Patient.deleted_at.is_(None))
+                .exists(),
+            )
+        )
+    )
+    if had_record:
+        return False
+    roles, _ = await authz.load_authz(session, account.id, account.role)
+    return not roles & _ADMIN_ROLES
+
+
+async def check_registration(
+    session: AsyncSession, email: str, cedula: str | None = None
+) -> RegistrationCheck:
+    """¿Qué pasaría si alguien se registra como médico con este correo y esta cédula?
+
+    Se consulta ANTES de crear la cuenta en Supabase Auth, que es lo que evita las cuentas
+    huérfanas: el alta crea la cuenta y luego la ficha, y si la ficha choca con una cédula o
+    un correo que ya existen, la cuenta se queda sin ficha. En producción así nacieron cuentas
+    de médicos que ya estaban registrados y probaron otra vez con otro correo.
+
+    Solo lectura: no crea, no bloquea y no envía nada."""
+    email = email.strip().lower()
+    if await session.scalar(_live_doctor_with_email(email)) is not None:
+        status = EMAIL_DOCTOR
+    else:
+        account = (
+            await session.execute(select(Profile).where(func.lower(Profile.email) == email))
+        ).scalar_one_or_none()
+        if account is None:
+            status = EMAIL_AVAILABLE
+        elif await _is_unfinished_doctor_signup(session, account):
+            status = EMAIL_INCOMPLETE
+        else:
+            status = EMAIL_OTHER_ACCOUNT
+    cedula_taken = cedula is not None and await _cedula_in_use(session, cedula)
+    return RegistrationCheck(email_status=status, cedula_taken=cedula_taken)
+
+
 async def create_doctor(session: AsyncSession, data: DoctorCreate) -> RegistrationResult:
     """Registra un médico. `verified` se decide contra SACS/FPV; `status` = 1 (activo).
 
@@ -631,6 +718,12 @@ async def create_doctor(session: AsyncSession, data: DoctorCreate) -> Registrati
     # Honeypot: si el campo trampa llegó con valor, es un bot. Rechazo genérico.
     if data.website:
         raise BadRequestError("Solicitud inválida.")
+    # Antes de consultar el SACS: si la ficha no se va a poder guardar, no hay nada que verificar.
+    # Sin esto chocaba con los índices únicos y salía el 409 genérico de integridad, que el
+    # formulario no sabe distinguir de cualquier otro fallo.
+    if await session.scalar(_live_doctor_with_email(data.email.strip().lower())) is not None:
+        raise ConflictError("Este correo ya pertenece a otro médico.")
+    await _assert_cedula_available(session, data.cedula)
     check = await _verify_credential(session, data.professional_type_id, data.cedula)
     # Liga el doctor a su cuenta (users) por email, si ya existe. El signup crea la cuenta
     # justo antes de este POST, así que normalmente la resuelve. Server-side (no lo manda el
@@ -796,11 +889,17 @@ async def _assert_cedula_available(
     """La cédula no puede pertenecer a otra ficha activa (mismo criterio que el índice
     único parcial `uq_doctors_cedula_not_deleted`). Se comprueba antes de escribir para
     devolver un 409 con mensaje de dominio en vez del error de integridad genérico."""
+    if await _cedula_in_use(session, cedula, exclude_doctor_id=exclude_doctor_id):
+        raise ConflictError("La cédula ya pertenece a otro médico.")
+
+
+async def _cedula_in_use(
+    session: AsyncSession, cedula: str, *, exclude_doctor_id: uuid.UUID | None = None
+) -> bool:
     stmt = select(Doctor.id).where(Doctor.cedula == cedula, Doctor.deleted_at.is_(None))
     if exclude_doctor_id is not None:
         stmt = stmt.where(Doctor.id != exclude_doctor_id)
-    if (await session.execute(stmt)).scalar_one_or_none() is not None:
-        raise ConflictError("La cédula ya pertenece a otro médico.")
+    return (await session.scalar(stmt.limit(1))) is not None
 
 
 async def _my_doctor_row(session: AsyncSession, user_id: uuid.UUID) -> Doctor | None:
