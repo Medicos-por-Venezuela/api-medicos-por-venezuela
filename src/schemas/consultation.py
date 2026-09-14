@@ -299,15 +299,17 @@ class ConsultationClaimRequest(BaseModel):
 
 
 class PanelWaitingPatient(BaseModel):
-    """Paciente en la COLA DE ESPERA (sin asignar): SIN nombre. Hasta que el médico toma la
-    consulta no se expone el nombre del paciente — ni en la UI ni en la respuesta del endpoint —
-    por seguridad. El médico elige el caso por síntomas/zona, no por nombre."""
+    """Paciente en la COLA DE ESPERA (sin asignar): SIN nombre, cédula ni teléfono. Hasta que el
+    médico toma la consulta no se expone quién es el paciente — ni en la UI ni en la respuesta del
+    endpoint — por seguridad. El médico elige el caso por síntomas/zona, no por identidad.
+
+    La cédula y el teléfono vivieron aquí mucho tiempo sin que el panel los pintara: el nombre se
+    ocultaba, pero cualquier médico recibía en el JSON con qué identificar y contactar a todos los
+    pacientes en espera. Se pasaron a `PanelPatient`, que es el caso ya tomado."""
 
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    cedula: str | None = None
-    phone_whatsapp: str | None = None
     affected_zone: str | None = None
     age_range: str | None = None
     needs_tags: list[str] | None = None
@@ -318,10 +320,12 @@ class PanelWaitingPatient(BaseModel):
 
 
 class PanelPatient(PanelWaitingPatient):
-    """Paciente de una consulta YA tomada por el médico (mis consultas abiertas): incluye el
-    nombre, porque el caso ya está siendo atendido."""
+    """Paciente de una consulta YA tomada por el médico (mis consultas abiertas): incluye nombre,
+    cédula y teléfono, porque el caso ya es suyo."""
 
     full_name: str
+    cedula: str | None = None
+    phone_whatsapp: str | None = None
 
 
 class PanelConsultationItem(BaseModel):

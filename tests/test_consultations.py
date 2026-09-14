@@ -589,6 +589,12 @@ async def test_panel_devuelve_espera_mias_y_cerradas(
     # El paciente viene anidado (zona, síntomas para elegir el caso) pero SIN `full_name`.
     item = next(c for c in data["waiting"] if c["id"] == cid_waiting)
     assert "full_name" not in item["patient"]
+    # Ni con qué identificarlo o contactarlo: la cédula y el teléfono viajaban en el JSON de la
+    # cola aunque el panel no los pintara, así que cualquier médico los tenía de TODOS los casos.
+    assert "cedula" not in item["patient"]
+    assert "phone_whatsapp" not in item["patient"]
+    # La descripción y lo clínico para decidir sí están.
+    assert {"description", "allergies", "affected_zone", "age_range"} <= item["patient"].keys()
     # `specialty_id` es obligatorio al crear, asi que el panel SIEMPRE resuelve el nombre; ya no
     # existe el caso "sin especialidad" que caia al matching legacy.
     assert item["specialty"] is not None
@@ -597,6 +603,7 @@ async def test_panel_devuelve_espera_mias_y_cerradas(
     # Mis consultas (ya tomadas por el médico) SÍ traen el nombre del paciente.
     mine_item = next(c for c in data["mine"] if c["id"] == cid_mine)
     assert mine_item["patient"]["full_name"] == "Paciente Consulta"
+    assert {"cedula", "phone_whatsapp"} <= mine_item["patient"].keys()
     assert isinstance(data["my_closed_count"], int)
 
 
