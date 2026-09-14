@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import BadRequestError, ForbiddenError, NotFoundError
 from src.models.doctor import Doctor
+from src.models.patient import Patient
 from src.models.profile import Profile
 from src.services import audit
 from src.services import specialties as specialties_service
@@ -92,6 +93,23 @@ async def get_profile(session: AsyncSession, profile_id: uuid.UUID) -> Profile:
     if profile is None:
         raise NotFoundError("Perfil no encontrado.")
     return profile
+
+
+async def has_account_record(session: AsyncSession, user_id: uuid.UUID) -> bool:
+    """La cuenta está respaldada por un registro vivo: una ficha en `doctors` o un paciente en
+    `patients` ligado a ella.
+
+    Una cuenta de Auth sin ninguno de los dos no es de nadie que el sistema conozca: es el rastro
+    de un alta que se quedó a medias (el registro de médico crea la cuenta ANTES de guardar la
+    ficha, y si eso falla la cuenta queda sola) o de un acceso con Google que nunca terminó. El
+    login la rechaza con esto. Un admin tampoco suele tener registro, pero no depende de él:
+    esa excepción la aplica quien decide el acceso, no este dato.
+
+    Es un hecho, no una política: `EXISTS` sobre las dos tablas, en una sola consulta.
+    """
+    doctor = select(Doctor.id).where(Doctor.user_id == user_id, Doctor.deleted_at.is_(None))
+    patient = select(Patient.id).where(Patient.user_id == user_id, Patient.deleted_at.is_(None))
+    return bool(await session.scalar(select(or_(doctor.exists(), patient.exists()))))
 
 
 async def set_active(

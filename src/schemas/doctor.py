@@ -39,6 +39,39 @@ class DoctorCreate(BaseModel):
         return value.upper()
 
 
+class DoctorRegistrationCheckRequest(BaseModel):
+    """Chequeo previo al registro de médico. Va por POST y no por query string para que el
+    correo no quede en los logs de acceso del proxy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr
+    # Opcional: el formulario manda solo el correo al salir del campo, y correo + cédula al enviar.
+    cedula: str | None = Field(default=None, pattern=_CEDULA_PATTERN)
+
+    @field_validator("cedula")
+    @classmethod
+    def _normalize_cedula(cls, value: str | None) -> str | None:
+        return value.upper() if value is not None else None
+
+
+class DoctorRegistrationCheckResponse(BaseModel):
+    """Qué encontraría el registro con estos datos, ANTES de crear la cuenta en Supabase Auth.
+
+    - `email_status`:
+      - `available`: nadie usa ese correo.
+      - `doctor`: ya hay una ficha de médico con ese correo → iniciar sesión o recuperar clave.
+      - `incomplete`: hay una cuenta de médico con ese correo que nunca llegó a tener ficha (su
+        registro se cortó). El registro puede terminarse entrando con esa misma contraseña.
+      - `account`: el correo es de otra cuenta (paciente, admin, o un médico cuya ficha dio de
+        baja un admin) → iniciar sesión o recuperar clave; aquí no se registra.
+    - `cedula_taken`: la cédula ya pertenece a una ficha activa (`false` si no se envió).
+    """
+
+    email_status: Literal["available", "doctor", "incomplete", "account"]
+    cedula_taken: bool
+
+
 class DoctorUpdate(BaseModel):
     """Edición administrativa de la ficha. Permite mover `status` (0/1/2).
 

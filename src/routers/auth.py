@@ -34,11 +34,16 @@ async def me(
     `role` = el rol EFECTIVO más alto del RBAC (`user_roles`; un dual doctor+super_admin se
     presenta como super_admin) y `roles` = la lista completa. La columna `users.role` es un
     único valor legado — el Principal ya trae los roles reales (con fallback al legado para
-    cuentas sin filas RBAC), así que esto no agrega queries."""
+    cuentas sin filas RBAC), así que esto no agrega queries.
+
+    `has_account_record` dice si la cuenta tiene detrás una ficha en `doctors` o un paciente en
+    `patients`. Una cuenta de Auth sin ninguno de los dos (un alta que se quedó a medias) no
+    debe poder entrar: el login la rechaza, salvo que sea admin."""
     profile = await profiles_service.get_profile(db, principal.id)
     resp = MyProfileResponse.model_validate(profile)
     resp.roles = sorted(principal.roles)
     resp.role = effective_role(principal.roles) or resp.role
+    resp.has_account_record = await profiles_service.has_account_record(db, principal.id)
     try:
         doctor_me = await doctors_service.get_my_profile(db, principal.id)
         resp.has_doctor_profile = True
