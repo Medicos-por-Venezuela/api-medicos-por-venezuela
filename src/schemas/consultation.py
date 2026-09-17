@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # Re-exportado desde el modelo para tener una única fuente de verdad.
 from src.models.consultation import CONSULTATION_STATUSES
@@ -20,6 +20,11 @@ __all__ = [
     "ConsultationPatientResponse",
     "ConsultationCloseRequest",
     "ConsultationClaimRequest",
+    "DeriveRequest",
+    "DerivationInfo",
+    "DerivationTargetResponse",
+    "ReferToQueueRequest",
+    "WaitingRoomResponse",
     "ScheduleFollowUpRequest",
     "ScheduleReferralRequest",
     "ReminderRunResponse",
@@ -145,6 +150,55 @@ class ScheduleReferralRequest(BaseModel):
     signature: str | None = Field(default=None, max_length=2_000_000)
 
 
+class DeriveRequest(BaseModel):
+    """Derivar desde la cola: el caso (sin tomar) pasa a la cola de otra especialidad."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    specialty_id: uuid.UUID
+
+
+class ReferToQueueRequest(BaseModel):
+    """Derivar con especialista desde un caso atendido: cierra la parte del médico (firmada, con
+    el motivo) y el paciente entra a la cola de la especialidad destino. Sin fecha: lo atiende el
+    primer especialista que lo tome."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    specialty_id: uuid.UUID
+    reason: str = Field(min_length=1, max_length=2000)
+    signature: str | None = Field(default=None, max_length=2_000_000)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Escribe el motivo de la derivación.")
+        return value
+
+
+class DerivationTargetResponse(BaseModel):
+    """Especialidad a la que se puede derivar (activa y con médicos atendiendo su cola)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+
+
+class DerivationInfo(BaseModel):
+    """De dónde viene un caso derivado: especialidad de origen, quién lo derivó y por qué. El
+    motivo es nota de staff: no va en la vista del paciente."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    from_specialty: str | None = None
+    by_name: str | None = None
+    reason: str | None = None
+    at: datetime
+
+
 class ChainItem(BaseModel):
     """Un eslabón de la cadena de seguimiento (historial cross-consulta padre→hijas)."""
 
@@ -227,6 +281,10 @@ class ConsultationResponse(ConsultationBase):
     # consulta está sin asignar.
     patient_name: str | None = None
     assigned_doctor_name: str | None = None
+    # Nombres de la especialidad actual y de la que viene derivado (None si el servicio no
+    # precargó las relaciones).
+    specialty: str | None = None
+    derived_from_specialty: str | None = None
     # Gestión del admin (panel admin/pacientes): super_admin de seguimiento + nota libre.
     admin_seguimiento: uuid.UUID | None = None
     nota_admin: str | None = None
@@ -238,6 +296,8 @@ class ConsultationDetailResponse(ConsultationResponse):
     `patient`, para no dispararla en lazy-load). El router puebla `patient` explícitamente."""
 
     patient: ConsultationDetailPatient | None = None
+    # Solo si el caso llegó derivado: quién, desde dónde y por qué (lo pone el router).
+    derivation: DerivationInfo | None = None
 
 
 class ConsultationCreatedResponse(ConsultationResponse):
@@ -287,15 +347,30 @@ class ConsultationPatientResponse(BaseModel):
     created_at: datetime
     # Cita agendada (módulo Agenda): el portal del paciente (mi-caso) lista sus próximas citas.
     scheduled_at: datetime | None = None
+    # Derivación: el paciente ve a qué cola pasó y desde cuál (no el motivo, que es de staff).
+    specialty: str | None = None
+    derived_from_specialty: str | None = None
+    parent_consultation_id: uuid.UUID | None = None
 
 
 class ConsultationClaimRequest(BaseModel):
-    """Cuerpo para tomar una consulta desde el panel médico."""
+    """Cuerpo (opcional) para tomar una consulta desde el panel médico.
+
+    `via_whatsapp` queda solo por compatibilidad con el panel anterior: la atención es SIEMPRE
+    por videoconsulta y el claim crea la sala. `true` se rechaza con 422."""
 
     model_config = ConfigDict(extra="forbid")
 
-    # true = atención por WhatsApp (sin videollamada); false = se abre la sala de video.
     via_whatsapp: bool = False
+
+    @field_validator("via_whatsapp")
+    @classmethod
+    def _solo_video(cls, value: bool) -> bool:
+        if value:
+            raise ValueError(
+                "La atención es siempre por videoconsulta: toma el caso con 'Atender paciente'."
+            )
+        return value
 
 
 class PanelWaitingPatient(BaseModel):
@@ -356,6 +431,12 @@ class PanelConsultationItem(BaseModel):
     # acababa de entrar. Esto se persiste una sola vez y sobrevive a que se muera la pestaña.
     entered_call_at: datetime | None = None
     created_at: datetime
+    # Hora de llegada del paciente a la cola: un caso derivado conserva la original. Es la que
+    # ordena la cola y la que dice cuánto lleva esperando.
+    queued_at: datetime
+    specialty_id: uuid.UUID | None = None
+    # Especialidad desde la que se derivó a esta cola (None si no viene derivado).
+    derived_from_specialty: str | None = None
     patient: PanelPatient | None = None
 
 
@@ -374,3 +455,29 @@ class ConsultationPanelResponse(BaseModel):
     waiting: list[PanelWaitingItem]
     mine: list[PanelConsultationItem]
     my_closed_count: int
+    # Por qué el médico no ve ninguna cola: `sin_especialidad` o `especialidad_por_definir`
+    # ("Otra"). None si ve alguna. El panel lo usa para mandarlo a completar su perfil.
+    queue_blocked_reason: str | None = None
+
+
+class WaitingRoomResponse(BaseModel):
+    """Estado de la sala de espera para el PACIENTE (`/sala-espera`, `/mi-caso`).
+
+    `phase`: `waiting` (en cola, sin médico) · `ready` (un médico tomó el caso y la sala existe)
+    · `scheduled` (cita agendada) · `finished` (cerrado, ausente, cancelado...).
+
+    `consultation_id` es el caso VIGENTE: si al paciente lo derivaron, la consulta hija. En ese
+    caso `access_token` trae un token para ella. `video_room_url` y `doctor_name` solo vienen en
+    `ready`. Sin notas clínicas, internas ni motivo de derivación: es la vista del paciente."""
+
+    consultation_id: uuid.UUID
+    code: str
+    status: str
+    phase: Literal["waiting", "ready", "scheduled", "finished"]
+    specialty: str | None = None
+    derived_from_specialty: str | None = None
+    doctor_name: str | None = None
+    video_room_url: str | None = None
+    scheduled_at: datetime | None = None
+    patient_first_name: str | None = None
+    access_token: str | None = None

@@ -1,7 +1,6 @@
 """Specialty catalog, matching rules, and CRUD."""
 
 import uuid
-from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy import func, select
@@ -18,64 +17,12 @@ _RESOURCE = "specialties"
 _PRIORITY_REVIEW_TAGS = {"Lesión física", "Embarazo", "Niño / pediatría"}
 
 
-@dataclass(frozen=True)
-class SpecialtyFlags:
-    """Reserva de salud mental de una especialidad, tal y como está en el catálogo."""
-
-    is_mental_health: bool = False
-    mental_health_only: bool = False
-
-
-async def flags_for_specialty_id(
-    session: AsyncSession, specialty_id: uuid.UUID | None
-) -> SpecialtyFlags:
-    """Flags de la especialidad de un MÉDICO, resueltos por su FK (`users.specialty_id`).
-
-    Por id y no por nombre: renombrar una especialidad en el catálogo no puede cambiar quién
-    puede atender qué. Si el médico no tiene especialidad devuelve todo en False, que es
-    fail-closed en la dirección que importa: sin `is_mental_health` NO puede tomar un caso de
-    salud mental.
-    """
-    if specialty_id is None:
-        return SpecialtyFlags()
-    row = (
-        await session.execute(
-            select(Specialty.is_mental_health, Specialty.mental_health_only).where(
-                Specialty.id == specialty_id
-            )
-        )
-    ).first()
-    return SpecialtyFlags(*row) if row else SpecialtyFlags()
-
-
 async def name_for_id(session: AsyncSession, specialty_id: uuid.UUID | None) -> str | None:
     """Nombre del catálogo para una especialidad. Lo usan los escritores de `users.specialty`,
     que es una copia desnormalizada: el nombre SIEMPRE sale de la fila, nunca del cliente."""
     if specialty_id is None:
         return None
     return await session.scalar(select(Specialty.name).where(Specialty.id == specialty_id))
-
-
-def can_attend_consultation(
-    *,
-    doctor: SpecialtyFlags,
-    consultation_is_mental_health: bool,
-) -> bool:
-    """Elegibilidad dura: separación bidireccional entre salud mental y salud física.
-
-    1) Un caso de salud mental solo lo toma quien atiende salud mental.
-    2) Quien SOLO atiende salud mental (Psicología, que no es médico) no toma casos físicos.
-
-    Que la especialidad del caso coincida exactamente con la del médico es la PREFERENCIA de
-    "atender al siguiente", no un bloqueo: nadie se queda sin atender.
-
-    Ambas reglas salen de columnas de `specialties`, no de nombres. Antes eran los literales
-    `_PSYCH_SPECIALTIES` y `!= "Psicología"`, que un renombre del catálogo rompía en silencio —
-    y en la dirección peligrosa: un caso de salud mental habría pasado a poder tomarlo cualquiera.
-    """
-    if consultation_is_mental_health:
-        return doctor.is_mental_health
-    return not doctor.mental_health_only
 
 
 def compute_priority(needs_tags: list[str] | None) -> str:

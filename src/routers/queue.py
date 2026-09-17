@@ -20,6 +20,7 @@ from src.core.security import Principal, require_permission
 from src.db.session import get_db
 from src.schemas.consultation import ConsultationResponse, QueueReleaseResponse
 from src.services import queue as queue_service
+from src.services import queue_access
 
 router = APIRouter(prefix="/queue", tags=["queue"])
 tag_metadata = [
@@ -45,10 +46,14 @@ _LOCK_DETAIL = (
 async def list_queue(
     limit: int = Query(100, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("queue.read")),
+    principal: Principal = Depends(require_permission("queue.read")),
 ) -> list[ConsultationResponse]:
-    """Lista las consultas en estado `waiting`, las más antiguas primero (FIFO)."""
-    return await queue_service.list_queue(db, limit=limit)
+    """Lista las consultas en espera sin asignar de las colas del médico (su especialidad y las
+    que tenga habilitadas; un admin ve todas), las más antiguas primero (FIFO)."""
+    scope = await queue_access.queue_scope(
+        db, specialty_id=principal.specialty_id, is_admin=principal.is_admin
+    )
+    return await queue_service.list_queue(db, scope, limit=limit)
 
 
 @router.post(
@@ -56,7 +61,8 @@ async def list_queue(
     response_model=ConsultationResponse,
     summary="Tomar una consulta de la cola (atómico)",
     responses={
-        200: {"description": "Consulta asignada al médico (pasa a `in_progress`)."},
+        200: {"description": "Consulta asignada al médico (pasa a `in_progress`, con sala)."},
+        403: {"description": "El caso no es de las colas del médico."},
         404: {"description": "La consulta no existe o ya no está en espera."},
         409: {"description": "Otro médico la está tomando en este instante (fila bloqueada)."},
     },
@@ -69,8 +75,11 @@ async def take_consultation(
     """Asignación **atómica anti-colisión** de una consulta en espera al médico
     autenticado. El ganador recibe `200`, el perdedor `409` (o `404`), sin colgarse.
     """
+    scope = await queue_access.queue_scope(
+        db, specialty_id=principal.specialty_id, is_admin=principal.is_admin
+    )
     try:
-        return await queue_service.take_consultation(db, consultation_id, principal.id)
+        return await queue_service.take_consultation(db, consultation_id, principal.id, scope)
     except DBAPIError as exc:
         if not is_lock_not_available(exc):
             raise

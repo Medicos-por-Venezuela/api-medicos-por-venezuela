@@ -11,45 +11,20 @@ from src.db.session import get_db
 from src.main import app
 from src.models.profile import Profile
 from src.models.specialty import Specialty
-from src.services.specialties import (
-    SpecialtyFlags,
-    can_attend_consultation,
-    compute_priority,
-    flags_for_specialty_id,
-)
+from src.services.queue_access import ESPECIALIDAD_POR_DEFINIR, SIN_ESPECIALIDAD, queue_scope
+from src.services.specialties import compute_priority
 from tests._helpers import auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
 
-# --- reserva de salud mental (flags del catálogo) ---
+# --- reglas del catálogo que decide la cola (ver también tests/test_cola_especialidad.py) ---
 
 
-PSICOLOGO = SpecialtyFlags(is_mental_health=True, mental_health_only=True)
-PSIQUIATRA = SpecialtyFlags(is_mental_health=True, mental_health_only=False)
-GENERAL = SpecialtyFlags()
-
-
-def test_caso_de_salud_mental_solo_para_quien_la_atiende() -> None:
-    assert can_attend_consultation(doctor=GENERAL, consultation_is_mental_health=True) is False
-    assert can_attend_consultation(doctor=PSICOLOGO, consultation_is_mental_health=True) is True
-    assert can_attend_consultation(doctor=PSIQUIATRA, consultation_is_mental_health=True) is True
-
-
-def test_psicologo_no_toma_casos_de_salud_fisica() -> None:
-    """Psicología SOLO atiende salud mental (no es médico); Psiquiatría sí puede lo físico."""
-    assert can_attend_consultation(doctor=PSICOLOGO, consultation_is_mental_health=False) is False
-    assert can_attend_consultation(doctor=PSIQUIATRA, consultation_is_mental_health=False) is True
-    assert can_attend_consultation(doctor=GENERAL, consultation_is_mental_health=False) is True
-
-
-async def test_renombrar_la_especialidad_no_toca_la_reserva(db_session: AsyncSession) -> None:
-    """La reserva cuelga de la FILA, así que renombrarla no la afecta en absoluto.
-
-    Antes la regla eran los literales `{"Psicología", "Psiquiatría"}` y la resolución iba por
-    nombre: un renombre del catálogo la abría en silencio y un caso de salud mental pasaba a
-    poder tomarlo cualquiera.
-    """
+async def test_renombrar_psicologia_no_abre_la_cola_a_su_admin(db_session: AsyncSession) -> None:
+    """La restricción del admin de salud mental cuelga de la FILA (`mental_health_only`), así
+    que renombrar la especialidad no la afecta. Antes las reglas eran literales de nombres y un
+    renombre del catálogo las abría en silencio."""
     psico = (
         await db_session.execute(
             select(Specialty).where(
@@ -57,29 +32,32 @@ async def test_renombrar_la_especialidad_no_toca_la_reserva(db_session: AsyncSes
             )
         )
     ).scalar_one()
-    assert (psico.is_mental_health, psico.mental_health_only) == (True, True)
-
     psico.name = "Psicología clínica y de la salud"
     await db_session.flush()
 
-    flags = await flags_for_specialty_id(db_session, psico.id)
-    assert flags.is_mental_health is True
-    assert can_attend_consultation(doctor=flags, consultation_is_mental_health=True) is True
-    assert can_attend_consultation(doctor=flags, consultation_is_mental_health=False) is False
+    scope = await queue_scope(db_session, specialty_id=psico.id, is_admin=True)
+    assert scope.specialty_ids == frozenset({psico.id})
 
 
-async def test_medico_sin_especialidad_es_fail_closed(db_session: AsyncSession) -> None:
-    """Sin FK no se puede tomar un caso de salud mental (la dirección que importa)."""
-    assert await flags_for_specialty_id(db_session, None) == SpecialtyFlags()
-    assert (
-        can_attend_consultation(doctor=SpecialtyFlags(), consultation_is_mental_health=True)
-        is False
-    )
-    # Un id que ya no existe en el catálogo se comporta igual.
-    huerfano = await flags_for_specialty_id(
-        db_session, uuid.UUID("00000000-0000-0000-0000-000000000000")
-    )
-    assert huerfano == SpecialtyFlags()
+async def test_renombrar_otra_no_la_vuelve_una_cola(db_session: AsyncSession) -> None:
+    otra = (
+        await db_session.execute(select(Specialty).where(func.lower(Specialty.name) == "otra"))
+    ).scalar_one()
+    otra.name = "Otra especialidad"
+    await db_session.flush()
+
+    scope = await queue_scope(db_session, specialty_id=otra.id, is_admin=False)
+    assert scope.specialty_ids == frozenset()
+    assert scope.blocked_reason == ESPECIALIDAD_POR_DEFINIR
+
+
+async def test_especialidad_inexistente_es_fail_closed(db_session: AsyncSession) -> None:
+    """Sin FK, o con un id que ya no está en el catálogo, no se ve ninguna cola."""
+    for specialty_id in (None, uuid.UUID("00000000-0000-0000-0000-000000000000")):
+        scope = await queue_scope(db_session, specialty_id=specialty_id, is_admin=False)
+        assert scope.specialty_ids == frozenset()
+        assert scope.blocked_reason == SIN_ESPECIALIDAD
+        assert scope.allows(None) is False
 
 
 # --- compute_priority ---

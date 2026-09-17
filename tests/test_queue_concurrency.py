@@ -21,7 +21,13 @@ from src.models.consultation import Consultation
 from src.models.doctor import Doctor
 from src.models.patient import Patient
 from src.models.profile import Profile
-from tests._helpers import auth_headers, make_doctor_row, make_profile
+from tests._helpers import (
+    GENERAL,
+    auth_headers,
+    make_doctor_row,
+    make_profile,
+    specialty_id_by_name,
+)
 
 PREFIX = "/api/v1"
 
@@ -32,7 +38,8 @@ async def _seed() -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
     El médico va con su ficha habilitada en `doctors`: sin ella el gate de credencial
     lo deja sin permisos y la carrera por la cola ni siquiera llegaría al lock."""
     async with AsyncSessionLocal() as s:
-        doctor = make_profile(role="doctor", specialty="Medicina general")
+        doctor = make_profile(role="doctor", specialty=GENERAL)
+        doctor.specialty_id = await specialty_id_by_name(s, GENERAL)
         patient = Patient(
             full_name="Cola Test",
             phone_whatsapp="+58412999999",
@@ -45,6 +52,7 @@ async def _seed() -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
         consultation = Consultation(
             code=f"TEST-{uuid.uuid4().hex[:10]}",
             patient_id=patient.id,
+            specialty_id=doctor.specialty_id,
             status="waiting",
         )
         s.add(consultation)

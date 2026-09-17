@@ -5,11 +5,17 @@ from datetime import UTC, datetime, timedelta
 
 import jwt
 from httpx import AsyncClient
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
 from src.models.doctor import Doctor
 from src.models.profile import Profile
+from src.models.specialty import Specialty
+
+# La cola es por especialidad exacta: un médico sin especialidad no ve ni toma ningún caso. Las
+# pruebas que no tratan de especialidades usan esta para médicos y consultas por igual.
+GENERAL = "Medicina general"
 
 
 def make_token(sub: uuid.UUID | str) -> str:
@@ -74,20 +80,35 @@ async def add_doctor(
     sus permisos. Los `doctor_overrides` (o `verified=False`) sirven para construir el
     médico *no* habilitado en los tests del propio gate."""
     profile = make_profile(role=role, specialty=specialty)
+    if specialty is not None:
+        # La cola decide con la FK (`users.specialty_id`), no con el nombre.
+        profile.specialty_id = await specialty_id_by_name(session, specialty)
     session.add(profile)
     await session.flush()
+    doctor_overrides.setdefault("specialty_id", profile.specialty_id)
     session.add(make_doctor_row(profile.id, verified=verified, **doctor_overrides))
     await session.flush()
     return profile
 
 
+async def specialty_id_by_name(session: AsyncSession, name: str) -> uuid.UUID:
+    """Id de una especialidad viva del catálogo por nombre (sin distinguir mayúsculas)."""
+    return (
+        await session.execute(
+            select(Specialty.id).where(
+                func.lower(Specialty.name) == name.lower(), Specialty.deleted_at.is_(None)
+            )
+        )
+    ).scalar_one()
+
+
 async def any_specialty_id(client: AsyncClient) -> str:
-    """Id de una especialidad del catálogo, para crear consultas en las pruebas.
+    """Id de Medicina general, para crear consultas en las pruebas.
 
     `specialty_id` es obligatorio en `ConsultationCreate` (esa columna ES el matching de la cola),
-    así que ya no se puede crear una consulta sin él. Se excluye salud mental a propósito: un caso
-    psi solo lo puede tomar Psicología/Psiquiatría, y la mayoría de las pruebas usan un médico sin
-    especialidad, así que un id psi les cambiaría la elegibilidad sin que eso sea lo que prueban.
+    así que ya no se puede crear una consulta sin él. Es la misma especialidad que `GENERAL`, la
+    de los médicos de las pruebas: con la cola por especialidad exacta, un caso de otra no lo
+    vería ni lo podría tomar el médico de la prueba sin que eso sea lo que se prueba.
     """
     resp = await client.get("/api/v1/specialties")
-    return next(s["id"] for s in resp.json() if s["name"] not in ("Psicología", "Psiquiatría"))
+    return next(s["id"] for s in resp.json() if s["name"].lower() == GENERAL.lower())

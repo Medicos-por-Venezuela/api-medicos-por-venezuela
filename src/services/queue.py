@@ -11,8 +11,10 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.errors import NotFoundError
+from src.core.errors import ForbiddenError, NotFoundError
 from src.models.consultation import Consultation
+from src.services import queue_access
+from src.services.jitsi import new_room_url
 
 # La ventana de presencia y `_is_present` se eliminaron con `attend_next`: leían
 # `patient_last_seen_at`, columna que dejó de escribirse cuando la presencia del paciente pasó
@@ -20,11 +22,18 @@ from src.models.consultation import Consultation
 # badge "● En sala", que sale de ese canal y no de la base.
 
 
-async def list_queue(session: AsyncSession, limit: int = 100) -> list[Consultation]:
+async def list_queue(
+    session: AsyncSession, scope: queue_access.QueueScope, limit: int = 100
+) -> list[Consultation]:
+    """Casos en espera sin asignar de las colas de `scope` (ver `queue_access`), FIFO."""
     stmt = (
         select(Consultation)
-        .where(Consultation.status == "waiting")
-        .order_by(Consultation.queued_at.asc())
+        .where(
+            Consultation.status == "waiting",
+            Consultation.assigned_doctor_id.is_(None),
+            scope.sql_filter(),
+        )
+        .order_by(Consultation.queued_at.asc(), Consultation.id)
         .limit(limit)
     )
     result = await session.execute(stmt)
@@ -36,6 +45,7 @@ async def _lock_waiting(session: AsyncSession, consultation_id: uuid.UUID) -> Co
     stmt = (
         select(Consultation)
         .where(Consultation.id == consultation_id, Consultation.status == "waiting")
+        .where(Consultation.assigned_doctor_id.is_(None))
         .with_for_update(nowait=True)
     )
     result = await session.execute(stmt)
@@ -50,19 +60,27 @@ async def _assign(
     consultation.assigned_doctor_id = assigned_doctor_id
     consultation.opened_at = consultation.opened_at or now
     consultation.started_at = consultation.started_at or now
+    # La atención es siempre por video: el caso no queda tomado sin sala (igual que el claim).
+    consultation.video_room_url = consultation.video_room_url or new_room_url()
     await session.commit()
     await session.refresh(consultation)
     return consultation
 
 
 async def take_consultation(
-    session: AsyncSession, consultation_id: uuid.UUID, assigned_doctor_id: uuid.UUID
+    session: AsyncSession,
+    consultation_id: uuid.UUID,
+    assigned_doctor_id: uuid.UUID,
+    scope: queue_access.QueueScope,
 ) -> Consultation:
     """Bloquea y asigna una consulta concreta. Lanza el error de lock si la fila
-    está bloqueada por otra transacción; NotFoundError si ya no está disponible."""
+    está bloqueada por otra transacción; NotFoundError si ya no está disponible;
+    ForbiddenError si no es de las colas de `scope`."""
     consultation = await _lock_waiting(session, consultation_id)
     if consultation is None:
         raise NotFoundError("El turno ya no está disponible.")
+    if not scope.allows(consultation.specialty_id):
+        raise ForbiddenError("Este caso no corresponde a tu especialidad.")
     return await _assign(session, consultation, assigned_doctor_id)
 
 

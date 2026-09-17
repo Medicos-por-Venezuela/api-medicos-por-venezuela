@@ -13,7 +13,7 @@ from src.models.consultation import Consultation
 from src.models.patient import Patient
 from src.models.profile import Profile
 from src.models.specialty import Specialty
-from tests._helpers import add_doctor, any_specialty_id, auth_headers, make_profile
+from tests._helpers import GENERAL, add_doctor, any_specialty_id, auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -331,8 +331,8 @@ async def test_claim_es_atomico_solo_gana_un_medico(
 ) -> None:
     """Dos médicos toman el mismo caso: el primero 200, el segundo 409 (nunca ambos)."""
     cid = await _create_waiting_consultation(client)
-    d1 = await add_doctor(db_session)
-    d2 = await add_doctor(db_session)
+    d1 = await add_doctor(db_session, specialty=GENERAL)
+    d2 = await add_doctor(db_session, specialty=GENERAL)
 
     r1 = await client.post(
         f"{PREFIX}/consultations/{cid}/claim", json={}, headers=auth_headers(d1.id)
@@ -347,19 +347,74 @@ async def test_claim_es_atomico_solo_gana_un_medico(
     assert r2.status_code == 409, r2.text
 
 
-async def test_claim_via_whatsapp_marca_el_flag(
+async def test_claim_por_whatsapp_se_rechaza(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
+    """La atención es siempre por videoconsulta: el panel anterior aún podía mandar
+    `via_whatsapp: true` y eso dejaba casos tomados sin sala. Ahora es 422 y el caso sigue en la
+    cola."""
     cid = await _create_waiting_consultation(client)
-    doc = await add_doctor(db_session)
+    doc = await add_doctor(db_session, specialty=GENERAL)
 
     resp = await client.post(
         f"{PREFIX}/consultations/{cid}/claim",
         json={"via_whatsapp": True},
         headers=auth_headers(doc.id),
     )
+    assert resp.status_code == 422, resp.text
+    consultation = await db_session.get(Consultation, uuid.UUID(cid))
+    await db_session.refresh(consultation)
+    assert consultation.assigned_doctor_id is None
+    assert consultation.status == "waiting"
+
+
+async def test_claim_crea_la_sala_en_la_misma_toma(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Sin cuerpo y sin sala previa: el claim deja el caso tomado CON sala. Crear la sala en otra
+    llamada antes del claim es lo que dejaba casos sin enlace cuando esa llamada fallaba."""
+    cid = await _create_waiting_consultation(client)
+    doc = await add_doctor(db_session, specialty=GENERAL)
+
+    resp = await client.post(f"{PREFIX}/consultations/{cid}/claim", headers=auth_headers(doc.id))
+
     assert resp.status_code == 200, resp.text
-    assert resp.json()["attended_via_whatsapp"] is True
+    body = resp.json()
+    assert body["status"] == "in_progress"
+    assert body["attended_via_whatsapp"] is False
+    assert "/vamed-" in body["video_room_url"]
+
+
+async def test_claim_conserva_la_sala_que_ya_tenia(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Si el paciente ya tenía sala (se la dieron al registrarse), el médico entra a esa misma:
+    otra sala los dejaría en videollamadas distintas."""
+    cid = await _create_waiting_consultation(client)
+    consultation = await db_session.get(Consultation, uuid.UUID(cid))
+    consultation.video_room_url = "https://meet.medicosporvenezuela.org/vamed-previa"
+    await db_session.flush()
+    doc = await add_doctor(db_session, specialty=GENERAL)
+
+    resp = await client.post(f"{PREFIX}/consultations/{cid}/claim", headers=auth_headers(doc.id))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["video_room_url"] == "https://meet.medicosporvenezuela.org/vamed-previa"
+
+
+async def test_claim_de_un_caso_que_ya_no_esta_en_espera_es_409(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Un caso cerrado y sin médico (lo cerró un admin) no se reabre por el claim."""
+    cid = await _create_waiting_consultation(client)
+    consultation = await db_session.get(Consultation, uuid.UUID(cid))
+    consultation.status = "closed_by_admin"
+    await db_session.flush()
+    doc = await add_doctor(db_session, specialty=GENERAL)
+
+    resp = await client.post(f"{PREFIX}/consultations/{cid}/claim", headers=auth_headers(doc.id))
+
+    assert resp.status_code == 409, resp.text
 
 
 # --- El correo "tu médico ya está en la sala" (lo dispara el claim por video) ---
@@ -418,7 +473,7 @@ async def test_claim_por_video_le_manda_al_paciente_el_enlace_de_la_sala(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     consultation = await _waiting_con_correo_y_sala(client, db_session)
-    doc = await add_doctor(db_session)
+    doc = await add_doctor(db_session, specialty=GENERAL)
 
     with _capturar_aviso_de_video() as enviados:
         resp = await client.post(
@@ -438,25 +493,6 @@ async def test_claim_por_video_le_manda_al_paciente_el_enlace_de_la_sala(
     assert str(consultation.id) in aviso["join_url"]
 
 
-async def test_claim_por_whatsapp_no_manda_el_aviso_de_video(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
-    """En la atención por WhatsApp no hay sala y el contacto lo inicia el médico: mandarle al
-    paciente un enlace de videollamada al que nadie va a entrar sería desviarlo del canal."""
-    consultation = await _waiting_con_correo_y_sala(client, db_session)
-    doc = await add_doctor(db_session)
-
-    with _capturar_aviso_de_video() as enviados:
-        resp = await client.post(
-            f"{PREFIX}/consultations/{consultation.id}/claim",
-            json={"via_whatsapp": True},
-            headers=auth_headers(doc.id),
-        )
-
-    assert resp.status_code == 200, resp.text
-    assert enviados == []
-
-
 async def test_claim_sin_correo_del_paciente_no_intenta_avisar(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
@@ -469,7 +505,7 @@ async def test_claim_sin_correo_del_paciente_no_intenta_avisar(
     consultation = await db_session.get(Consultation, uuid.UUID(cid))
     consultation.video_room_url = "https://meet.medicosporvenezuela.org/vamed-sin-correo"
     await db_session.flush()
-    doc = await add_doctor(db_session)
+    doc = await add_doctor(db_session, specialty=GENERAL)
 
     with _capturar_aviso_de_video() as enviados:
         resp = await client.post(
@@ -480,11 +516,11 @@ async def test_claim_sin_correo_del_paciente_no_intenta_avisar(
     assert enviados == []
 
 
-async def test_claim_sin_sala_no_manda_un_correo_sin_enlace(
+async def test_claim_sin_sala_previa_igual_manda_el_enlace(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """No debería pasar (el panel crea la sala antes del claim), pero si pasa, un correo que
-    anuncia una videollamada y no trae enlace es peor que ninguno."""
+    """El caso llega al claim sin sala: el claim la crea, así que el paciente recibe el correo
+    con enlace igual. Antes este caso no avisaba (no había sala a la que invitar)."""
     patient = Patient(
         full_name="Paciente Sin Sala",
         phone_whatsapp="+584140000098",
@@ -500,7 +536,7 @@ async def test_claim_sin_sala_no_manda_un_correo_sin_enlace(
             json={"patient_id": str(patient.id), "specialty_id": await any_specialty_id(client)},
         )
     ).json()["id"]
-    doc = await add_doctor(db_session)
+    doc = await add_doctor(db_session, specialty=GENERAL)
 
     with _capturar_aviso_de_video() as enviados:
         resp = await client.post(
@@ -508,7 +544,8 @@ async def test_claim_sin_sala_no_manda_un_correo_sin_enlace(
         )
 
     assert resp.status_code == 200, resp.text
-    assert enviados == []
+    assert len(enviados) == 1
+    assert enviados[0]["to_email"] == "sin-sala@example.com"
 
 
 async def test_el_claim_sobrevive_a_un_fallo_de_correo(
@@ -518,7 +555,7 @@ async def test_el_claim_sobrevive_a_un_fallo_de_correo(
     de `send_mail` y aquí se comprueba en el flujo que la necesita — un 500 en el claim dejaría
     al paciente en la cola con el médico ya dentro de la sala."""
     consultation = await _waiting_con_correo_y_sala(client, db_session)
-    doc = await add_doctor(db_session)
+    doc = await add_doctor(db_session, specialty=GENERAL)
 
     # Se rompe el envío de DENTRO (`send_mail`), no `send_video_ready_email`: doblar la propia
     # tarea encolada sustituiría también el `@best_effort` que la blinda, y el test pasaría a
@@ -553,7 +590,7 @@ async def test_claim_requiere_permiso_queue_take(
 async def test_panel_devuelve_espera_mias_y_cerradas(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    doc = await add_doctor(db_session)
+    doc = await add_doctor(db_session, specialty=GENERAL)
 
     cid_waiting = await _create_waiting_consultation(client)
     cid_mine = await _create_waiting_consultation(client)
@@ -562,12 +599,10 @@ async def test_panel_devuelve_espera_mias_y_cerradas(
     )
     # Una consulta con especialidad explícita: el panel debe traer el NOMBRE resuelto
     # (es la columna con la que matchea el médico en el frontend).
-    # La especialidad se toma DEL catálogo, sin hardcodear un nombre: los nombres se renombran
-    # (fue 'Pediatría' -> 'Pediatría y subespecialidades') y el test reventaba con StopIteration
-    # por un cambio de datos, no de comportamiento. Se excluye salud mental porque este médico
-    # no tiene especialidad y un caso psi solo lo puede tomar Psicología/Psiquiatría.
+    # Es la especialidad del médico: con la cola por especialidad exacta, un caso de otra no le
+    # aparecería.
     specs = (await client.get(f"{PREFIX}/specialties")).json()
-    spec = next(s for s in specs if s["name"] not in ("Psicología", "Psiquiatría"))
+    spec = next(s for s in specs if s["name"].lower() == GENERAL.lower())
     patient_id = await _create_patient(client)
     cid_spec = (
         await client.post(
@@ -605,6 +640,7 @@ async def test_panel_devuelve_espera_mias_y_cerradas(
     assert mine_item["patient"]["full_name"] == "Paciente Consulta"
     assert {"cedula", "phone_whatsapp"} <= mine_item["patient"].keys()
     assert isinstance(data["my_closed_count"], int)
+    assert data["queue_blocked_reason"] is None
 
 
 async def test_panel_requiere_permiso_queue_read(
@@ -643,8 +679,8 @@ async def _consultation_assigned_to(
 async def test_doctor_no_puede_editar_ni_cerrar_consulta_ajena(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    dr_a = await add_doctor(db_session)
-    dr_b = await add_doctor(db_session)
+    dr_a = await add_doctor(db_session, specialty=GENERAL)
+    dr_b = await add_doctor(db_session, specialty=GENERAL)
     cid = await _consultation_assigned_to(client, db_session, str(dr_b.id))
 
     headers_a = auth_headers(dr_a.id)
@@ -662,8 +698,8 @@ async def test_doctor_no_puede_editar_ni_cerrar_consulta_ajena(
 async def test_doctor_no_puede_reasignar_a_terceros(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    dr_a = await add_doctor(db_session)
-    dr_c = await add_doctor(db_session)
+    dr_a = await add_doctor(db_session, specialty=GENERAL)
+    dr_c = await add_doctor(db_session, specialty=GENERAL)
     patient_id = await _create_patient(client)
     cid = (
         await client.post(
@@ -723,7 +759,7 @@ async def test_doctor_no_puede_editar_doctor_id(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     """doctor_id (ficha del médico) es server-only: un no-admin no lo edita por PATCH."""
-    dr_a = await add_doctor(db_session)
+    dr_a = await add_doctor(db_session, specialty=GENERAL)
     patient_id = await _create_patient(client)
     cid = (
         await client.post(
@@ -745,8 +781,8 @@ async def test_doctor_no_puede_inyectar_eventos_en_consulta_ajena(
 ) -> None:
     """Anti-IDOR en eventos: el historial del caso solo lo escribe el médico asignado
     (o un admin) — sin esto, cualquier doctor podía fabricar un evento 'closed' falso."""
-    dr_a = await add_doctor(db_session)
-    dr_b = await add_doctor(db_session)
+    dr_a = await add_doctor(db_session, specialty=GENERAL)
+    dr_b = await add_doctor(db_session, specialty=GENERAL)
     cid = await _consultation_assigned_to(client, db_session, str(dr_b.id))
 
     payload = {"consultation_id": cid, "event_type": "closed", "note": "evento intruso"}
@@ -772,7 +808,7 @@ async def test_doctor_no_puede_inyectar_eventos_en_consulta_ajena(
 async def test_admin_puede_gestionar_consulta_ajena(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    dr_b = await add_doctor(db_session)
+    dr_b = await add_doctor(db_session, specialty=GENERAL)
     cid = await _consultation_assigned_to(client, db_session, str(dr_b.id))
 
     # El client del fixture es admin: puede editar y cerrar consultas de otros.
@@ -814,7 +850,7 @@ async def test_consultation_list_includes_patient_and_doctor_names(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     patient_id = await _create_patient(client)
-    doctor_profile = await add_doctor(db_session)
+    doctor_profile = await add_doctor(db_session, specialty=GENERAL)
 
     cid = (
         await client.post(
@@ -869,7 +905,7 @@ async def test_consultation_list_hides_pii_from_patient_viewer(
     """Guarda contra un futuro drift de `ConsultationPatientResponse`: si algún día
     se le agregan `patient_name`/`assigned_doctor_name`, este test debe fallar."""
     patient_id = await _create_patient(client)
-    doctor_profile = await add_doctor(db_session)
+    doctor_profile = await add_doctor(db_session, specialty=GENERAL)
 
     cid = (
         await client.post(
@@ -964,7 +1000,7 @@ async def test_el_panel_dice_si_el_paciente_entro_a_la_videollamada(
     "sin conexión" justo en el momento en que el paciente acababa de entrar.
     """
     consultation = await _waiting_con_correo_y_sala(client, db_session)
-    doc = await add_doctor(db_session)
+    doc = await add_doctor(db_session, specialty=GENERAL)
     suyo = auth_headers(doc.id)
 
     await client.post(f"{PREFIX}/consultations/{consultation.id}/claim", json={}, headers=suyo)

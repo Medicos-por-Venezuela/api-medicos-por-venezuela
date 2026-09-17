@@ -44,6 +44,10 @@ def effective_role(roles: frozenset[str]) -> str | None:
 
 # auto_error=False: gestionamos nosotros el 401 (mensaje uniforme).
 _bearer = HTTPBearer(auto_error=False)
+# Para endpoints que resuelven al principal con su propia sesión (ver el SSE de la sala de
+# espera): necesitan las credenciales crudas en vez de `get_optional_principal`, cuya sesión
+# viviría lo que dura la respuesta.
+bearer_credentials = _bearer
 
 
 class Principal(BaseModel):

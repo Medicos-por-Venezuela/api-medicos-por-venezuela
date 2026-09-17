@@ -1,6 +1,7 @@
 """Capa de negocio para consultations y sus eventos."""
 
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy import func, select, update
@@ -10,7 +11,6 @@ from sqlalchemy.orm import selectinload
 from src.core.errors import (
     BadRequestError,
     ConflictError,
-    ForbiddenError,
     NotFoundError,
     UnprocessableError,
 )
@@ -21,29 +21,24 @@ from src.models.profile import Profile
 from src.models.specialty import Specialty
 from src.schemas.consultation import ConsultationCreate, ConsultationUpdate
 from src.schemas.consultation_event import ConsultationEventCreate
-from src.services import audit
+from src.services import audit, queue_access
+from src.services.doctors import practicing_doctor_exists
 from src.services.jitsi import new_room_url
-from src.services.specialties import (
-    can_attend_consultation,
-    compute_priority,
-    flags_for_specialty_id,
-)
+from src.services.specialties import compute_priority
 
 # Estados en los que la consulta sigue "viva" para el heartbeat del paciente.
 _HEARTBEAT_OPEN_STATUSES = {"waiting", "in_progress"}
 # Resultados de cierre permitidos.
 _CLOSE_OUTCOMES = {"closed", "patient_no_show"}
 
-# Panel médico: cola de espera (casos sin asignar) y "mis consultas abiertas".
-_PANEL_WAITING_STATUSES = (
-    "waiting",
-    "in_progress",
-    "referred_to_specialist",
-    "urgent_in_person",
-    "contacted_whatsapp",
-    "patient_no_show",
-)
+# Panel médico: "mis consultas abiertas". La cola es `waiting` sin asignar (ver get_panel).
 _PANEL_MINE_STATUSES = ("in_progress", "contacted_whatsapp")
+# Un caso ya tomado que sigue abierto: se le puede crear sala y se puede derivar.
+_OPEN_ASSIGNED_STATUSES = ("in_progress", "contacted_whatsapp")
+# Estados en los que todavía tiene sentido crear la sala de video.
+_ROOM_STATUSES = ("waiting", *_OPEN_ASSIGNED_STATUSES)
+# Evento que deja escrito quién derivó un caso a otra cola y por qué.
+DERIVED_EVENT = "derived"
 
 
 def _validate_status(value: str | None) -> None:
@@ -74,6 +69,9 @@ async def list_consultations(
         )
         .outerjoin(Patient, Consultation.patient_id == Patient.id)
         .outerjoin(Profile, Consultation.assigned_doctor_id == Profile.id)
+        .options(
+            selectinload(Consultation.specialty_ref), selectinload(Consultation.derived_from_ref)
+        )
     )
     if status:
         stmt = stmt.where(Consultation.status == status)
@@ -112,6 +110,27 @@ async def get_consultation(
     return consultation
 
 
+async def get_consultation_detail(
+    session: AsyncSession,
+    consultation_id: uuid.UUID,
+    viewer_is_staff: bool = True,
+    viewer_user_id: uuid.UUID | None = None,
+) -> Consultation:
+    """`get_consultation` (con su control de pertenencia) más los nombres de la especialidad
+    actual y de la que viene derivada, para el detalle. `populate_existing` porque la fila puede
+    estar ya en la sesión sin esas relaciones (son `noload`)."""
+    await get_consultation(session, consultation_id, viewer_is_staff, viewer_user_id)
+    stmt = (
+        select(Consultation)
+        .options(
+            selectinload(Consultation.specialty_ref), selectinload(Consultation.derived_from_ref)
+        )
+        .where(Consultation.id == consultation_id)
+        .execution_options(populate_existing=True)
+    )
+    return (await session.execute(stmt)).scalar_one()
+
+
 async def belongs_to_patient(
     session: AsyncSession, consultation_id: uuid.UUID, user_id: uuid.UUID | None
 ) -> bool:
@@ -137,8 +156,12 @@ async def create_consultation(session: AsyncSession, data: ConsultationCreate) -
     patient = await session.get(Patient, data.patient_id)
     if patient is None:
         raise BadRequestError("El paciente referenciado (patient_id) no existe.")
-    if await session.get(Specialty, data.specialty_id) is None:
+    specialty = await session.get(Specialty, data.specialty_id)
+    if specialty is None:
         raise BadRequestError("La especialidad referenciada (specialty_id) no existe.")
+    if specialty.is_placeholder:
+        # "Otra" no es la cola de nadie: sus médicos no ven casos hasta definir su especialidad.
+        raise UnprocessableError("Elige la especialidad que necesitas o Medicina general.")
     # code lo asigna SIEMPRE el trigger generate_consultation_code en la base.
     consultation = Consultation(**data.model_dump())
 
@@ -449,34 +472,31 @@ async def claim_consultation(
     session: AsyncSession,
     consultation_id: uuid.UUID,
     doctor_user_id: uuid.UUID,
-    via_whatsapp: bool = False,
     doctor_specialty_id: uuid.UUID | None = None,
     is_admin: bool = False,
 ) -> Consultation:
-    """Toma una consulta en espera para el médico autenticado.
+    """Toma una consulta en espera para el médico autenticado, con su sala de video.
 
-    Claim ATÓMICO: el UPDATE solo matchea mientras `assigned_doctor_id IS NULL`, así que si
-    otro médico la tomó primero afecta 0 filas y se responde 409. La condición de carrera la
-    resuelve la base (un único ganador), no un read-then-write en la app.
+    Claim ATÓMICO: el UPDATE solo matchea mientras el caso sigue `waiting` y sin asignar, así
+    que si otro médico lo tomó primero afecta 0 filas y se responde 409. La condición de carrera
+    la resuelve la base (un único ganador), no un read-then-write en la app.
 
-    Valida la especialidad: la separación psicología <-> salud física es una regla de negocio,
-    y este endpoint es el ÚNICO camino real para tomar un caso. Que el panel ya filtre la lista
-    no basta — un POST directo se saltaba el filtro por completo."""
+    La sala se fija en ese MISMO UPDATE (`coalesce` con una sala nueva): la atención es siempre
+    por videoconsulta, y crear la sala en otra llamada antes del claim es lo que dejaba casos
+    tomados sin enlace cuando esa llamada fallaba.
+
+    Valida la especialidad con `queue_access`, la misma regla que arma la lista: que el panel
+    filtre no basta, un POST directo se saltaría el filtro."""
     consultation = await get_consultation(session, consultation_id)  # 404 si no existe
-    if not is_admin:
-        # La reserva de salud mental sale del catálogo (columnas de `specialties`), no de una
-        # lista de nombres: renombrar una especialidad ya no puede abrirla en silencio.
-        caso = await session.get(Specialty, consultation.specialty_id)
-        if not can_attend_consultation(
-            doctor=await flags_for_specialty_id(session, doctor_specialty_id),
-            consultation_is_mental_health=bool(caso and caso.is_mental_health),
-        ):
-            raise ForbiddenError("Este caso no corresponde a tu especialidad.")
+    await queue_access.ensure_can_take(
+        session, consultation, specialty_id=doctor_specialty_id, is_admin=is_admin
+    )
     now = datetime.now(UTC)
     stmt = (
         update(Consultation)
         .where(
             Consultation.id == consultation_id,
+            Consultation.status == "waiting",
             Consultation.assigned_doctor_id.is_(None),
         )
         .values(
@@ -484,7 +504,8 @@ async def claim_consultation(
             assigned_doctor_id=doctor_user_id,
             # No pisar opened_at si ya estaba (re-claim tras liberar).
             opened_at=func.coalesce(Consultation.opened_at, now),
-            attended_via_whatsapp=via_whatsapp,
+            attended_via_whatsapp=False,
+            video_room_url=func.coalesce(Consultation.video_room_url, new_room_url()),
         )
         .execution_options(synchronize_session=False)
     )
@@ -497,7 +518,7 @@ async def claim_consultation(
             consultation_id=consultation_id,
             event_type="opened",
             created_by=doctor_user_id,
-            note="Atendido vía WhatsApp" if via_whatsapp else "Abierta",
+            note="Abierta",
         )
     )
     await audit.log_action(
@@ -506,11 +527,23 @@ async def claim_consultation(
         actor_user_id=doctor_user_id,
         resource="consultations",
         resource_id=consultation_id,
-        metadata={"via_whatsapp": via_whatsapp},
     )
     await session.commit()
     await session.refresh(consultation)  # el objeto quedó desfasado por el UPDATE en masa
     return consultation
+
+
+def _with_specialty_names(stmt):
+    """Precarga el paciente y los nombres de especialidad (actual y de origen) de una lista.
+
+    `populate_existing`: si la fila ya estaba en la sesión (la tomó o derivó esta misma sesión),
+    sin esto SQLAlchemy devuelve el objeto con las relaciones `noload` vacías y la especialidad
+    saldría en blanco. Son lecturas: no hay cambios pendientes que pisar."""
+    return stmt.options(
+        selectinload(Consultation.patient),
+        selectinload(Consultation.specialty_ref),
+        selectinload(Consultation.derived_from_ref),
+    ).execution_options(populate_existing=True)
 
 
 async def get_panel(
@@ -518,30 +551,31 @@ async def get_panel(
     doctor_user_id: uuid.UUID,
     doctor_specialty_id: uuid.UUID | None = None,
     is_admin: bool = False,
-) -> tuple[list[Consultation], list[Consultation], int]:
-    """Datos del panel médico en una pasada: cola de espera ACOTADA a lo que este médico puede
-    atender, las consultas abiertas del propio médico y cuántas ha cerrado. El paciente viene
-    precargado (`selectinload`) para el card de cada fila.
+) -> tuple[list[Consultation], list[Consultation], int, queue_access.QueueScope]:
+    """Datos del panel médico en una pasada: la cola de espera ACOTADA a las colas de este
+    médico, sus consultas abiertas, cuántas ha cerrado y el alcance de su cola (con el motivo si
+    no ve ninguna, para que el panel le diga qué hacer).
 
-    El filtro por especialidad se aplica AQUÍ, en el servidor: antes se devolvía la cola entera
-    y el recorte era cosmético en el cliente, así que un psicólogo veía (y podía tomar) la
-    cédula, el teléfono y el motivo de un caso de medicina general. La regla es la misma que ya
-    usaba la elegibilidad (`can_attend_consultation`), y `claim_consultation` la revalida: el
-    filtro de una lista nunca es un control de acceso por sí solo.
+    El filtro por especialidad se aplica AQUÍ, en SQL, con la regla de `queue_access`, y
+    `claim_consultation` la revalida: el filtro de una lista nunca es un control de acceso por sí
+    solo.
 
-    El admin sigue viendo la cola completa. El orden es FIFO (más antiguo primero)."""
-    waiting_stmt = (
+    La cola son los casos `waiting` sin asignar, por orden de llegada del paciente (`queued_at`):
+    un caso derivado conserva la hora a la que llegó, no la de la derivación."""
+    scope = await queue_access.queue_scope(
+        session, specialty_id=doctor_specialty_id, is_admin=is_admin
+    )
+    waiting_stmt = _with_specialty_names(
         select(Consultation)
-        .options(selectinload(Consultation.patient), selectinload(Consultation.specialty_ref))
         .where(
             Consultation.assigned_doctor_id.is_(None),
-            Consultation.status.in_(_PANEL_WAITING_STATUSES),
+            Consultation.status == "waiting",
+            scope.sql_filter(),
         )
-        .order_by(Consultation.created_at.asc())
+        .order_by(Consultation.queued_at.asc(), Consultation.created_at.asc(), Consultation.id)
     )
-    mine_stmt = (
+    mine_stmt = _with_specialty_names(
         select(Consultation)
-        .options(selectinload(Consultation.patient), selectinload(Consultation.specialty_ref))
         .where(
             Consultation.assigned_doctor_id == doctor_user_id,
             Consultation.status.in_(_PANEL_MINE_STATUSES),
@@ -557,26 +591,233 @@ async def get_panel(
         )
     )
     waiting = list((await session.execute(waiting_stmt)).scalars().all())
-    if not is_admin:
-        # En Python y no en SQL a propósito: es la MISMA función que valida el claim, y
-        # duplicarla en SQL sería la forma de que las dos se desincronicen. La cola sin asignar
-        # es corta, así que el coste es irrelevante.
-        # Una sola consulta para los flags del médico; los del caso vienen con `specialty_ref`,
-        # que ya se precarga arriba (sin N+1).
-        doctor_flags = await flags_for_specialty_id(session, doctor_specialty_id)
-        waiting = [
-            c
-            for c in waiting
-            if can_attend_consultation(
-                doctor=doctor_flags,
-                consultation_is_mental_health=bool(
-                    c.specialty_ref and c.specialty_ref.is_mental_health
-                ),
-            )
-        ]
     mine = list((await session.execute(mine_stmt)).scalars().all())
     my_closed = (await session.execute(closed_stmt)).scalar_one()
-    return waiting, mine, my_closed
+    return waiting, mine, my_closed, scope
+
+
+# --- Derivación a la cola de otra especialidad ---
+
+
+async def derivation_targets(session: AsyncSession) -> list[Specialty]:
+    """Especialidades a las que se puede derivar un paciente: activas, no de relleno y con al
+    menos un médico habilitado mirando esa cola. Mandar un caso a una cola que nadie ve es dejar
+    al paciente esperando para siempre."""
+    stmt = (
+        select(Specialty)
+        .where(
+            Specialty.deleted_at.is_(None),
+            Specialty.status == "active",
+            Specialty.is_placeholder.is_(False),
+            practicing_doctor_exists(Specialty.id),
+        )
+        .order_by(Specialty.sort_order.asc(), Specialty.name.asc(), Specialty.id)
+    )
+    return list((await session.scalars(stmt)).all())
+
+
+async def _derivation_target(
+    session: AsyncSession, target_specialty_id: uuid.UUID, current_specialty_id: uuid.UUID | None
+) -> Specialty:
+    """Valida el destino de una derivación (422 con el motivo si no sirve)."""
+    target = await session.get(Specialty, target_specialty_id)
+    if (
+        target is None
+        or target.deleted_at is not None
+        or target.status != "active"
+        or target.is_placeholder
+    ):
+        raise UnprocessableError("La especialidad de destino no es válida.")
+    if target.id == current_specialty_id:
+        raise UnprocessableError("El caso ya está en la cola de esa especialidad.")
+    has_doctor = await session.scalar(select(practicing_doctor_exists(target.id)))
+    if not has_doctor:
+        raise UnprocessableError("Esa especialidad todavía no tiene médicos que atiendan su cola.")
+    return target
+
+
+async def derive_in_queue(
+    session: AsyncSession,
+    consultation_id: uuid.UUID,
+    *,
+    target_specialty_id: uuid.UUID,
+    actor_user_id: uuid.UUID,
+    actor_specialty_id: uuid.UUID | None,
+    actor_is_admin: bool,
+) -> Consultation:
+    """Deriva un caso que NADIE ha tomado a la cola de otra especialidad.
+
+    Es el mismo caso (nadie lo atendió: no hay acto médico que conservar), cambia de cola y
+    conserva `queued_at`, así que no pierde su turno. Solo lo deriva quien lo ve en su cola.
+
+    Escritura condicional sobre la especialidad que se leyó: si en el medio otro médico lo tomó
+    o lo derivó, el UPDATE no matchea y se responde 409 en vez de pisar su decisión."""
+    consultation = await get_consultation(session, consultation_id)
+    if consultation.status != "waiting" or consultation.assigned_doctor_id is not None:
+        raise ConflictError("Este caso ya no está en la cola.")
+    await queue_access.ensure_can_take(
+        session, consultation, specialty_id=actor_specialty_id, is_admin=actor_is_admin
+    )
+    origin_id = consultation.specialty_id
+    target = await _derivation_target(session, target_specialty_id, origin_id)
+    result = await session.execute(
+        update(Consultation)
+        .where(
+            Consultation.id == consultation_id,
+            Consultation.status == "waiting",
+            Consultation.assigned_doctor_id.is_(None),
+            Consultation.specialty_id == origin_id,
+        )
+        .values(specialty_id=target.id, derived_from_specialty_id=origin_id)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount == 0:
+        raise ConflictError("El caso cambió mientras lo derivabas: otro médico lo tomó o movió.")
+    session.add(
+        ConsultationEvent(
+            consultation_id=consultation_id,
+            event_type=DERIVED_EVENT,
+            created_by=actor_user_id,
+        )
+    )
+    await audit.log_action(
+        session,
+        action="consultation.derived",
+        actor_user_id=actor_user_id,
+        resource="consultations",
+        resource_id=consultation_id,
+        metadata={"from_specialty_id": str(origin_id), "to_specialty_id": str(target.id)},
+    )
+    await session.commit()
+    await session.refresh(consultation)
+    return consultation
+
+
+async def refer_to_queue(
+    session: AsyncSession,
+    parent_id: uuid.UUID,
+    *,
+    target_specialty_id: uuid.UUID,
+    reason: str,
+    signature: str | None,
+    actor_user_id: uuid.UUID,
+    actor_is_admin: bool,
+) -> Consultation:
+    """Derivar con especialista desde un caso YA atendido: el médico cierra su parte (firmada) y
+    el paciente entra a la cola de la especialidad destino, sin cita.
+
+    - Padre: `referred_to_specialist`, `closed_at`, firma y evento con el motivo. Sale de "Mis
+      pacientes" del médico.
+    - Hija: nueva consulta de la cadena en `waiting`, sin médico ni sala (la sala se crea al
+      tomarla), con la especialidad destino y el `queued_at` del padre (conserva su turno).
+      Evento `derived` con el motivo: es lo que ve el especialista.
+
+    El cierre del padre es condicional (sigue abierto y con el mismo médico): si en el medio un
+    admin lo cerró o lo reasignó, 409 en vez de derivar un caso que ya no es de quien deriva."""
+    parent = await get_consultation(session, parent_id)
+    if parent.assigned_doctor_id is None or parent.status not in _OPEN_ASSIGNED_STATUSES:
+        raise ConflictError("Solo se deriva con especialista un caso que se está atendiendo.")
+    _ensure_can_manage(parent, actor_user_id, actor_is_admin)
+    target = await _derivation_target(session, target_specialty_id, parent.specialty_id)
+
+    now = datetime.now(UTC)
+    values: dict = {"status": "referred_to_specialist", "closed_at": now}
+    if signature is not None:
+        values["close_signature"] = signature
+    result = await session.execute(
+        update(Consultation)
+        .where(
+            Consultation.id == parent.id,
+            Consultation.status.in_(_OPEN_ASSIGNED_STATUSES),
+            Consultation.assigned_doctor_id == parent.assigned_doctor_id,
+        )
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount == 0:
+        raise ConflictError("La consulta cambió mientras la derivabas. Recarga la página.")
+    session.add(
+        ConsultationEvent(
+            consultation_id=parent.id,
+            event_type="referred_to_specialist",
+            created_by=actor_user_id,
+            note=reason,
+        )
+    )
+    child = Consultation(
+        patient_id=parent.patient_id,
+        specialty_id=target.id,
+        derived_from_specialty_id=parent.specialty_id,
+        chief_complaint=parent.chief_complaint,
+        category=parent.category,
+        priority=parent.priority,
+        status="waiting",
+        parent_consultation_id=parent.id,
+        queued_at=parent.queued_at,
+    )
+    session.add(child)
+    await session.flush()
+    session.add(
+        ConsultationEvent(
+            consultation_id=child.id,
+            event_type=DERIVED_EVENT,
+            created_by=actor_user_id,
+            note=reason,
+        )
+    )
+    await audit.log_action(
+        session,
+        action="consultation.referred_to_queue",
+        actor_user_id=actor_user_id,
+        resource="consultations",
+        resource_id=child.id,
+        metadata={
+            "parent_id": str(parent.id),
+            "from_specialty_id": str(parent.specialty_id),
+            "to_specialty_id": str(target.id),
+        },
+    )
+    await session.commit()
+    await session.refresh(child)
+    return child
+
+
+@dataclass(frozen=True)
+class Derivation:
+    """Quién derivó el caso a su cola actual, desde qué especialidad y por qué."""
+
+    from_specialty: str | None
+    by_name: str | None
+    reason: str | None
+    at: datetime
+
+
+async def get_derivation(session: AsyncSession, consultation: Consultation) -> Derivation | None:
+    """La derivación más reciente del caso (None si nunca se derivó). El motivo y el autor salen
+    del evento `derived`: es la única copia del motivo."""
+    if consultation.derived_from_specialty_id is None:
+        return None
+    row = (
+        await session.execute(
+            select(ConsultationEvent.note, ConsultationEvent.created_at, Profile.full_name)
+            .outerjoin(Profile, Profile.id == ConsultationEvent.created_by)
+            .where(
+                ConsultationEvent.consultation_id == consultation.id,
+                ConsultationEvent.event_type == DERIVED_EVENT,
+            )
+            .order_by(ConsultationEvent.created_at.desc(), ConsultationEvent.id.desc())
+            .limit(1)
+        )
+    ).first()
+    from_name = await session.scalar(
+        select(Specialty.name).where(Specialty.id == consultation.derived_from_specialty_id)
+    )
+    return Derivation(
+        from_specialty=from_name,
+        by_name=row.full_name if row else None,
+        reason=row.note if row else None,
+        at=row.created_at if row else consultation.created_at,
+    )
 
 
 # `heartbeat` se eliminó: era el único escritor de `patient_last_seen_at` y no lo llamaba
@@ -598,16 +839,34 @@ async def mark_entered_call(session: AsyncSession, consultation_id: uuid.UUID) -
 
 
 async def ensure_video_room(session: AsyncSession, consultation_id: uuid.UUID) -> Consultation:
-    """Genera (idempotente) la sala Jitsi de la consulta. Si ya existe, la devuelve;
-    solo crea una nueva si la consulta está en espera (réplica de /api/videoconsulta)."""
+    """Genera (idempotente) la sala Jitsi de la consulta. Si ya existe, la devuelve; si no, la
+    crea mientras el caso siga abierto (en espera o en atención).
+
+    En atención también: la atención es siempre por video, y hay casos tomados sin sala (los que
+    se tomaron por WhatsApp o cuando fallaba la creación previa al claim). Su médico tiene que
+    poder abrirla desde el detalle.
+
+    Escritura condicional (`video_room_url IS NULL`): dos llamadas simultáneas no pueden dejar a
+    médico y paciente en salas distintas; la segunda relee la que ganó."""
     consultation = await get_consultation(session, consultation_id)
     if consultation.video_room_url:
         return consultation
-    if consultation.status != "waiting":
-        raise ConflictError("La consulta no está en espera.")
-    consultation.video_room_url = new_room_url()
+    if consultation.status not in _ROOM_STATUSES:
+        raise ConflictError("La consulta ya no está abierta.")
+    await session.execute(
+        update(Consultation)
+        .where(
+            Consultation.id == consultation_id,
+            Consultation.video_room_url.is_(None),
+            Consultation.status.in_(_ROOM_STATUSES),
+        )
+        .values(video_room_url=new_room_url())
+        .execution_options(synchronize_session=False)
+    )
     await session.commit()
     await session.refresh(consultation)
+    if not consultation.video_room_url:
+        raise ConflictError("La consulta ya no está abierta.")
     return consultation
 
 

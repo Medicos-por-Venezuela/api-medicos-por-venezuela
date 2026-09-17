@@ -11,6 +11,7 @@ from httpx import AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.models.consultation import Consultation
 from src.models.profile import Profile
 from src.models.specialty import Specialty
 from tests._helpers import any_specialty_id, auth_headers, make_doctor_row, make_profile
@@ -120,7 +121,9 @@ async def test_claim_asigna_caso_de_su_especialidad(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     doc = await _doctor(db_session, "Traumatología y ortopedia")
-    cid = await _consultation(client, ["Lesión física"])  # -> category 'Lesión física'
+    cid = await _consultation_with_specialty(
+        client, ["Lesión física"], "Traumatología y ortopedia"
+    )
 
     resp = await client.post(
         f"{PREFIX}/consultations/{cid}/claim", json={}, headers=auth_headers(doc.id)
@@ -130,6 +133,7 @@ async def test_claim_asigna_caso_de_su_especialidad(
     assert body["id"] == cid
     assert body["status"] == "in_progress"
     assert body["assigned_doctor_id"] == str(doc.id)
+    assert "/vamed-" in body["video_room_url"]
 
 
 async def test_psicologo_no_ve_caso_fisico_en_la_cola(
@@ -270,11 +274,32 @@ async def test_video_room_idempotent_and_conflict(client: AsyncClient) -> None:
     second = await client.post(f"{PREFIX}/consultations/{cid}/video-room", headers=room)
     assert second.json()["video_room_url"] == url
 
-    # Una consulta tomada (in_progress) y sin sala -> 409.
+    # Tomar el caso no le cambia la sala: el médico entra a la misma que ya tenía el paciente.
+    await client.post(f"{PREFIX}/queue/{cid}/take")
+    taken = await client.post(f"{PREFIX}/consultations/{cid}/video-room", headers=room)
+    assert taken.json()["video_room_url"] == url
+
+    # Un caso ya cerrado y sin sala -> 409: no se abren salas de consultas terminadas.
     cid2, room2 = await _consultation_and_room_headers(client, ["Medicina general"])
-    await client.post(f"{PREFIX}/queue/{cid2}/take")
+    await client.post(f"{PREFIX}/consultations/{cid2}/close", json={"outcome": "closed"})
     conflict = await client.post(f"{PREFIX}/consultations/{cid2}/video-room", headers=room2)
     assert conflict.status_code == 409
+
+
+async def test_video_room_se_crea_para_un_caso_en_atencion_sin_sala(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Los casos legacy tomados por WhatsApp no tienen sala. Su médico la abre desde el detalle:
+    la atención es siempre por video."""
+    cid, room = await _consultation_and_room_headers(client, ["Medicina general"])
+    consultation = await db_session.get(Consultation, uuid.UUID(cid))
+    consultation.status = "in_progress"
+    consultation.assigned_doctor_id = (await _doctor(db_session, "Medicina general")).id
+    await db_session.flush()
+
+    resp = await client.post(f"{PREFIX}/consultations/{cid}/video-room", headers=room)
+    assert resp.status_code == 200, resp.text
+    assert "/vamed-" in resp.json()["video_room_url"]
 
 
 # --- Token de acceso a la sala (hallazgo M3) ---

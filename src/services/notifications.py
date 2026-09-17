@@ -22,6 +22,7 @@ from src.core.tz import VET
 from src.models.consultation import Consultation
 from src.models.patient import Patient
 from src.models.profile import Profile
+from src.models.specialty import Specialty
 from src.services import mail_layout
 from src.services.mail import best_effort, esc, send_mail
 
@@ -281,6 +282,94 @@ async def send_video_ready_email(
     """Envía el aviso de "tu médico ya está en la sala". Best-effort (ver send_mail)."""
     subject, text, html = video_ready_email(patient_name, doctor_name, join_url, code)
     return await send_mail(to_email, subject, text, html, category="videoconsulta")
+
+
+# --- "Tu caso pasó a la cola de X" (derivación a otra especialidad) ---
+#
+# Sin esto el paciente derivado no se enteraba: seguía mirando una sala de espera que ya no era
+# la suya, y algunos terminaban creando otra cuenta y otra consulta.
+
+
+def build_waiting_room_url(consultation_id) -> str:
+    """Enlace a `/sala-espera` del caso, con un token fresco (el del registro caduca a las 24 h).
+    La página muestra el estado en vivo y el botón de entrar cuando un médico lo toma."""
+    base = settings.FRONTEND_URL.rstrip("/")
+    token = consultation_token.issue(consultation_id)
+    return f"{base}/sala-espera?cid={consultation_id}&t={token}"
+
+
+def derivation_email(
+    patient_name: str | None, specialty_name: str, waiting_url: str, code: str | None
+) -> tuple[str, str, str]:
+    """(subject, text, html) del aviso al paciente de que su caso pasó a otra especialidad."""
+    nombre = patient_name or "paciente"
+    subject = f"Tu caso pasó a la cola de {specialty_name}"
+    codigo_text = f"Código de caso: {code}\n" if code else ""
+    text = (
+        f"Hola {nombre},\n\n"
+        f"Tu caso pasó a la cola de {specialty_name}. Conservas tu lugar en la fila.\n\n"
+        "Cuando un especialista tome tu caso te llegará otro correo para entrar a la "
+        "videoconsulta. Hay muchos pacientes esperando, así que puede tardar: no hace falta "
+        "que vuelvas a registrarte.\n\n"
+        f"Puedes ver el estado de tu caso aquí:\n{waiting_url}\n\n"
+        f"{codigo_text}"
+        "Si tu situación empeora o hay señales de alarma, busca atención presencial urgente.\n"
+    )
+    url = esc(waiting_url)
+    codigo_html = (
+        f'<p style="color:{mail_layout.MUTED};font-size:14px;">'
+        f"<strong>Código de caso:</strong> {esc(code)}</p>"
+        if code
+        else ""
+    )
+    html = (
+        f"<p>Hola {esc(nombre)},</p>"
+        f"<p>Tu caso pasó a la cola de <strong>{esc(specialty_name)}</strong>. Conservas tu "
+        "lugar en la fila.</p>"
+        "<p>Cuando un especialista tome tu caso te llegará otro correo para entrar a la "
+        "videoconsulta. Hay muchos pacientes esperando, así que puede tardar: no hace falta que "
+        "vuelvas a registrarte.</p>"
+        f'<p style="margin:26px 0;">{mail_layout.button(url, "Ver el estado de mi caso")}</p>'
+        f"{codigo_html}"
+        f'<p style="color:{mail_layout.MUTED};font-size:13px;word-break:break-all;">'
+        f'Si el botón no funciona, copia este enlace: <a href="{url}" '
+        f'style="color:{mail_layout.BLUE};">{url}</a></p>'
+        '<p style="background:#fff7ed;border-left:4px solid #f59e0b;padding:12px 14px;'
+        'margin:22px 0 0;font-size:14px;">Si tu situación empeora o hay señales de alarma, '
+        "busca atención presencial urgente.</p>"
+    )
+    return subject, text, html
+
+
+async def derivation_mail_args(session: AsyncSession, consultation: Consultation) -> dict | None:
+    """Args para `send_derivation_email`, o None si el paciente no tiene correo. Se resuelve con
+    la sesión viva (el BackgroundTask corre tras cerrar la request)."""
+    patient = await session.get(Patient, consultation.patient_id)
+    if patient is None or not patient.email:
+        return None
+    specialty_name = await session.scalar(
+        select(Specialty.name).where(Specialty.id == consultation.specialty_id)
+    )
+    return {
+        "to_email": patient.email,
+        "patient_name": patient.full_name,
+        "specialty_name": specialty_name or "otra especialidad",
+        "waiting_url": build_waiting_room_url(consultation.id),
+        "code": consultation.code,
+    }
+
+
+@best_effort
+async def send_derivation_email(
+    to_email: str,
+    patient_name: str | None,
+    specialty_name: str,
+    waiting_url: str,
+    code: str | None,
+) -> bool:
+    """Envía el aviso de derivación. Best-effort (ver send_mail)."""
+    subject, text, html = derivation_email(patient_name, specialty_name, waiting_url, code)
+    return await send_mail(to_email, subject, text, html, category="derivacion")
 
 
 async def appointment_email_args(session: AsyncSession, consultation: Consultation) -> dict | None:

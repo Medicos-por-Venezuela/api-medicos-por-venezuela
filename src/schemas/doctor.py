@@ -114,11 +114,26 @@ class DoctorSelfUpdate(BaseModel):
     specialty_id: uuid.UUID | None = None
     professional_type_id: uuid.UUID | None = None
     cedula: str | None = Field(default=None, pattern=_CEDULA_PATTERN)
+    # "Mi especialidad no está en la lista": la escribe a mano y queda pendiente de que un admin
+    # la agregue al catálogo. Mientras tanto el médico no ve la cola (su especialidad es "Otra").
+    requested_specialty: str | None = Field(default=None, min_length=2, max_length=120)
 
     @field_validator("cedula")
     @classmethod
     def _normalize_cedula(cls, value: str | None) -> str | None:
         return value.upper() if value is not None else None
+
+    @field_validator("requested_specialty")
+    @classmethod
+    def _clean_requested_specialty(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = " ".join(value.split())
+        if len(value) < 2:
+            raise ValueError("Escribe el nombre de tu especialidad.")
+        if "<" in value or ">" in value:
+            raise ValueError("El nombre de la especialidad no puede contener HTML.")
+        return value
 
 
 class DoctorMeResponse(BaseModel):
@@ -143,6 +158,10 @@ class DoctorMeResponse(BaseModel):
     professional_type_id: uuid.UUID | None = None
     professional_type: str | None = None
     verified: bool
+    # Su especialidad es de relleno ("Otra"): no ve la cola hasta elegir una real.
+    specialty_is_placeholder: bool = False
+    # La que escribió a mano y espera revisión de un admin (None si no hay ninguna pendiente).
+    requested_specialty: str | None = None
 
 
 class DoctorResponse(BaseModel):
@@ -248,6 +267,31 @@ class DoctorPoolPage(BaseModel):
 
     items: list[DoctorPoolItem]
     total: int
+
+
+class SpecialtyRequestItem(BaseModel):
+    """Un médico que escribió una especialidad que no está en el catálogo."""
+
+    doctor_id: uuid.UUID
+    user_id: uuid.UUID | None = None
+    full_name: str
+    email: str | None = None
+    specialty: str | None = None  # la que tiene hoy (normalmente "Otra")
+    requested_specialty: str
+    requested_at: datetime | None = None
+
+
+class SpecialtyRequestPage(BaseModel):
+    items: list[SpecialtyRequestItem]
+    total: int
+
+
+class SpecialtyRequestResolve(BaseModel):
+    """Especialidad del catálogo que se le asigna (si era nueva, se crea antes en el catálogo)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    specialty_id: uuid.UUID
 
 
 class DoctorContactResponse(BaseModel):
