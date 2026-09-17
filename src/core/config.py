@@ -99,6 +99,15 @@ class Settings(BaseSettings):
     # estancada y se devuelve a 'waiting' (la libera para otro médico).
     STALE_CONSULTATION_MINUTES: int = 30
 
+    # --- Sala de espera en vivo (SSE, ver services/waiting_room.py) ---
+    # Cada cuánto el stream relee el estado del caso. Es una lectura por PK por paciente con la
+    # sala abierta: 4 s hace que el botón aparezca casi al instante sin cargar la base.
+    WAITING_ROOM_POLL_SECONDS: float = 4.0
+    # Latido si no hubo eventos: por debajo del timeout de inactividad de cualquier proxy.
+    WAITING_ROOM_HEARTBEAT_SECONDS: float = 15.0
+    # Vida máxima de un stream; el cliente reconecta. Acota conexiones colgadas.
+    WAITING_ROOM_STREAM_MAX_SECONDS: float = 300.0
+
     # --- Videoconsulta (Jitsi) ---
     # Instancia self-hosted (salas abiertas, sin moderador). NO se usa el público meet.jit.si por
     # defecto porque ahora exige login de moderador ("no moderators have yet arrived"). Override

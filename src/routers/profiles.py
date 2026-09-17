@@ -45,14 +45,17 @@ async def list_profiles(
     roles: list[str] | None = Query(None, description="Uno o varios roles (p. ej. staff)."),
     search: str | None = Query(None, description="Filtra por nombre, email o especialidad."),
     active: bool | None = Query(None, description="true=activos, false=revocados, omitir=ambos."),
+    specialty_id: uuid.UUID | None = Query(
+        None, description="Filtra por una especialidad que ejerza (principal o del conjunto)."
+    ),
     created_from: date | None = Query(None),
     created_to: date | None = Query(None),
     db: AsyncSession = Depends(get_db),
     _: Principal = Depends(require_permission("profiles.read")),
 ) -> ProfileListResponse:
     """Lista paginada de perfiles + total exacto. Filtros: `role`/`roles`, `search` (nombre/email/
-    especialidad), `active` (revocado o no) y rango de fechas. Reemplaza el acceso directo del
-    panel admin a la tabla `users`."""
+    especialidad), `active` (revocado o no), `specialty_id` (cualquiera de las que ejerce) y rango
+    de fechas. Reemplaza el acceso directo del panel admin a la tabla `users`."""
     items, total = await profiles_service.list_profiles(
         db,
         skip=skip,
@@ -61,14 +64,17 @@ async def list_profiles(
         roles=roles,
         search=search,
         active=active,
+        specialty_id=specialty_id,
         created_from=created_from,
         created_to=created_to,
     )
     # `doctor_verified` no sale del ORM (viene del LEFT JOIN), así que se inyecta tras validar.
     return ProfileListResponse(
         items=[
-            ProfileListItem.model_validate(p).model_copy(update={"doctor_verified": verified})
-            for p, verified in items
+            ProfileListItem.model_validate(p).model_copy(
+                update={"doctor_verified": verified, "specialties": especialidades}
+            )
+            for p, verified, especialidades in items
         ],
         total=total,
     )

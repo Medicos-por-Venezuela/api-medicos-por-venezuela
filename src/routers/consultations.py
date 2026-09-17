@@ -20,18 +20,21 @@ from fastapi import (
     Request,
     status,
 )
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.core import consultation_token
 from src.core.config import settings
 from src.core.ratelimit import limiter
 from src.core.security import (
     Principal,
+    bearer_credentials,
     get_current_principal,
     get_optional_principal,
     require_permission,
 )
-from src.db.session import get_db
+from src.db.session import get_db, get_session_factory
 from src.models.consultation import Consultation
 from src.models.patient import Patient
 from src.schemas.consultation import (
@@ -45,18 +48,24 @@ from src.schemas.consultation import (
     ConsultationPatientResponse,
     ConsultationResponse,
     ConsultationUpdate,
+    DerivationInfo,
+    DerivationTargetResponse,
+    DeriveRequest,
     PanelConsultationItem,
     PanelWaitingItem,
+    QueueGroupResponse,
+    ReferToQueueRequest,
     ReminderRunResponse,
     ScheduleFollowUpRequest,
     ScheduleReferralRequest,
+    WaitingRoomResponse,
 )
 from src.schemas.consultation_event import (
     ConsultationEventCreate,
     ConsultationEventResponse,
 )
 from src.services import consultations as consultations_service
-from src.services import notifications, registration_mail
+from src.services import notifications, registration_mail, waiting_room
 
 logger = logging.getLogger("mpv.api")
 
@@ -103,11 +112,31 @@ async def _queue_new_patient_alert(
         background_tasks.add_task(registration_mail.send_new_patient_alert, **args)
 
 
+async def _queue_derivation_email(
+    background_tasks: BackgroundTasks, db: AsyncSession, consultation: Consultation
+) -> None:
+    """Encola el aviso al paciente de que su caso pasó a otra cola (best-effort, fuera de la
+    request). Sin correo del paciente no se encola nada."""
+    args = await notifications.derivation_mail_args(db, consultation)
+    if args:
+        background_tasks.add_task(notifications.send_derivation_email, **args)
+
+
 async def require_consultation_token(
     consultation_id: uuid.UUID,
     x_consultation_token: str | None = Header(default=None, alias=_CONSULTATION_TOKEN_HEADER),
     principal: Principal | None = Depends(get_optional_principal),
     db: AsyncSession = Depends(get_db),
+) -> None:
+    """Dependencia de `authorize_consultation_access` (ver ahí las reglas)."""
+    await authorize_consultation_access(db, consultation_id, x_consultation_token, principal)
+
+
+async def authorize_consultation_access(
+    db: AsyncSession,
+    consultation_id: uuid.UUID,
+    x_consultation_token: str | None,
+    principal: Principal | None,
 ) -> None:
     """Exige el token de sala de ESTA consulta (hallazgo M3), una sesión de staff, **o** la
     sesión del propio paciente dueño de la consulta.
@@ -221,9 +250,14 @@ async def consultation_panel(
     principal: Principal = Depends(require_permission("queue.read")),
 ) -> ConsultationPanelResponse:
     """Todo lo que el panel del médico necesita en una llamada: la cola de espera (casos sin
-    asignar), las consultas abiertas del propio médico y cuántas ha cerrado. Reemplaza las
-    lecturas directas a Supabase del panel."""
-    waiting, mine, my_closed = await consultations_service.get_panel(
+    asignar), las consultas abiertas del propio médico y cuántas ha cerrado.
+
+    `queues` son las colas que el panel pinta por separado: una por especialidad del médico (puede
+    tener varias) más la de entrada (Medicina general, donde caen los pacientes que no saben qué
+    necesitan) si atiende salud física. Con una sola cola el panel muestra la lista directa. Un
+    admin las ve todas: si además es especialista se le añade una cola `is_rest` con el resto, y
+    si no ejerce ninguna especialidad no recibe colas (una sola lista)."""
+    waiting, mine, my_closed, scope = await consultations_service.get_panel(
         db,
         principal.id,
         doctor_specialty_id=principal.specialty_id,
@@ -233,7 +267,35 @@ async def consultation_panel(
         waiting=[PanelWaitingItem.model_validate(c) for c in waiting],
         mine=[PanelConsultationItem.model_validate(c) for c in mine],
         my_closed_count=my_closed,
+        queue_blocked_reason=scope.blocked_reason,
+        queues=[
+            QueueGroupResponse(
+                id=g.id,
+                name=g.name,
+                is_triage=g.is_triage,
+                is_rest=g.is_rest,
+                specialty_ids=sorted(g.specialty_ids),
+            )
+            for g in scope.groups
+        ],
     )
+
+
+# NOTA: antes de "/{consultation_id}" por lo mismo que "/panel".
+@router.get(
+    "/derivation-targets",
+    response_model=list[DerivationTargetResponse],
+    summary="Especialidades a las que se puede derivar un paciente",
+)
+async def derivation_targets(
+    db: AsyncSession = Depends(get_db),
+    _: Principal = Depends(require_permission("queue.read")),
+) -> list[DerivationTargetResponse]:
+    """Especialidades activas, que no son de relleno ("Otra") y con al menos un médico
+    habilitado atendiendo su cola. Es la lista del modal "Derivar a especialista": derivar a una
+    cola que nadie mira dejaría al paciente esperando para siempre."""
+    targets = await consultations_service.derivation_targets(db)
+    return [DerivationTargetResponse.model_validate(t) for t in targets]
 
 
 # NOTA: debe ir ANTES de "/{consultation_id}" o FastAPI intenta parsear "agenda" como UUID (422).
@@ -283,13 +345,17 @@ async def get_consultation(
     """Staff recibe la vista completa (incluye notas clínicas/internas) + el paciente anidado, para
     que el panel no lea `patients` directo. Un paciente autenticado solo recibe su propia consulta
     sin las notas del médico."""
-    consultation = await consultations_service.get_consultation(
+    consultation = await consultations_service.get_consultation_detail(
         db, consultation_id, viewer_is_staff=principal.is_staff, viewer_user_id=principal.id
     )
     if principal.is_staff:
         # Poblar la relación `patient` explícitamente (evita el lazy-load async) para el detalle.
         consultation.patient = await db.get(Patient, consultation.patient_id)
-        return ConsultationDetailResponse.model_validate(consultation)
+        response = ConsultationDetailResponse.model_validate(consultation)
+        derivation = await consultations_service.get_derivation(db, consultation)
+        if derivation is not None:
+            response.derivation = DerivationInfo.model_validate(derivation)
+        return response
     return ConsultationPatientResponse.model_validate(consultation)
 
 
@@ -465,34 +531,169 @@ async def consultation_chain(
 )
 async def claim_consultation(
     consultation_id: uuid.UUID,
-    payload: ConsultationClaimRequest,
     background_tasks: BackgroundTasks,
+    payload: ConsultationClaimRequest | None = None,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("queue.take")),
 ) -> ConsultationResponse:
-    """El médico autenticado toma un caso en espera. Atómico: si otro médico lo tomó primero
-    responde 409 (nunca dos médicos sobre el mismo paciente). `via_whatsapp` marca atención
-    por WhatsApp (sin sala de video).
+    """El médico autenticado toma un caso en espera de sus colas. Atómico: si otro médico lo
+    tomó primero responde 409 (nunca dos médicos sobre el mismo paciente).
 
-    Si el caso se toma **por video**, se le manda al paciente el correo "tu médico ya está en
-    la sala" con el enlace de la videoconsulta. Es la única notificación que recibe: el enlace
-    vivía solo en la pestaña de `/sala-espera` a la que cayó al registrarse, así que quien la
-    cerró no tenía cómo volver. No sale en la toma por WhatsApp, donde no hay sala y el
-    contacto lo inicia el médico.
+    La atención es **siempre por videoconsulta**: el mismo UPDATE crea la sala si el caso no
+    tenía, y al paciente le sale el correo "tu médico ya está en la sala" con el enlace. El
+    cuerpo es opcional; `{"via_whatsapp": true}` (el panel anterior) responde 422.
     """
+    del payload  # solo existe para rechazar `via_whatsapp: true` en la validación
     consultation = await consultations_service.claim_consultation(
         db,
         consultation_id,
         doctor_user_id=principal.id,
-        via_whatsapp=payload.via_whatsapp,
         doctor_specialty_id=principal.specialty_id,
         is_admin=principal.is_admin,
     )
-    if not payload.via_whatsapp:
-        video_args = await notifications.video_ready_mail_args(db, consultation)
-        if video_args:
-            background_tasks.add_task(notifications.send_video_ready_email, **video_args)
+    video_args = await notifications.video_ready_mail_args(db, consultation)
+    if video_args:
+        background_tasks.add_task(notifications.send_video_ready_email, **video_args)
     return ConsultationResponse.model_validate(consultation)
+
+
+@router.post(
+    "/{consultation_id}/derive",
+    response_model=ConsultationResponse,
+    summary="Derivar un caso de la cola a otra especialidad (sin tomarlo)",
+    responses={
+        **_NOT_FOUND,
+        403: {"description": "El caso no es de las colas del médico."},
+        409: {"description": "El caso ya no está en la cola o cambió mientras se derivaba."},
+        422: {"description": "Especialidad de destino inválida, igual a la actual o sin médicos."},
+    },
+)
+async def derive_consultation(
+    consultation_id: uuid.UUID,
+    payload: DeriveRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_permission("queue.take")),
+) -> ConsultationResponse:
+    """Pasa un caso que nadie tomó a la cola de otra especialidad. Es el mismo caso: conserva
+    su hora de llegada, así que el paciente no pierde el turno. Solo lo deriva quien lo ve en su
+    cola, y se le avisa al paciente por correo."""
+    consultation = await consultations_service.derive_in_queue(
+        db,
+        consultation_id,
+        target_specialty_id=payload.specialty_id,
+        actor_user_id=principal.id,
+        actor_specialty_id=principal.specialty_id,
+        actor_is_admin=principal.is_admin,
+    )
+    await _queue_derivation_email(background_tasks, db, consultation)
+    return ConsultationResponse.model_validate(consultation)
+
+
+@router.post(
+    "/{consultation_id}/refer-to-queue",
+    response_model=ConsultationResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Derivar con especialista: cierra esta consulta y manda al paciente a otra cola",
+    responses={
+        **_NOT_FOUND,
+        409: {"description": "La consulta no se está atendiendo o es de otro médico."},
+        422: {"description": "Especialidad de destino inválida, igual a la actual o sin médicos."},
+    },
+)
+async def refer_to_queue(
+    consultation_id: uuid.UUID,
+    payload: ReferToQueueRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_permission("consultations.close")),
+) -> ConsultationResponse:
+    """El médico que atiende deriva al paciente a otra especialidad, sin cita: su consulta queda
+    `referred_to_specialist` (firmada, con el motivo) y se crea una consulta hija en la cola de
+    la especialidad destino, con la hora de llegada original. La atiende el primer especialista
+    que la tome, que verá quién la derivó y por qué. Devuelve la consulta hija."""
+    child = await consultations_service.refer_to_queue(
+        db,
+        consultation_id,
+        target_specialty_id=payload.specialty_id,
+        reason=payload.reason,
+        signature=payload.signature,
+        actor_user_id=principal.id,
+        actor_is_admin=principal.is_admin,
+    )
+    await _queue_derivation_email(background_tasks, db, child)
+    return ConsultationResponse.model_validate(child)
+
+
+@router.get(
+    "/{consultation_id}/waiting-room",
+    response_model=WaitingRoomResponse,
+    summary="Estado de la sala de espera del paciente (sin sesión, con token)",
+    responses={**_NOT_FOUND, **_TOKEN_RESPONSES},
+)
+async def waiting_room_status(
+    consultation_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_consultation_token),
+) -> WaitingRoomResponse:
+    """¿Ya hay un médico? Para `/sala-espera` y `/mi-caso`. `phase=ready` trae la sala y el
+    nombre del médico; antes no hay sala que mostrar. Si el paciente fue derivado responde por el
+    caso vigente de la cadena (con un token para él). Acepta el token de la consulta, la sesión
+    del paciente dueño o staff. Es el respaldo del stream SSE."""
+    state = await waiting_room.snapshot(db, consultation_id)
+    return waiting_room.with_access_token(state, consultation_id)
+
+
+@router.get(
+    "/{consultation_id}/waiting-room/stream",
+    summary="Estado de la sala de espera en vivo (SSE)",
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "description": (
+                "`text/event-stream`: evento `status` (mismo cuerpo que `/waiting-room`) al "
+                "conectar y en cada cambio; `: ping` de latido; `gone` si el caso desaparece."
+            ),
+            "content": {"text/event-stream": {}},
+        },
+        **_NOT_FOUND,
+        **_TOKEN_RESPONSES,
+    },
+)
+async def waiting_room_stream(
+    consultation_id: uuid.UUID,
+    x_consultation_token: str | None = Header(default=None, alias=_CONSULTATION_TOKEN_HEADER),
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_credentials),
+    session_factory: async_sessionmaker[AsyncSession] = Depends(get_session_factory),
+) -> StreamingResponse:
+    """Igual que `/waiting-room`, pero empuja los cambios: el botón "Entrar a la videoconsulta"
+    aparece solo cuando un médico toma el caso, sin recargar.
+
+    Se autoriza y se valida que el caso exista con una sesión corta ANTES de abrir el stream
+    (así un 401/404 es una respuesta normal), y cada lectura del stream abre y cierra la suya:
+    no se retiene una conexión del pool por paciente en espera. El stream termina a los
+    `WAITING_ROOM_STREAM_MAX_SECONDS` o cuando el caso termina; el cliente reconecta."""
+    async with session_factory() as db:
+        principal = await get_current_principal(credentials, db) if credentials else None
+        await authorize_consultation_access(db, consultation_id, x_consultation_token, principal)
+        await waiting_room.current_in_chain(db, consultation_id)  # 404 antes de abrir el stream
+
+    async def fetch() -> WaitingRoomResponse:
+        async with session_factory() as session:
+            return await waiting_room.snapshot(session, consultation_id)
+
+    events = waiting_room.sse_events(
+        fetch,
+        requested_id=consultation_id,
+        poll_seconds=settings.WAITING_ROOM_POLL_SECONDS,
+        heartbeat_seconds=settings.WAITING_ROOM_HEARTBEAT_SECONDS,
+        max_seconds=settings.WAITING_ROOM_STREAM_MAX_SECONDS,
+    )
+    return StreamingResponse(
+        events,
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post(
@@ -521,7 +722,7 @@ async def mark_entered_call(
     responses={
         **_NOT_FOUND,
         **_TOKEN_RESPONSES,
-        409: {"description": "La consulta no está en espera."},
+        409: {"description": "La consulta ya no está abierta."},
     },
 )
 @limiter.limit(settings.PUBLIC_WRITE_RATE_LIMIT)
@@ -531,9 +732,9 @@ async def ensure_video_room(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(require_consultation_token),
 ) -> ConsultationResponse:
-    """Genera la sala Jitsi si no existe (solo en estado `waiting`); si ya existe, devuelve la
-    misma URL (idempotente). Exige el token de acceso de ESA consulta: devolver la URL de una
-    videoconsulta médica a quien solo conozca el id era el hallazgo M3."""
+    """Genera la sala Jitsi si no existe (mientras el caso siga en espera o en atención); si ya
+    existe, devuelve la misma URL (idempotente). Exige el token de acceso de ESA consulta:
+    devolver la URL de una videoconsulta médica a quien solo conozca el id era el hallazgo M3."""
     return await consultations_service.ensure_video_room(db, consultation_id)
 
 

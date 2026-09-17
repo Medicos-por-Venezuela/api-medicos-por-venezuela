@@ -4,12 +4,15 @@ import uuid
 from datetime import date, timedelta
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.dialects.postgresql import aggregate_order_by
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import BadRequestError, ForbiddenError, NotFoundError
 from src.models.doctor import Doctor
+from src.models.doctor_specialty import DoctorSpecialty
 from src.models.patient import Patient
 from src.models.profile import Profile
+from src.models.specialty import Specialty
 from src.services import audit
 from src.services import specialties as specialties_service
 
@@ -26,17 +29,23 @@ async def list_profiles(
     roles: list[str] | None = None,
     search: str | None = None,
     active: bool | None = None,
+    specialty_id: uuid.UUID | None = None,
     created_from: date | None = None,
     created_to: date | None = None,
-) -> tuple[list[tuple[Profile, bool | None]], int]:
+) -> tuple[list[tuple[Profile, bool | None, list[str]]], int]:
     """Perfiles filtrados + total exacto (para la tabla de médicos/usuarios del admin). Reemplaza
     el acceso directo del frontend a `users`. Filtros: uno o varios roles, estado activo/revocado,
     rango de fechas, y búsqueda por nombre/email/especialidad. Todo con parámetros enlazados.
 
     Cada fila viene con el `doctors.verified` de esa persona (o `None` si no tiene ficha de
-    médico). OJO: NO es `users.verified`, que nace `true` y ningún camino la baja — el dato real de
-    credencial, el que sale de contrastar la cédula con SACS/FPV, vive en `doctors`. La lista del
-    admin mostraba la primera y por eso pintaba a todo el mundo como verificado."""
+    médico) y con las especialidades que ejerce. OJO: `verified` NO es `users.verified`, que nace
+    `true` y ningún camino la baja — el dato real de credencial, el que sale de contrastar la
+    cédula con SACS/FPV, vive en `doctors`. La lista del admin mostraba la primera y por eso
+    pintaba a todo el mundo como verificado.
+
+    `specialty_id` filtra por **cualquiera** de las que ejerce (`doctor_specialties`), no solo por
+    la principal: desde que un médico puede tener varias, filtrar por la principal escondería al
+    internista que además es cardiólogo de la lista de Cardiología."""
     conditions = []
     if roles:
         conditions.append(Profile.role.in_(roles))
@@ -55,6 +64,19 @@ async def list_profiles(
         )
     if active is not None:
         conditions.append(Profile.active.is_(active))
+    if specialty_id is not None:
+        # La principal o cualquiera del conjunto: son la misma pregunta para quien filtra.
+        conditions.append(
+            or_(
+                Profile.specialty_id == specialty_id,
+                select(DoctorSpecialty.user_id)
+                .where(
+                    DoctorSpecialty.user_id == Profile.id,
+                    DoctorSpecialty.specialty_id == specialty_id,
+                )
+                .exists(),
+            )
+        )
     if created_from is not None:
         conditions.append(Profile.created_at >= created_from)
     if created_to is not None:
@@ -75,8 +97,21 @@ async def list_profiles(
     # user_id IS NOT NULL). Sin ese filtro, una ficha borrada duplicaría la fila del usuario y
     # descuadraría la página contra el total. En el WHERE además convertiría el LEFT JOIN en INNER
     # y haría desaparecer a los que no son médicos.
+    # Las especialidades que ejerce, en la MISMA consulta de la página (subconsulta correlacionada
+    # con array_agg) por lo mismo que el JOIN de arriba: una consulta por fila sería un N+1 en la
+    # pantalla más usada del admin.
+    especialidades = (
+        select(
+            func.coalesce(func.array_agg(aggregate_order_by(Specialty.name, Specialty.name)), [])
+        )
+        .select_from(DoctorSpecialty)
+        .join(Specialty, Specialty.id == DoctorSpecialty.specialty_id)
+        .where(DoctorSpecialty.user_id == Profile.id, Specialty.deleted_at.is_(None))
+        .correlate(Profile)
+        .scalar_subquery()
+    )
     stmt = (
-        select(Profile, Doctor.verified)
+        select(Profile, Doctor.verified, especialidades)
         .outerjoin(Doctor, (Doctor.user_id == Profile.id) & (Doctor.deleted_at.is_(None)))
         .order_by(Profile.created_at.desc())
         .offset(skip)
@@ -85,7 +120,10 @@ async def list_profiles(
     if conditions:
         stmt = stmt.where(*conditions)
     rows = (await session.execute(stmt)).all()
-    return [(profile, doctor_verified) for profile, doctor_verified in rows], total
+    return [
+        (profile, doctor_verified, list(nombres or []))
+        for profile, doctor_verified, nombres in rows
+    ], total
 
 
 async def get_profile(session: AsyncSession, profile_id: uuid.UUID) -> Profile:

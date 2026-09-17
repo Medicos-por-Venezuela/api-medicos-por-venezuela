@@ -36,6 +36,12 @@ class Doctor(Base):
     status: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
     # Lo fija el backend según SACS/FPV al registrar.
     verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    # Especialidad escrita a mano porque no está en el catálogo, pendiente de que un admin la
+    # agregue o asigne una existente. Mientras tanto la ficha conserva su especialidad de relleno.
+    requested_specialty: Mapped[str | None] = mapped_column(String, nullable=True)
+    requested_specialty_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

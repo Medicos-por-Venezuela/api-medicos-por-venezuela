@@ -36,6 +36,9 @@ from src.schemas.doctor import (
     DoctorResponse,
     DoctorSelfUpdate,
     DoctorUpdate,
+    SpecialtyRequestItem,
+    SpecialtyRequestPage,
+    SpecialtyRequestResolve,
 )
 from src.services import doctors as doctors_service
 from src.services import registration_mail
@@ -262,6 +265,28 @@ async def update_my_doctor(
 
 # NOTA: debe ir ANTES de "/{doctor_id}" o FastAPI intenta parsear el literal como UUID (422).
 @router.get(
+    "/specialty-requests",
+    response_model=SpecialtyRequestPage,
+    summary="Especialidades escritas a mano por médicos, pendientes de revisión (admin)",
+    responses={403: {"description": "Requiere el permiso doctors.verify."}},
+)
+async def specialty_requests(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    _: Principal = Depends(require_permission("doctors.verify")),
+) -> SpecialtyRequestPage:
+    """Médicos cuya especialidad no estaba en el catálogo y la escribieron en su perfil. No ven
+    la cola hasta que un admin la agregue al catálogo (o les asigne una existente) con
+    `POST /doctors/{id}/specialty-request/resolve`. Las más antiguas primero."""
+    rows, total = await doctors_service.list_specialty_requests(db, skip=skip, limit=limit)
+    return SpecialtyRequestPage(
+        items=[SpecialtyRequestItem.model_validate(r, from_attributes=True) for r in rows],
+        total=total,
+    )
+
+
+@router.get(
     "/credential-summary",
     response_model=DoctorCredentialSummary,
     summary="Resumen de credenciales: cuántos atienden y cuántos están bloqueados (staff)",
@@ -419,6 +444,31 @@ async def approve_doctor(
         if args:
             background_tasks.add_task(registration_mail.send_doctor_approved_email, **args)
     return doctor
+
+
+@router.post(
+    "/{doctor_id}/specialty-request/resolve",
+    response_model=DoctorResponse,
+    summary="Asignar la especialidad que un médico pidió agregar (admin)",
+    responses={
+        **_NOT_FOUND,
+        403: {"description": "Requiere el permiso doctors.verify."},
+        409: {"description": "El médico no tiene una especialidad pendiente de revisión."},
+        422: {"description": "La especialidad no existe, está borrada o es de relleno."},
+    },
+)
+async def resolve_specialty_request(
+    doctor_id: uuid.UUID,
+    payload: SpecialtyRequestResolve,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_permission("doctors.verify")),
+) -> DoctorResponse:
+    """Le asigna al médico una especialidad del catálogo y cierra su solicitud: desde ese
+    momento ve la cola de esa especialidad. Si la que escribió no existía, se crea primero con
+    `POST /specialties`. Queda en `audit_log` como `doctor.specialty_request_resolved`."""
+    return await doctors_service.resolve_specialty_request(
+        db, doctor_id, payload.specialty_id, actor_user_id=principal.id
+    )
 
 
 @router.post(

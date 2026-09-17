@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.doctor import Doctor
 from src.models.profile import Profile
-from tests._helpers import make_profile
+from tests._helpers import GENERAL, make_profile, set_specialties, specialty_id_by_name
 
 PREFIX = "/api/v1"
 
@@ -246,3 +246,42 @@ async def test_auth_me_conserva_el_contexto_de_medico(client: AsyncClient) -> No
         assert campo in body, f"{campo} debe seguir en /auth/me"
     # Y el del listado no se cuela aquí: /auth/me no lo puebla.
     assert "doctor_verified" not in body
+
+
+async def test_el_listado_trae_las_especialidades_que_ejerce(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """La tabla del admin muestra la especialidad, y un médico puede ejercer varias: salen todas,
+    no solo la principal."""
+    perfil = _named("doctor")
+    db_session.add(perfil)
+    await db_session.flush()
+    await set_specialties(db_session, perfil.id, ["Medicina interna", "Cardiología"])
+
+    fila = await _fetch_one(client, perfil)
+
+    assert fila["specialties"] == ["Cardiología", "Medicina interna"]  # por nombre
+    assert fila["specialty"] == "Medicina interna"  # la principal no cambia
+
+
+async def test_filtrar_por_especialidad_incluye_las_no_principales(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Filtrar por Cardiología tiene que traer también al internista que además es cardiólogo: si
+    mirara solo `users.specialty_id`, la lista de esa especialidad escondería a media plantilla."""
+    doble = _named("doctor")
+    otro = _named("doctor")
+    db_session.add_all([doble, otro])
+    await db_session.flush()
+    await set_specialties(db_session, doble.id, ["Medicina interna", "Cardiología"])
+    await set_specialties(db_session, otro.id, [GENERAL])
+    cardio = await specialty_id_by_name(db_session, "Cardiología")
+
+    resp = await client.get(
+        f"{PREFIX}/profiles", params={"specialty_id": str(cardio), "limit": 100}
+    )
+
+    assert resp.status_code == 200
+    ids = {p["id"] for p in resp.json()["items"]}
+    assert str(doble.id) in ids
+    assert str(otro.id) not in ids
