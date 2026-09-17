@@ -543,7 +543,15 @@ protege el endpoint con `require_permission("...")`. Nunca lo insertes a mano.
 | `POST/PATCH/DELETE` | `/specialties` / `/specialties/{id}` | CRUD de especialidades (admin/super_admin) |
 | `POST`  | `/consultations/{id}/close`         | Cerrar / no-show (+ evento de auditoría) |
 | `POST`  | `/consultations/{id}/heartbeat`     | Presencia del paciente (sala de espera) |
-| `POST`  | `/consultations/{id}/video-room`    | Sala Jitsi idempotente               |
+| `POST`  | `/consultations/{id}/video-room`    | Sala Jitsi idempotente (espera o atención) |
+| `POST`  | `/consultations/{id}/claim`         | Tomar un caso de la cola (crea la sala en el mismo UPDATE) |
+| `GET`   | `/consultations/derivation-targets` | Especialidades con médicos para derivar |
+| `POST`  | `/consultations/{id}/derive`        | Derivar un caso de la cola a otra especialidad |
+| `POST`  | `/consultations/{id}/refer-to-queue`| Derivar con especialista (firmado, sin cita) |
+| `GET`   | `/consultations/{id}/waiting-room`  | Estado de la sala de espera del paciente |
+| `GET`   | `/consultations/{id}/waiting-room/stream` | Lo mismo por SSE             |
+| `GET`   | `/doctors/specialty-requests`       | Especialidades escritas por médicos (admin) |
+| `POST`  | `/doctors/{id}/specialty-request/resolve` | Asignarle una del catálogo (admin) |
 | `POST`  | `/profiles/{id}/online`             | Presencia del médico (`last_seen_at`) |
 | `PATCH` | `/profiles/{id}/active`             | Revocar / reactivar médico (admin)   |
 | `POST`  | `/profiles/{id}/finalize-role`      | Finalizar rol (patient/doctor)       |

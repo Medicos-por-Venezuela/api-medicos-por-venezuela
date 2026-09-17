@@ -15,10 +15,11 @@ escriben en la ficha (ver `_apply_official_identity`).
 import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
 
 from sqlalchemy import (
+    ColumnElement,
     Integer,
     Select,
     String,
@@ -45,8 +46,14 @@ from src.models.professional_type import ProfessionalType
 from src.models.profile import Profile
 from src.models.specialty import Specialty
 from src.schemas import sacs as sacs_schemas
-from src.schemas.doctor import DoctorCreate, DoctorMeResponse, DoctorSelfUpdate, DoctorUpdate
-from src.services import audit, authz
+from src.schemas.doctor import (
+    DoctorCreate,
+    DoctorMeResponse,
+    DoctorSelfUpdate,
+    DoctorUpdate,
+    SpecialtyRefResponse,
+)
+from src.services import audit, authz, doctor_specialties
 from src.services import psicologo as psicologo_service
 from src.services import sacs as sacs_service
 from src.services import specialties as specialties_service
@@ -275,6 +282,25 @@ def _blocked_reason(has_record, status, verified, cedula, license_):
 def _doctor_blocked_reason():
     """`_blocked_reason` aplicado a las columnas de una fila `doctors` existente."""
     return _blocked_reason(true(), Doctor.status, Doctor.verified, Doctor.cedula, Doctor.license)
+
+
+def practicing_doctor_exists(specialty_id_column) -> ColumnElement[bool]:
+    """SQL: hay al menos un médico habilitado para atender cuya cola es `specialty_id_column`.
+
+    Habilitado = el mismo criterio del gate (`_blocked_reason`) y cuenta activa. La cola de un
+    médico sale de `users.specialty_id` (la copia que sincroniza `_sync_user_from_doctor`), que
+    es la columna con la que `queue_access` decide qué ve. Lo usa la derivación para no mandar
+    un paciente a una cola que nadie mira."""
+    return exists(
+        select(Doctor.id)
+        .join(Profile, Profile.id == Doctor.user_id)
+        .where(
+            Profile.specialty_id == specialty_id_column,
+            Profile.active.is_(True),
+            Doctor.deleted_at.is_(None),
+            _doctor_blocked_reason().is_(None),
+        )
+    )
 
 
 async def has_valid_credential(session: AsyncSession, user_id: uuid.UUID) -> bool:
@@ -873,6 +899,133 @@ async def _specialty_name(session: AsyncSession, specialty_id: uuid.UUID | None)
     return await session.scalar(select(Specialty.name).where(Specialty.id == specialty_id))
 
 
+async def _is_placeholder(session: AsyncSession, specialty_id: uuid.UUID | None) -> bool:
+    if specialty_id is None:
+        return False
+    return bool(
+        await session.scalar(select(Specialty.is_placeholder).where(Specialty.id == specialty_id))
+    )
+
+
+async def _placeholder_specialty_id(session: AsyncSession) -> uuid.UUID | None:
+    """La especialidad de relleno del catálogo ("Otra"), por su columna y no por su nombre."""
+    return await session.scalar(
+        select(Specialty.id)
+        .where(Specialty.is_placeholder.is_(True), Specialty.deleted_at.is_(None))
+        .order_by(Specialty.sort_order, Specialty.id)
+        .limit(1)
+    )
+
+
+async def _apply_specialty_choice(session: AsyncSession, doctor: Doctor, fields: dict) -> None:
+    """Aplica al médico lo que eligió en el selector de especialidades (puede marcar VARIAS).
+
+    - `specialty_ids` es el conjunto que ejerce: se guarda en `doctor_specialties` (lo que decide
+      su cola) y la primera queda como principal en la ficha y en su cuenta.
+    - "Mi especialidad no está en la lista" (`requested_specialty`): queda pendiente de revisión.
+      Si además eligió otras, sigue viendo esas colas; si no eligió ninguna, su especialidad pasa a
+      la de relleno y no ve casos hasta que un admin la resuelva — dejarle la anterior sería
+      seguir mandándole pacientes de algo que acaba de decir que no es lo suyo.
+    - Elegir especialidades reales sin pedir nada nuevo descarta la solicitud pendiente.
+    """
+    requested = fields.pop("requested_specialty", None)
+    ids = fields.pop("specialty_ids", None)
+    legacy = fields.pop("specialty_id", None)
+    if ids is None and legacy is not None:
+        ids = [legacy]  # compatibilidad con el frontend de una sola especialidad
+
+    elegidas: list[Specialty] | None = None
+    if ids is not None:
+        elegidas = await doctor_specialties.validate(session, ids)
+        if doctor.user_id is not None:
+            await doctor_specialties.replace(session, doctor.user_id, [s.id for s in elegidas])
+        doctor.specialty_id = (
+            elegidas[0].id if elegidas else await _placeholder_specialty_id(session)
+        )
+
+    if requested:
+        doctor.requested_specialty = requested
+        doctor.requested_specialty_at = datetime.now(UTC)
+        if not elegidas:
+            doctor.specialty_id = await _placeholder_specialty_id(session)
+    elif elegidas:
+        doctor.requested_specialty = None
+        doctor.requested_specialty_at = None
+
+
+def _specialty_requests_select() -> Select:
+    return (
+        select(
+            Doctor.id.label("doctor_id"),
+            Doctor.user_id.label("user_id"),
+            Doctor.full_name.label("full_name"),
+            func.coalesce(Doctor.email, Profile.email).label("email"),
+            Specialty.name.label("specialty"),
+            Doctor.requested_specialty.label("requested_specialty"),
+            Doctor.requested_specialty_at.label("requested_at"),
+        )
+        .select_from(Doctor)
+        .outerjoin(Profile, Profile.id == Doctor.user_id)
+        .outerjoin(Specialty, Specialty.id == Doctor.specialty_id)
+        .where(Doctor.requested_specialty.isnot(None), Doctor.deleted_at.is_(None))
+    )
+
+
+async def list_specialty_requests(
+    session: AsyncSession, *, skip: int = 0, limit: int = 50
+) -> tuple[list, int]:
+    """Médicos con una especialidad escrita a mano pendiente de revisión, las más antiguas
+    primero. Es la bandeja del aviso del panel admin."""
+    base = _specialty_requests_select()
+    total = await session.scalar(select(func.count()).select_from(base.subquery()))
+    rows = (
+        await session.execute(
+            base.order_by(Doctor.requested_specialty_at.asc().nulls_last(), Doctor.id)
+            .offset(skip)
+            .limit(limit)
+        )
+    ).all()
+    return list(rows), int(total or 0)
+
+
+async def resolve_specialty_request(
+    session: AsyncSession,
+    doctor_id: uuid.UUID,
+    specialty_id: uuid.UUID,
+    actor_user_id: uuid.UUID | None = None,
+) -> Doctor:
+    """Un admin le asigna al médico una especialidad del catálogo y cierra su solicitud.
+
+    Si la especialidad que escribió no existía, el admin la crea antes con el CRUD de
+    especialidades y la asigna aquí. Queda en `audit_log` con lo que había pedido."""
+    doctor = await get_doctor(session, doctor_id)
+    if doctor.requested_specialty is None:
+        raise ConflictError("Este médico no tiene una especialidad pendiente de revisión.")
+    specialty = await session.get(Specialty, specialty_id)
+    if specialty is None or specialty.deleted_at is not None or specialty.is_placeholder:
+        raise UnprocessableError("Elige una especialidad válida del catálogo.")
+    requested = doctor.requested_specialty
+    # Se SUMA a las que ya ejerce (puede tener varias); pasa a principal solo si no tenía una real.
+    if doctor.user_id is not None:
+        await doctor_specialties.add(session, doctor.user_id, specialty.id)
+    if doctor.specialty_id is None or await _is_placeholder(session, doctor.specialty_id):
+        doctor.specialty_id = specialty.id
+    doctor.requested_specialty = None
+    doctor.requested_specialty_at = None
+    await _sync_user_from_doctor(session, doctor)
+    await audit.log_action(
+        session,
+        action="doctor.specialty_request_resolved",
+        actor_user_id=actor_user_id,
+        resource="doctors",
+        resource_id=doctor.id,
+        metadata={"requested": requested, "specialty_id": str(specialty.id)},
+    )
+    await session.commit()
+    await session.refresh(doctor)
+    return doctor
+
+
 async def _professional_type_name(
     session: AsyncSession, professional_type_id: uuid.UUID | None
 ) -> str | None:
@@ -939,6 +1092,16 @@ async def _me_from_doctor_row(
         professional_type_id=doctor.professional_type_id,
         professional_type=await _professional_type_name(session, doctor.professional_type_id),
         verified=doctor.verified,
+        specialty_is_placeholder=await _is_placeholder(session, doctor.specialty_id),
+        requested_specialty=doctor.requested_specialty,
+        specialties=[
+            SpecialtyRefResponse(id=s.id, name=s.name)
+            for s in (
+                await doctor_specialties.list_for_user(session, user_id)
+                if doctor.user_id is not None
+                else []
+            )
+        ],
     )
 
 
@@ -973,6 +1136,7 @@ async def _update_my_doctor_row(
     # crearla desde una cuenta sin ficha); se ignora si viene en el payload.
     fields.pop("professional_type_id", None)
     new_cedula = fields.pop("cedula", None)
+    await _apply_specialty_choice(session, doctor, fields)
     for field, value in fields.items():
         setattr(doctor, field, value)
     # Cambiar la cédula re-verifica contra el registro oficial de su tipo y
@@ -1012,7 +1176,7 @@ async def _complete_registration_from_user(
     doctor = Doctor(
         user_id=profile.id,
         professional_type_id=professional_type_id,
-        specialty_id=fields.get("specialty_id"),
+        # `_apply_specialty_choice` (abajo) fija la principal y el conjunto.
         cedula=cedula,
         full_name=fields.get("full_name") or profile.full_name,
         license=fields.get("license", profile.medical_license),
@@ -1021,6 +1185,7 @@ async def _complete_registration_from_user(
         country_of_residence=profile.country,
         verified=check.verified,
     )
+    await _apply_specialty_choice(session, doctor, fields)
     _apply_official_identity(doctor, check)
     session.add(doctor)
     await session.flush()
@@ -1044,9 +1209,14 @@ async def _update_my_profile_row(
         profile.full_name = fields["full_name"]
     if "license" in fields:
         profile.medical_license = fields["license"]
-    if "specialty_id" in fields:
-        profile.specialty_id = fields["specialty_id"]
-        profile.specialty = await _specialty_name(session, fields["specialty_id"])
+    ids = fields.get("specialty_ids")
+    if ids is None and "specialty_id" in fields:
+        ids = [fields["specialty_id"]]
+    if ids is not None:
+        elegidas = await doctor_specialties.validate(session, ids)
+        await doctor_specialties.replace(session, profile.id, [s.id for s in elegidas])
+        profile.specialty_id = elegidas[0].id if elegidas else None
+        profile.specialty = elegidas[0].name if elegidas else None
     await session.commit()
     await session.refresh(profile)
     return _me_from_profile(profile)

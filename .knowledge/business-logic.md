@@ -9,37 +9,64 @@ La cola del panel es **en tiempo real** (Supabase Realtime `postgres_changes` so
 nuevas aparecen de inmediato, **sin gate de espera** (el gate de 20 min se eliminó) y sin polling.
 El backend la sirve en una pasada con `GET /consultations/panel` (espera + mías + cerradas).
 
-Selección del próximo caso ("Atender al siguiente"), en orden:
-1. Filtrar por `canAttend(specialty, category, needs_tags)` (ver §2).
-2. Preferir **pacientes presentes**: `patient_last_seen_at` dentro de los últimos **5 min**
-   (`PRESENCE_WINDOW` en `services/queue.py`).
-3. Entre los elegibles, preferir match de especialidad (`matchesSpecialty`), si no, el más antiguo (FIFO).
+La cola son los casos `status='waiting'` sin médico, **de las colas del médico** (§2), por orden de
+llegada del paciente (`queued_at`; un caso derivado conserva la suya).
 - **Toma atómica** (dos rutas equivalentes): `POST /queue/{id}/take` con
   `with_for_update(nowait=True)` y `POST /consultations/{id}/claim` con
-  `UPDATE ... WHERE assigned_doctor_id IS NULL` (`rowcount == 0` → 409). La base elige al único
-  ganador; **prohibido** replicar la toma con read-then-write (ver security.md §Concurrencia).
-- Campos al tomar: `status='in_progress'`, `assigned_doctor_id`, `opened_at` (no pisar si existe),
-  `attended_via_whatsapp` (claim).
+  `UPDATE ... WHERE status='waiting' AND assigned_doctor_id IS NULL` (`rowcount == 0` → 409). La
+  base elige al único ganador; **prohibido** replicar la toma con read-then-write (ver
+  security.md §Concurrencia).
+- Campos al tomar: `status='in_progress'`, `assigned_doctor_id`, `opened_at` (no pisar si existe)
+  y **`video_room_url` en el mismo UPDATE** (`coalesce` con una sala nueva). Desde 2026-09-17 la
+  atención es **siempre por videoconsulta**: `via_whatsapp=true` → 422.
 
-## 2. Matching de especialidades — por `consultations.specialty_id` (2026-07-14)
-**La columna del match es `specialty_id`**: el registro del paciente ahora pide la especialidad y
-SIEMPRE la setea (menores → Pediatría; sin elección → Medicina general). El backend resuelve el
-nombre (join a `specialties`) y matchea contra la especialidad del médico. El admin re-rutea un
-caso editando esa columna (Gestionar caso).
+## 2. Cola por especialidad — `services/queue_access.py` (2026-09-17)
+**La columna del match es `consultations.specialty_id`** contra las especialidades del médico. Una sola
+función (`queue_scope`) decide qué ve y qué puede tomar cada uno; la usan panel, claim, `/queue`,
+`/queue/{id}/take` y la derivación desde la cola:
+1. Admin/super_admin: todas las colas, **salvo** si su especialidad es `mental_health_only`
+   (Psicología): entonces la regla normal. Si además ejerce alguna especialidad que no sea la de
+   entrada, el panel le devuelve sus colas más una `is_rest` ("Otras especialidades") con lo demás
+   —sin ids: el panel la arma por descarte—; si no ejerce ninguna, no recibe colas (una sola
+   lista, que es lo que pidió la super_admin de Medicina general).
+2. Sin especialidad o con una `is_placeholder` ("Otra"): ninguna cola (`queue_blocked_reason` en el
+   panel), hasta que actualice su perfil.
+3. Resto: **todas las que ejerce** (tabla `doctor_specialties`, ver 2c) + las de
+   `specialty_queue_access` de cada una (sembradas: Psiquiatría → Psicología, Medicina interna →
+   Medicina general).
+4. La **cola de entrada** (`specialties.is_general_triage`, Medicina general) la ve además todo el
+   que atiende salud física; quien solo atiende salud mental, no.
 
-- `matches_consultation(spec, c_spec, category, needs)`: si la consulta trae especialidad →
-  **igualdad exacta**; si no (consultas viejas) → fallback legacy `matches_specialty`.
-- `can_attend_consultation(spec, c_spec, category, needs)` (elegibilidad dura): un caso con
-  especialidad Psicología/Psiquiatría solo va a esas dos; `Psicología` solo atiende salud mental;
-  un caso físico explícito lo puede tomar cualquier no-psicólogo (la coincidencia exacta es la
-  PREFERENCIA de attend-next, no un bloqueo). Sin especialidad → fallback legacy `can_attend`.
-- Espejo exacto en el frontend: `matchesConsultation`/`canAttendConsultation` en `lib/utils.ts`
-  (el panel recibe `specialty` ya resuelta en `GET /consultations/panel`).
+`GET /consultations/panel` devuelve además `queues[]` (`id`, `name`, `is_triage`, `specialty_ids`):
+una cola por especialidad del médico más la de entrada, para que el panel las pinte en cards con
+sus contadores. Un admin **no** recibe ninguna: las ve todas juntas en una sola lista.
 
-Fallback legacy (`SPECIALTY_NEEDS`/`RESERVED_NEEDS`, solo para consultas sin `specialty_id`):
-`Medicina general` y `Otra` cubren `['*']`; `RESERVED_NEEDS = { 'Apoyo emocional': ['Psicología',
-'Psiquiatría'], 'Crisis de ansiedad': ['Psicología','Psiquiatría'] }`; `matchesSpecialty` por
-inclusión y `canAttend` con la separación dura bidireccional psicología ↔ físico.
+"Otra" no se puede pedir al crear una consulta (422). Un médico puede escribir una especialidad que
+no está (`doctors.requested_specialty`); el admin la resuelve con
+`POST /doctors/{id}/specialty-request/resolve`.
+
+## 2c. Un médico, varias especialidades — `doctor_specialties` (2026-09-17)
+Un internista que además es cardiólogo ve las dos colas. El conjunto vive en
+`doctor_specialties(user_id, specialty_id)` (RLS deny-all, backfilleada desde `users.specialty_id`)
+y lo maneja `services/doctor_specialties.py` (validar ≤10, descartar las `is_placeholder`,
+reemplazar, sumar).
+
+**`users.specialty_id` sigue siendo la principal** — la que usan el pool, los reportes, el admin y
+la bandeja de interconsultas — y es el respaldo de `queue_scope` si el conjunto está vacío. Al
+guardar `specialty_ids` en `PATCH /doctors/me`, la primera pasa a principal. Resolver una
+`requested_specialty` **suma** la nueva al conjunto y solo la asciende a principal si la que había
+era de relleno o no había ninguna.
+
+## 2b. Derivación a la cola de otra especialidad
+- Desde la cola (caso sin tomar): `POST /consultations/{id}/derive` — el mismo caso cambia de
+  `specialty_id`, guarda `derived_from_specialty_id` y conserva `queued_at`.
+- Desde el detalle (caso atendido): `POST /consultations/{id}/refer-to-queue` — el padre queda
+  `referred_to_specialist` (firmado, `closed_at`), y una hija `waiting` sin médico entra a la cola
+  destino con el `queued_at` del padre. Motivo y autor en el evento `derived`.
+- Destinos (`GET /consultations/derivation-targets`): activas, no de relleno y con al menos un
+  médico habilitado en esa cola. Al paciente se le avisa por correo con el enlace a su sala.
+- `POST /consultations/{id}/refer` (cita con fecha y médico) queda por compatibilidad; el panel ya
+  no lo usa.
 
 ## 3. Transiciones de estado (`consultations.status`)
 Válidos: `waiting | in_progress | referred_to_specialist | urgent_in_person | closed | cancelled | patient_no_show` (+ `closed_by_admin` en la base real).
@@ -72,10 +99,18 @@ La API **no** debe fijarlo (cualquier `code` enviado se ignora).
 ## 7. Videoconsulta (Jitsi) — idempotente
 Sala `https://{JITSI_DOMAIN}/vamed-{uuid}` guardada en `consultations.video_room_url`. El default
 es la instancia **self-hosted abierta** `meet.medicosporvenezuela.org` — NO el público
-`meet.jit.si`, que hoy exige login de moderador ("no moderators have yet arrived"). Generar
-**solo si** `video_room_url IS NULL` y `status='waiting'`; si ya existe, devolver la misma
-(`POST /consultations/{id}/video-room`). El frontend además **sana** al abrir las salas legacy
-guardadas con `meet.jit.si` (ver `browserRoomUrl` en `lib/jitsi.ts`).
+`meet.jit.si`, que hoy exige login de moderador ("no moderators have yet arrived"). La crea el
+**claim** (ver §1). `POST /consultations/{id}/video-room` la devuelve si existe y la crea si el caso
+sigue abierto (`waiting`/`in_progress`/`contacted_whatsapp`), con escritura condicional. El
+frontend además **sana** al abrir las salas legacy guardadas con `meet.jit.si` (ver
+`browserRoomUrl` en `lib/jitsi.ts`).
+
+## 8. Sala de espera en vivo — `services/waiting_room.py`
+`GET /consultations/{id}/waiting-room` (JSON) y `/waiting-room/stream` (SSE). Fases: `waiting`
+(sin médico) · `ready` (médico y sala: trae `video_room_url` y `doctor_name`) · `scheduled` ·
+`finished`. Sigue la cadena hacia abajo: si el paciente fue derivado responde por la hija, con un
+`access_token` para ella. El stream abre una sesión corta por lectura (`get_session_factory`), late
+cada `WAITING_ROOM_HEARTBEAT_SECONDS` y se corta a los `WAITING_ROOM_STREAM_MAX_SECONDS`.
 
 ## Estado de portado
 - `POST /queue/{id}/take` ✅ y `POST /consultations/{id}/claim` ✅ (toma atómica; el panel usa claim).
@@ -98,5 +133,7 @@ guardadas con `meet.jit.si` (ver `browserRoomUrl` en `lib/jitsi.ts`).
   **resiliencia** ✅ (`POST /queue/release-stale`).
 
 ### Pendiente (siguiente fase)
-- Endpoints explícitos de derivación a especialista / urgente presencial (hoy vía `PATCH /consultations/{id}`).
+- Endpoint explícito de urgente presencial (hoy vía `PATCH /consultations/{id}`).
+- `GET /consultations` y `GET /consultations/{id}` siguen abiertos a cualquier staff, sin acotar por
+  especialidad (la cola sí lo está).
 - Worker/CRON real que invoque `release-stale` periódicamente (hoy es un endpoint admin).

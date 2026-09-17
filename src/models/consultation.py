@@ -49,6 +49,11 @@ class Consultation(Base):
     specialty_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("specialties.id"), nullable=True
     )
+    # Especialidad desde la que se derivó el caso a su cola actual (NULL si nunca se derivó). El
+    # motivo y quién derivó viven en el evento `derived`.
+    derived_from_specialty_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("specialties.id"), nullable=True
+    )
     chief_complaint: Mapped[str | None] = mapped_column(Text, nullable=True)
     clinical_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     internal_note: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -117,10 +122,21 @@ class Consultation(Base):
         back_populates="consultation", cascade="all, delete-orphan"
     )
     # noload: solo se puebla con selectinload explícito (el panel) — nunca lazy IO async.
-    specialty_ref: Mapped["Specialty | None"] = relationship(lazy="noload")  # noqa: F821
+    specialty_ref: Mapped["Specialty | None"] = relationship(  # noqa: F821
+        lazy="noload", foreign_keys=[specialty_id]
+    )
+    derived_from_ref: Mapped["Specialty | None"] = relationship(  # noqa: F821
+        lazy="noload", foreign_keys=[derived_from_specialty_id]
+    )
 
     @property
     def specialty(self) -> str | None:
         """Nombre de la especialidad solicitada (la columna del matching médico<->consulta).
         None si no hay specialty_id o si specialty_ref no fue cargada con selectinload."""
         return self.specialty_ref.name if self.specialty_ref else None
+
+    @property
+    def derived_from_specialty(self) -> str | None:
+        """Nombre de la especialidad de la que viene derivado. None si no se derivó o si
+        `derived_from_ref` no se precargó."""
+        return self.derived_from_ref.name if self.derived_from_ref else None
