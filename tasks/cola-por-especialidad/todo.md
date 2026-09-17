@@ -49,5 +49,5 @@
 
 ### Checkpoint final
 
-- [ ] tsc, lint, format, build, E2E verdes
-- [ ] QA manual en navegador (cola, derivar, sala de espera, marca)
+- [x] tsc, lint, format, build, E2E verdes (49/49) · API 633 tests, cobertura 98%
+- [x] QA manual en navegador (cola, derivar, sala de espera en vivo, marca)
