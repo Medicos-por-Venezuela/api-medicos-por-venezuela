@@ -7,7 +7,8 @@ un psicólogo terminó tomando casos de Medicina general.
 
 La regla:
 1. Un admin ve todas las colas, salvo que TODAS sus especialidades sean de salud mental exclusiva
-   (Psicología): entonces aplica la regla normal.
+   (Psicología): entonces aplica la regla normal. Si además ejerce alguna especialidad (no solo
+   Medicina general), el panel le arma sus colas y una última con TODO lo demás, que sigue viendo.
 2. Sin especialidad, o solo con la de relleno ("Otra"): no ve ninguna cola hasta actualizar su
    perfil.
 3. Resto: **todas sus especialidades** (`doctor_specialties`; un internista que además es
@@ -39,14 +40,32 @@ SIN_ESPECIALIDAD = "sin_especialidad"
 ESPECIALIDAD_POR_DEFINIR = "especialidad_por_definir"
 
 
+# La cola "todo lo demás" de un admin que además ejerce: no es una especialidad del catálogo.
+RESTO = "Otras especialidades"
+
+
 @dataclass(frozen=True)
 class QueueGroup:
     """Una cola del panel: la especialidad que la titula y los ids de casos que entran en ella
-    (la suya más sus accesos extra, p. ej. Psicología dentro de la de Psiquiatría)."""
+    (la suya más sus accesos extra, p. ej. Psicología dentro de la de Psiquiatría).
 
-    specialty: Specialty
+    `specialty` es None en la cola del resto (`is_rest`): la de un admin que ejerce, donde cae
+    todo lo que no es de sus especialidades. El panel la calcula por descarte, así que no lleva
+    ids: enumerar el catálogo entero aquí solo daría una lista que caduca al crear una
+    especialidad."""
+
+    specialty: Specialty | None
     specialty_ids: frozenset[uuid.UUID]
     is_triage: bool = False
+    is_rest: bool = False
+
+    @property
+    def id(self) -> uuid.UUID | None:
+        return self.specialty.id if self.specialty is not None else None
+
+    @property
+    def name(self) -> str:
+        return self.specialty.name if self.specialty is not None else RESTO
 
 
 @dataclass(frozen=True)
@@ -55,7 +74,8 @@ class QueueScope:
 
     `specialty_ids` es None cuando ve todas; un conjunto (quizá vacío) cuando solo ve esas.
     `blocked_reason` explica un conjunto vacío. `groups` son las colas que el panel pinta por
-    separado; va vacío para quien ve todas (un admin no tiene "su" cola)."""
+    separado; va vacío cuando no hay nada que separar (un médico general, o un admin que no
+    ejerce ninguna especialidad: todo lo que ve es una sola lista)."""
 
     specialty_ids: frozenset[uuid.UUID] | None
     blocked_reason: str | None = None
@@ -143,17 +163,36 @@ async def queue_scope(
     triage = await general_triage_specialty(session)
 
     if is_admin and not (reales and all(s.mental_health_only for s in reales)):
-        # Sin grupos: quien ve TODAS las colas no tiene "la suya" y "la de entrada" — partir su
-        # panel en dos dejaba una card "mi especialidad" que en realidad traía todo lo demás.
-        return QueueScope(None)
+        # Ve TODAS las colas. Solo se le separan en cards si además es especialista: sus colas y
+        # una última con el resto, que sigue viendo. A un admin que no ejerce, o que solo ejerce
+        # Medicina general, partirle el panel le dejaba una card "mi especialidad" que en realidad
+        # traía todas las demás.
+        grupos: list[QueueGroup] = []
+        if any(not es_triage(s, triage) for s in reales):
+            grupos = await _grupos(session, reales, triage)
+            grupos.append(QueueGroup(None, frozenset(), is_rest=True))
+        return QueueScope(None, groups=grupos)
     if not mias:
         return QueueScope(frozenset(), SIN_ESPECIALIDAD)
     if not reales:
         return QueueScope(frozenset(), ESPECIALIDAD_POR_DEFINIR)
 
+    grupos = await _grupos(session, reales, triage)
+    vistos = {sid for g in grupos for sid in g.specialty_ids}
+    return QueueScope(frozenset(vistos), groups=grupos)
+
+
+def es_triage(specialty: Specialty, triage: Specialty | None) -> bool:
+    return triage is not None and specialty.id == triage.id
+
+
+async def _grupos(
+    session: AsyncSession, reales: list[Specialty], triage: Specialty | None
+) -> list[QueueGroup]:
+    """Una cola por especialidad del médico (con sus accesos extra) más la de entrada."""
     grupos: list[QueueGroup] = []
     vistos: set[uuid.UUID] = set()
-    tiene_triage = triage is not None and any(s.id == triage.id for s in reales)
+    tiene_triage = any(es_triage(s, triage) for s in reales)
     for especialidad in reales:
         ids = {especialidad.id, *await _extras(session, especialidad.id)}
         if triage is not None and not tiene_triage:
@@ -166,7 +205,7 @@ async def queue_scope(
             QueueGroup(
                 specialty=especialidad,
                 specialty_ids=frozenset(nuevos),
-                is_triage=triage is not None and especialidad.id == triage.id,
+                is_triage=es_triage(especialidad, triage),
             )
         )
 
@@ -174,12 +213,11 @@ async def queue_scope(
     # (el paciente que no sabe qué necesita cae ahí). Quien SOLO atiende salud mental, no. Va
     # primera en el panel: es la que más pacientes tiene esperando.
     if triage is not None and not tiene_triage and any(not s.mental_health_only for s in reales):
-        vistos.add(triage.id)
         grupos.insert(
             0, QueueGroup(specialty=triage, specialty_ids=frozenset({triage.id}), is_triage=True)
         )
 
-    return QueueScope(frozenset(vistos), groups=grupos)
+    return grupos
 
 
 async def ensure_can_take(

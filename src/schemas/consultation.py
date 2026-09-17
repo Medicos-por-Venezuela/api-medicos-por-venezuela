@@ -193,12 +193,20 @@ class DerivationTargetResponse(SpecialtyRef):
     """Especialidad a la que se puede derivar (activa y con médicos atendiendo su cola)."""
 
 
-class QueueGroupResponse(SpecialtyRef):
+class QueueGroupResponse(BaseModel):
     """Una cola del panel: la especialidad que la titula y los `specialty_id` de los casos que
     entran en ella (los suyos más sus accesos extra, p. ej. Psicología dentro de Psiquiatría)."""
 
+    model_config = ConfigDict(from_attributes=True)
+
+    # None en la cola del resto (`is_rest`): no es una especialidad del catálogo.
+    id: uuid.UUID | None = None
+    name: str
     # Cola de entrada (Medicina general): el panel la nombra distinto.
     is_triage: bool = False
+    # "Otras especialidades": lo que ve un admin que además ejerce y no entra en sus colas. Va sin
+    # ids: el panel la arma por descarte de las demás.
+    is_rest: bool = False
     specialty_ids: list[uuid.UUID] = []
 
 

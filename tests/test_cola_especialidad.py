@@ -118,17 +118,43 @@ async def test_el_panel_separa_la_cola_propia_de_la_de_entrada(
     assert [q["name"] for q in (await _panel(client, psicologo.id))["queues"]] == [PSICOLOGIA]
 
 
-async def test_un_admin_no_ve_el_panel_partido_en_dos(
+async def test_un_admin_que_no_es_especialista_no_ve_el_panel_partido_en_dos(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """Quien ve TODAS las colas no tiene "la suya" y "la de entrada": partirlo en dos dejaba una
-    card "mi especialidad" que en realidad traía todas las demás (reportado con una super_admin de
-    Medicina general)."""
+    """Quien ve TODAS las colas y solo ejerce Medicina general no tiene "la suya" y "la de
+    entrada": son la misma, y partirlo en dos dejaba una card "mi especialidad" que en realidad
+    traía todas las demás (reportado con una super_admin de Medicina general)."""
     con_general = await add_doctor(db_session, role="super_admin", specialty=GENERAL)
     sin_especialidad = await _admin(db_session, "admin", None)
 
     assert (await _panel(client, con_general.id))["queues"] == []
     assert (await _panel(client, sin_especialidad.id))["queues"] == []
+
+
+async def test_un_admin_que_ademas_ejerce_ve_sus_colas_y_una_con_el_resto(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Una super_admin que también es cardióloga sí quiere sus colas separadas; pero sigue viendo
+    TODO, así que la última card reúne lo que no es suyo — si no, los contadores de las cards no
+    sumarían lo que dice el KPI y habría casos que no salen por ninguna parte."""
+    admin = await add_doctor(db_session, role="super_admin", specialty=GENERAL)
+    await set_specialties(db_session, admin.id, [GENERAL, "Cardiología"])
+    entrada = await _case(db_session, GENERAL)
+    cardio = await _case(db_session, "Cardiología")
+    ajeno = await _case(db_session, TRAUMA)
+
+    panel = await _panel(client, admin.id)
+
+    assert [q["name"] for q in panel["queues"]] == [GENERAL, "Cardiología", "Otras especialidades"]
+    assert [q["is_rest"] for q in panel["queues"]] == [False, False, True]
+    # La del resto va sin ids: el panel la arma por descarte, para que una especialidad nueva no
+    # se caiga de las cards.
+    assert panel["queues"][-1]["id"] is None
+    assert panel["queues"][-1]["specialty_ids"] == []
+    # Sigue viendo todo, incluido lo que no es de sus especialidades.
+    ids = {c["id"] for c in panel["waiting"]}
+    assert {str(entrada.id), str(cardio.id), str(ajeno.id)} <= ids
+    assert await _claim(client, ajeno.id, admin.id) == 200
 
 
 async def test_un_medico_con_varias_especialidades_ve_las_colas_de_todas(

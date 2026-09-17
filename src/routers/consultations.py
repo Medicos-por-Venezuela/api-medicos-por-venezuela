@@ -254,8 +254,9 @@ async def consultation_panel(
 
     `queues` son las colas que el panel pinta por separado: una por especialidad del médico (puede
     tener varias) más la de entrada (Medicina general, donde caen los pacientes que no saben qué
-    necesitan) si atiende salud física. Con una sola cola el panel muestra la lista directa; un
-    admin, que las ve todas, no recibe ninguna."""
+    necesitan) si atiende salud física. Con una sola cola el panel muestra la lista directa. Un
+    admin las ve todas: si además es especialista se le añade una cola `is_rest` con el resto, y
+    si no ejerce ninguna especialidad no recibe colas (una sola lista)."""
     waiting, mine, my_closed, scope = await consultations_service.get_panel(
         db,
         principal.id,
@@ -269,9 +270,10 @@ async def consultation_panel(
         queue_blocked_reason=scope.blocked_reason,
         queues=[
             QueueGroupResponse(
-                id=g.specialty.id,
-                name=g.specialty.name,
+                id=g.id,
+                name=g.name,
                 is_triage=g.is_triage,
+                is_rest=g.is_rest,
                 specialty_ids=sorted(g.specialty_ids),
             )
             for g in scope.groups

@@ -25,7 +25,10 @@ llegada del paciente (`queued_at`; un caso derivado conserva la suya).
 función (`queue_scope`) decide qué ve y qué puede tomar cada uno; la usan panel, claim, `/queue`,
 `/queue/{id}/take` y la derivación desde la cola:
 1. Admin/super_admin: todas las colas, **salvo** si su especialidad es `mental_health_only`
-   (Psicología): entonces la regla normal.
+   (Psicología): entonces la regla normal. Si además ejerce alguna especialidad que no sea la de
+   entrada, el panel le devuelve sus colas más una `is_rest` ("Otras especialidades") con lo demás
+   —sin ids: el panel la arma por descarte—; si no ejerce ninguna, no recibe colas (una sola
+   lista, que es lo que pidió la super_admin de Medicina general).
 2. Sin especialidad o con una `is_placeholder` ("Otra"): ninguna cola (`queue_blocked_reason` en el
    panel), hasta que actualice su perfil.
 3. Resto: **todas las que ejerce** (tabla `doctor_specialties`, ver 2c) + las de

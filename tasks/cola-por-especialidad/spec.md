@@ -44,7 +44,9 @@ Una sola función decide ambas cosas (listar y tomar), en el servicio:
 
 1. **Admin** (`admin`/`super_admin` activo): ve **todas** las colas, **salvo** que su
    especialidad sea exclusiva de salud mental (`specialties.mental_health_only`, hoy
-   Psicología). En ese caso aplica la regla normal (Luis → solo Psicología).
+   Psicología). En ese caso aplica la regla normal (Luis → solo Psicología). Si además ejerce
+   alguna especialidad que no sea la cola de entrada, el panel le separa sus colas y añade una
+   última con **el resto**, que sigue viendo (R7).
 2. **Médico sin especialidad o con especialidad de relleno** (`specialties.is_placeholder`,
    hoy "Otra"): **no ve nada** y no puede tomar nada, hasta que actualice su perfil.
 3. **Resto**: coincidencia **exacta** de `consultations.specialty_id` con **cualquiera de las
@@ -140,9 +142,13 @@ IS NULL AND specialty_id = <la que vio>`): cambia `specialty_id`, guarda
 - **Una card por cola**: antes de ver los casos elige entre
   "Ver consultas pendientes de {cola de entrada} (N)" y una
   "Ver consultas pendientes de mi especialidad: {X} (N)" **por cada especialidad que ejerce**.
-  Con una sola cola —un médico general (esa ES la cola de entrada), Psicología, o un admin, que
-  las ve todas juntas— no hay cards: la lista va directa. La API lo dice en el panel con
-  `queues[]` (`id`, `name`, `is_triage`, `specialty_ids`).
+  Con una sola cola —un médico general (esa ES la cola de entrada), Psicología, o un admin que no
+  ejerce ninguna especialidad— no hay cards: la lista va directa. La API lo dice en el panel con
+  `queues[]` (`id`, `name`, `is_triage`, `is_rest`, `specialty_ids`).
+- **Admin que además ejerce**: sus colas, y una última "Ver consultas de otras especialidades (N)"
+  con todo lo demás que ve por ser admin. Va sin `specialty_ids`: el panel la arma **por
+  descarte**, así una especialidad nueva no se cae de las cards. Sin esa card, los contadores no
+  sumarían el KPI y habría pacientes que no salen por ningún lado.
 - Tarjeta de la cola: título = especialidad (en vez de "Paciente"), "Derivado desde X" si
   aplica, botón **"Atender paciente"** y botón **"Derivar a especialista"** (modal con la lista
   → confirmación "¿Seguro que quieres derivar este paciente a X?").

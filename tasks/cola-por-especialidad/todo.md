@@ -60,6 +60,8 @@
 - [x] T26 Perfil con casillas, panel con una card por cola, fuera "Disponibilidad"
 - [x] T27 Tests (API + E2E)
 
+- [x] T28 Admin que además ejerce: sus colas + card del resto (`is_rest`)
+
 ### Checkpoint Fase 7
 
 - [x] API 640 tests verdes · E2E 50/50 · tsc, lint, format limpios
