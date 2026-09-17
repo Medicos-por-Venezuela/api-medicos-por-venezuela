@@ -78,6 +78,9 @@ class ProfileListItem(ProfileResponse):
     # de `users`, que nace `true` y ningún camino la baja. Reutilizar el nombre es exactamente cómo
     # la lista acabó pintando como "Verificado" a los médicos cuya cédula no validó.
     doctor_verified: bool | None = None
+    # Todas las que ejerce (puede tener varias); `specialty` sigue siendo la principal. Va vacía
+    # para quien no es médico.
+    specialties: list[str] = []
 
 
 class ProfileListResponse(BaseModel):
