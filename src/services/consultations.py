@@ -489,7 +489,11 @@ async def claim_consultation(
     filtre no basta, un POST directo se saltaría el filtro."""
     consultation = await get_consultation(session, consultation_id)  # 404 si no existe
     await queue_access.ensure_can_take(
-        session, consultation, specialty_id=doctor_specialty_id, is_admin=is_admin
+        session,
+        consultation,
+        user_id=doctor_user_id,
+        specialty_id=doctor_specialty_id,
+        is_admin=is_admin,
     )
     now = datetime.now(UTC)
     stmt = (
@@ -553,8 +557,8 @@ async def get_panel(
     is_admin: bool = False,
 ) -> tuple[list[Consultation], list[Consultation], int, queue_access.QueueScope]:
     """Datos del panel médico en una pasada: la cola de espera ACOTADA a las colas de este
-    médico, sus consultas abiertas, cuántas ha cerrado y el alcance de su cola (con el motivo si
-    no ve ninguna, para que el panel le diga qué hacer).
+    médico (todas sus especialidades), sus consultas abiertas, cuántas ha cerrado y el alcance de
+    su cola (los grupos que pinta como cards, y el motivo si no ve ninguna).
 
     El filtro por especialidad se aplica AQUÍ, en SQL, con la regla de `queue_access`, y
     `claim_consultation` la revalida: el filtro de una lista nunca es un control de acceso por sí
@@ -563,7 +567,7 @@ async def get_panel(
     La cola son los casos `waiting` sin asignar, por orden de llegada del paciente (`queued_at`):
     un caso derivado conserva la hora a la que llegó, no la de la derivación."""
     scope = await queue_access.queue_scope(
-        session, specialty_id=doctor_specialty_id, is_admin=is_admin
+        session, user_id=doctor_user_id, specialty_id=doctor_specialty_id, is_admin=is_admin
     )
     waiting_stmt = _with_specialty_names(
         select(Consultation)
@@ -656,7 +660,11 @@ async def derive_in_queue(
     if consultation.status != "waiting" or consultation.assigned_doctor_id is not None:
         raise ConflictError("Este caso ya no está en la cola.")
     await queue_access.ensure_can_take(
-        session, consultation, specialty_id=actor_specialty_id, is_admin=actor_is_admin
+        session,
+        consultation,
+        user_id=actor_user_id,
+        specialty_id=actor_specialty_id,
+        is_admin=actor_is_admin,
     )
     origin_id = consultation.specialty_id
     target = await _derivation_target(session, target_specialty_id, origin_id)

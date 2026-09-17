@@ -51,3 +51,15 @@
 
 - [x] tsc, lint, format, build, E2E verdes (49/49) · API 633 tests, cobertura 98%
 - [x] QA manual en navegador (cola, derivar, sala de espera en vivo, marca)
+
+## Fase 7 — Varias especialidades por médico
+
+- [x] T23 Migración `doctor_specialties` + backfill
+- [x] T24 `services/doctor_specialties.py` + `queue_scope` con `groups`
+- [x] T25 `specialty_ids` en el perfil y `queues[]` en el panel
+- [x] T26 Perfil con casillas, panel con una card por cola, fuera "Disponibilidad"
+- [x] T27 Tests (API + E2E)
+
+### Checkpoint Fase 7
+
+- [x] API 640 tests verdes · E2E 50/50 · tsc, lint, format limpios

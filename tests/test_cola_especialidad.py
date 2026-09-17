@@ -16,7 +16,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.models.consultation import Consultation
 from src.models.patient import Patient
 from src.models.profile import Profile
-from tests._helpers import GENERAL, add_doctor, auth_headers, make_profile, specialty_id_by_name
+from tests._helpers import (
+    GENERAL,
+    add_doctor,
+    auth_headers,
+    make_profile,
+    set_specialties,
+    specialty_id_by_name,
+)
 
 PREFIX = "/api/v1"
 TRAUMA = "Traumatología y ortopedia"
@@ -71,19 +78,89 @@ async def _claim(client: AsyncClient, cid, user_id) -> int:
     return resp.status_code
 
 
-async def test_traumatologo_solo_ve_y_toma_su_especialidad(
+async def test_traumatologo_ve_su_cola_y_la_de_entrada_pero_no_otras(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """Antes un traumatólogo veía Medicina general (la regla solo separaba salud mental)."""
+    """Un especialista de salud física atiende lo suyo y la cola de entrada (Medicina general,
+    donde caen los pacientes que no saben qué necesitan), pero no las colas de otros."""
     trauma = await add_doctor(db_session, specialty=TRAUMA)
     suyo = await _case(db_session, TRAUMA)
-    ajeno = await _case(db_session, GENERAL)
+    entrada = await _case(db_session, GENERAL)
+    ajeno = await _case(db_session, PEDIATRIA)
 
     ids = await _waiting_ids(client, trauma.id)
-    assert str(suyo.id) in ids
+    assert {str(suyo.id), str(entrada.id)} <= ids
     assert str(ajeno.id) not in ids
     assert await _claim(client, ajeno.id, trauma.id) == 403
+    assert await _claim(client, entrada.id, trauma.id) == 200
     assert await _claim(client, suyo.id, trauma.id) == 200
+
+
+async def test_el_panel_separa_la_cola_propia_de_la_de_entrada(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El panel del especialista pinta dos cards: la de entrada (primero, la que más acumula) y la
+    suya."""
+    trauma = await add_doctor(db_session, specialty=TRAUMA)
+    general = await add_doctor(db_session, specialty=GENERAL)
+    psicologo = await add_doctor(db_session, specialty=PSICOLOGIA)
+
+    colas = (await _panel(client, trauma.id))["queues"]
+    assert [q["name"] for q in colas] == [GENERAL, TRAUMA]
+    assert [q["is_triage"] for q in colas] == [True, False]
+
+    # Para un médico general, la cola de entrada ES la suya: una sola card.
+    colas_general = (await _panel(client, general.id))["queues"]
+    assert [q["name"] for q in colas_general] == [GENERAL]
+    assert colas_general[0]["is_triage"] is True
+
+    # Psicología solo atiende salud mental: no se le ofrece la cola de entrada.
+    assert [q["name"] for q in (await _panel(client, psicologo.id))["queues"]] == [PSICOLOGIA]
+
+
+async def test_un_admin_no_ve_el_panel_partido_en_dos(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Quien ve TODAS las colas no tiene "la suya" y "la de entrada": partirlo en dos dejaba una
+    card "mi especialidad" que en realidad traía todas las demás (reportado con una super_admin de
+    Medicina general)."""
+    con_general = await add_doctor(db_session, role="super_admin", specialty=GENERAL)
+    sin_especialidad = await _admin(db_session, "admin", None)
+
+    assert (await _panel(client, con_general.id))["queues"] == []
+    assert (await _panel(client, sin_especialidad.id))["queues"] == []
+
+
+async def test_un_medico_con_varias_especialidades_ve_las_colas_de_todas(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Un internista que además es cardiólogo ve las dos colas, más la de entrada."""
+    doc = await add_doctor(db_session, specialty=INTERNA)
+    await set_specialties(db_session, doc.id, [INTERNA, "Cardiología"])
+    interna = await _case(db_session, INTERNA)
+    cardio = await _case(db_session, "Cardiología")
+    entrada = await _case(db_session, GENERAL)
+    ajeno = await _case(db_session, TRAUMA)
+
+    panel = await _panel(client, doc.id)
+    ids = {c["id"] for c in panel["waiting"]}
+    assert {str(interna.id), str(cardio.id), str(entrada.id)} <= ids
+    assert str(ajeno.id) not in ids
+    assert [q["name"] for q in panel["queues"]] == [GENERAL, INTERNA, "Cardiología"]
+    # La cola de Medicina general va en su propia card, no dentro de la de Medicina interna.
+    interna_card = panel["queues"][1]
+    assert str(entrada.specialty_id) not in interna_card["specialty_ids"]
+    assert await _claim(client, cardio.id, doc.id) == 200
+
+
+async def test_psicologia_no_ve_la_cola_de_entrada(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    psicologo = await add_doctor(db_session, specialty=PSICOLOGIA)
+    entrada = await _case(db_session, GENERAL)
+
+    assert str(entrada.id) not in await _waiting_ids(client, psicologo.id)
+    assert await _claim(client, entrada.id, psicologo.id) == 403
 
 
 async def test_medicina_interna_tambien_ve_medicina_general(
@@ -109,6 +186,7 @@ async def test_el_acceso_extra_no_es_reciproco(
     psicologo = await add_doctor(db_session, specialty=PSICOLOGIA)
     interna = await _case(db_session, INTERNA)
     psiquiatria = await _case(db_session, PSIQUIATRIA)
+    # (La cola de entrada la ven todos los de salud física; estas dos no son esa cola.)
 
     assert str(interna.id) not in await _waiting_ids(client, general.id)
     assert str(psiquiatria.id) not in await _waiting_ids(client, psicologo.id)
@@ -117,13 +195,16 @@ async def test_el_acceso_extra_no_es_reciproco(
 async def test_psiquiatria_tambien_ve_psicologia(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
+    """Psiquiatría atiende salud mental y física: ve Psicología, la suya y la de entrada, pero no
+    la cola de otra especialidad física."""
     psiquiatra = await add_doctor(db_session, specialty=PSIQUIATRIA)
     psicologia = await _case(db_session, PSICOLOGIA)
     general = await _case(db_session, GENERAL)
+    trauma = await _case(db_session, TRAUMA)
 
     ids = await _waiting_ids(client, psiquiatra.id)
-    assert str(psicologia.id) in ids
-    assert str(general.id) not in ids
+    assert {str(psicologia.id), str(general.id)} <= ids
+    assert str(trauma.id) not in ids
     assert await _claim(client, psicologia.id, psiquiatra.id) == 200
 
 
@@ -222,7 +303,7 @@ async def test_get_queue_y_take_legacy_aplican_la_misma_regla(
     """`GET /queue` y `/queue/{id}/take` no pueden ser un atajo alrededor del filtro."""
     trauma = await add_doctor(db_session, specialty=TRAUMA)
     suyo = await _case(db_session, TRAUMA)
-    ajeno = await _case(db_session, GENERAL)
+    ajeno = await _case(db_session, PEDIATRIA)
     headers = auth_headers(trauma.id)
 
     listed = await client.get(f"{PREFIX}/queue", headers=headers)

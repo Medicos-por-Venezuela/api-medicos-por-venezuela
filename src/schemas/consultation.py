@@ -24,6 +24,8 @@ __all__ = [
     "DerivationInfo",
     "DerivationTargetResponse",
     "ReferToQueueRequest",
+    "QueueGroupResponse",
+    "SpecialtyRef",
     "WaitingRoomResponse",
     "ScheduleFollowUpRequest",
     "ScheduleReferralRequest",
@@ -178,13 +180,26 @@ class ReferToQueueRequest(BaseModel):
         return value
 
 
-class DerivationTargetResponse(BaseModel):
-    """Especialidad a la que se puede derivar (activa y con médicos atendiendo su cola)."""
+class SpecialtyRef(BaseModel):
+    """Especialidad referida por id y nombre (las colas del panel, los destinos de derivación)."""
 
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     name: str
+
+
+class DerivationTargetResponse(SpecialtyRef):
+    """Especialidad a la que se puede derivar (activa y con médicos atendiendo su cola)."""
+
+
+class QueueGroupResponse(SpecialtyRef):
+    """Una cola del panel: la especialidad que la titula y los `specialty_id` de los casos que
+    entran en ella (los suyos más sus accesos extra, p. ej. Psicología dentro de Psiquiatría)."""
+
+    # Cola de entrada (Medicina general): el panel la nombra distinto.
+    is_triage: bool = False
+    specialty_ids: list[uuid.UUID] = []
 
 
 class DerivationInfo(BaseModel):
@@ -458,6 +473,10 @@ class ConsultationPanelResponse(BaseModel):
     # Por qué el médico no ve ninguna cola: `sin_especialidad` o `especialidad_por_definir`
     # ("Otra"). None si ve alguna. El panel lo usa para mandarlo a completar su perfil.
     queue_blocked_reason: str | None = None
+    # Las colas que el panel pinta por separado: una por especialidad del médico (puede tener
+    # varias) más la de entrada (Medicina general) si atiende salud física. Con una sola, el panel
+    # muestra la lista directa; con ninguna (admin, que ve todas) tampoco hay cards.
+    queues: list[QueueGroupResponse] = []
 
 
 class WaitingRoomResponse(BaseModel):

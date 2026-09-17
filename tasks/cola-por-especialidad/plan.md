@@ -153,3 +153,20 @@ Checkpoint: cobertura ≥95%, ruff limpio, Swagger con `summary`/`responses`.
 | Un deploy de API antes que el frontend rompe el botón WhatsApp del panel viejo | Es el comportamiento buscado (422 con mensaje claro); el botón de video sigue funcionando porque el claim sigue aceptando `{via_whatsapp:false}`. |
 | Streams abiertos agotan conexiones                                             | Sesiones cortas por ciclo, duración máxima, cierre en `ready`/`finished`.                                                                         |
 | Supabase local no replica Realtime                                             | La sala de espera no depende de Realtime (SSE contra la API), así que los E2E sí la ejercitan.                                                    |
+
+## Fase 7 — Varias especialidades por médico
+
+Un médico puede ejercer varias (internista + cardiólogo) y ver la cola de todas. El conjunto vive
+aparte de `users.specialty_id`, que sigue siendo la **principal** (pool, reportes, admin,
+interconsultas): así ningún consumidor existente cambia de contrato.
+
+- **T23** Migración `doctor_specialties(user_id, specialty_id)` + backfill desde `users.specialty_id`
+  (RLS deny-all como el resto: solo la API la lee).
+- **T24** `services/doctor_specialties.py` (listar, validar ≤10 y sin relleno, reemplazar, sumar) y
+  `queue_access.queue_scope` uniendo las especialidades del médico, sus accesos extra y el triaje;
+  devuelve además `groups` (una cola por especialidad + la de entrada).
+- **T25** Contrato: `PATCH /doctors/me` acepta `specialty_ids`; `GET /doctors/me` devuelve
+  `specialties[]`; el panel devuelve `queues[]` en lugar de `my_specialty`/`triage_specialty`.
+- **T26** Frontend: perfil con casillas (y "Otra" aparte), panel con una card por cola, fuera
+  "Disponibilidad".
+- **T27** Tests: cola de varias especialidades, perfil multi-selección, E2E de las dos colas.

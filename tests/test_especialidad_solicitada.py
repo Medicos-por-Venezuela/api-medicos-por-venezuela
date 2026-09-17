@@ -25,6 +25,84 @@ async def _doctor_row(db_session: AsyncSession, user_id) -> Doctor:
     return doctor
 
 
+async def test_un_medico_puede_ejercer_varias_especialidades(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Un internista que además es cardiólogo: guarda las dos y ve las dos colas. La primera queda
+    como principal (la que usan el pool, los reportes y el admin)."""
+    doc = await add_doctor(db_session, specialty=GENERAL)
+    interna = await specialty_id_by_name(db_session, "Medicina interna")
+    cardio = await specialty_id_by_name(db_session, "Cardiología")
+
+    resp = await client.patch(
+        f"{PREFIX}/doctors/me",
+        json={"specialty_ids": [str(interna), str(cardio)]},
+        headers=auth_headers(doc.id),
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # La lista va en el orden del catálogo; la PRINCIPAL es la primera que envió.
+    assert {s["name"] for s in body["specialties"]} == {"Medicina interna", "Cardiología"}
+    assert body["specialty"] == "Medicina interna"
+    panel = await client.get(f"{PREFIX}/consultations/panel", headers=auth_headers(doc.id))
+    # La cola de entrada va primera (es la que más acumula), luego las suyas.
+    assert [q["name"] for q in panel.json()["queues"]] == [
+        GENERAL,
+        "Medicina interna",
+        "Cardiología",
+    ]
+
+
+async def test_elegir_varias_y_ademas_escribir_una(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Puede elegir las que sí están y, además, pedir la que falta: sigue viendo sus colas
+    mientras un admin revisa la nueva."""
+    doc = await add_doctor(db_session, specialty=GENERAL)
+    cardio = await specialty_id_by_name(db_session, "Cardiología")
+
+    resp = await client.patch(
+        f"{PREFIX}/doctors/me",
+        json={"specialty_ids": [str(cardio)], "requested_specialty": "Medicina del deporte"},
+        headers=auth_headers(doc.id),
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert [s["name"] for s in body["specialties"]] == ["Cardiología"]
+    assert body["requested_specialty"] == "Medicina del deporte"
+    assert body["specialty_is_placeholder"] is False
+    panel = await client.get(f"{PREFIX}/consultations/panel", headers=auth_headers(doc.id))
+    assert panel.json()["queue_blocked_reason"] is None
+
+
+async def test_el_admin_suma_la_especialidad_pedida_a_las_que_ya_tenia(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = await add_doctor(db_session, specialty=GENERAL)
+    cardio = await specialty_id_by_name(db_session, "Cardiología")
+    await client.patch(
+        f"{PREFIX}/doctors/me",
+        json={"specialty_ids": [str(cardio)], "requested_specialty": "Medicina del deporte"},
+        headers=auth_headers(doc.id),
+    )
+    row = await _doctor_row(db_session, doc.id)
+    nueva = Specialty(name=f"Medicina del deporte {uuid.uuid4().hex[:6]}")
+    db_session.add(nueva)
+    await db_session.flush()
+
+    resp = await client.post(
+        f"{PREFIX}/doctors/{row.id}/specialty-request/resolve",
+        json={"specialty_id": str(nueva.id)},
+    )
+
+    assert resp.status_code == 200, resp.text
+    me = (await client.get(f"{PREFIX}/doctors/me", headers=auth_headers(doc.id))).json()
+    assert {s["name"] for s in me["specialties"]} == {"Cardiología", nueva.name}
+    assert me["specialty"] == "Cardiología"  # la principal no cambia si ya tenía una real
+
+
 async def test_el_perfil_dice_si_la_especialidad_es_de_relleno(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:

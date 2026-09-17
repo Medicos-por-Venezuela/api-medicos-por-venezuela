@@ -40,6 +40,11 @@ class Specialty(Base):
     is_placeholder: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
+    # Cola de entrada (Medicina general): la ven también los especialistas de salud física, en una
+    # cola aparte de la suya (ver 20260917_160545 y services/queue_access.py).
+    is_general_triage: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

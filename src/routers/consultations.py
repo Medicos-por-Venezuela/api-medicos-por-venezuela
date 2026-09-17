@@ -53,6 +53,7 @@ from src.schemas.consultation import (
     DeriveRequest,
     PanelConsultationItem,
     PanelWaitingItem,
+    QueueGroupResponse,
     ReferToQueueRequest,
     ReminderRunResponse,
     ScheduleFollowUpRequest,
@@ -249,8 +250,12 @@ async def consultation_panel(
     principal: Principal = Depends(require_permission("queue.read")),
 ) -> ConsultationPanelResponse:
     """Todo lo que el panel del médico necesita en una llamada: la cola de espera (casos sin
-    asignar), las consultas abiertas del propio médico y cuántas ha cerrado. Reemplaza las
-    lecturas directas a Supabase del panel."""
+    asignar), las consultas abiertas del propio médico y cuántas ha cerrado.
+
+    `queues` son las colas que el panel pinta por separado: una por especialidad del médico (puede
+    tener varias) más la de entrada (Medicina general, donde caen los pacientes que no saben qué
+    necesitan) si atiende salud física. Con una sola cola el panel muestra la lista directa; un
+    admin, que las ve todas, no recibe ninguna."""
     waiting, mine, my_closed, scope = await consultations_service.get_panel(
         db,
         principal.id,
@@ -262,6 +267,15 @@ async def consultation_panel(
         mine=[PanelConsultationItem.model_validate(c) for c in mine],
         my_closed_count=my_closed,
         queue_blocked_reason=scope.blocked_reason,
+        queues=[
+            QueueGroupResponse(
+                id=g.specialty.id,
+                name=g.specialty.name,
+                is_triage=g.is_triage,
+                specialty_ids=sorted(g.specialty_ids),
+            )
+            for g in scope.groups
+        ],
     )
 
 

@@ -51,7 +51,10 @@ async def list_queue(
     """Lista las consultas en espera sin asignar de las colas del médico (su especialidad y las
     que tenga habilitadas; un admin ve todas), las más antiguas primero (FIFO)."""
     scope = await queue_access.queue_scope(
-        db, specialty_id=principal.specialty_id, is_admin=principal.is_admin
+        db,
+        user_id=principal.id,
+        specialty_id=principal.specialty_id,
+        is_admin=principal.is_admin,
     )
     return await queue_service.list_queue(db, scope, limit=limit)
 
@@ -76,7 +79,10 @@ async def take_consultation(
     autenticado. El ganador recibe `200`, el perdedor `409` (o `404`), sin colgarse.
     """
     scope = await queue_access.queue_scope(
-        db, specialty_id=principal.specialty_id, is_admin=principal.is_admin
+        db,
+        user_id=principal.id,
+        specialty_id=principal.specialty_id,
+        is_admin=principal.is_admin,
     )
     try:
         return await queue_service.take_consultation(db, consultation_id, principal.id, scope)

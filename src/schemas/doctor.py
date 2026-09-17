@@ -92,6 +92,15 @@ class DoctorUpdate(BaseModel):
     status: int | None = Field(default=None, ge=0, le=2)
 
 
+class SpecialtyRefResponse(BaseModel):
+    """Especialidad por id y nombre (las que ejerce el médico)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+
+
 class DoctorSelfUpdate(BaseModel):
     """Auto-edición del médico sobre su **propio** perfil (campos del wireframe:
     cédula, nombre, licencia, especialidad).
@@ -111,11 +120,15 @@ class DoctorSelfUpdate(BaseModel):
 
     full_name: str | None = Field(default=None, min_length=2, max_length=200)
     license: str | None = Field(default=None, max_length=100)
+    # Legacy (una sola especialidad). `specialty_ids` manda si vienen las dos.
     specialty_id: uuid.UUID | None = None
+    # Las especialidades que ejerce: puede tener varias y su cola es la unión. La primera queda
+    # como principal (la que usan el pool, los reportes y el admin).
+    specialty_ids: list[uuid.UUID] | None = None
     professional_type_id: uuid.UUID | None = None
     cedula: str | None = Field(default=None, pattern=_CEDULA_PATTERN)
     # "Mi especialidad no está en la lista": la escribe a mano y queda pendiente de que un admin
-    # la agregue al catálogo. Mientras tanto el médico no ve la cola (su especialidad es "Otra").
+    # la agregue al catálogo. Si no eligió ninguna real, mientras tanto no ve la cola.
     requested_specialty: str | None = Field(default=None, min_length=2, max_length=120)
 
     @field_validator("cedula")
@@ -158,6 +171,8 @@ class DoctorMeResponse(BaseModel):
     professional_type_id: uuid.UUID | None = None
     professional_type: str | None = None
     verified: bool
+    # Todas las que ejerce (la principal es `specialty_id`/`specialty`).
+    specialties: list[SpecialtyRefResponse] = []
     # Su especialidad es de relleno ("Otra"): no ve la cola hasta elegir una real.
     specialty_is_placeholder: bool = False
     # La que escribió a mano y espera revisión de un admin (None si no hay ninguna pendiente).

@@ -47,10 +47,17 @@ Una sola función decide ambas cosas (listar y tomar), en el servicio:
    Psicología). En ese caso aplica la regla normal (Luis → solo Psicología).
 2. **Médico sin especialidad o con especialidad de relleno** (`specialties.is_placeholder`,
    hoy "Otra"): **no ve nada** y no puede tomar nada, hasta que actualice su perfil.
-3. **Resto**: coincidencia **exacta** de `consultations.specialty_id` con `users.specialty_id`,
-   más los accesos extra de la tabla `specialty_queue_access`:
+3. **Resto**: coincidencia **exacta** de `consultations.specialty_id` con **cualquiera de las
+   especialidades que ejerce** (tabla `doctor_specialties`; `users.specialty_id` es la principal
+   y el respaldo si el conjunto está vacío), más los accesos extra de `specialty_queue_access`
+   de cada una:
    - Psiquiatría → también ve Psicología.
    - Medicina interna → también ve Medicina general.
+     Un internista que además es cardiólogo ve las dos colas.
+4. **Cola de entrada** (`specialties.is_general_triage`, hoy Medicina general): la ve además todo
+   el que atiende salud física, porque es donde caen los pacientes que no saben qué especialidad
+   necesitan y la que más acumula. Quien solo atiende salud mental (Psicología) **no** la ve.
+   El panel se la muestra **aparte** de la suya (R7).
 
 La cola es `status = 'waiting' AND assigned_doctor_id IS NULL`, ordenada por `queued_at`
 (hora de llegada del paciente) y luego `created_at`.
@@ -120,20 +127,38 @@ IS NULL AND specialty_id = <la que vio>`): cambia `specialty_id`, guarda
   caso, que usa el mismo formulario). `POST /consultations` rechaza una especialidad de relleno
   (422).
 - Migración de datos: las consultas `waiting` sin asignar con "Otra" pasan a Medicina general.
-- Médico con "Otra": en su perfil elige de la lista o escribe su especialidad
-  (`doctors.requested_specialty`). Mientras tanto no ve casos (R1.2).
+- Médico con "Otra": en su perfil marca las suyas de la lista o escribe la que falta
+  (`doctors.requested_specialty`). Mientras tanto no ve casos (R1.2). Escribir una no le quita
+  las que ya marcó: puede ejercer varias y quedar a la espera de una más.
 - Admin: `GET /doctors/specialty-requests` lista las pendientes; `POST
 /doctors/{id}/specialty-request/resolve` con `{specialty_id}` asigna (la especialidad nueva
   se crea antes con el CRUD de catálogo existente) y limpia la solicitud. Auditado.
 
 ### R7. Panel médico (UI)
 
+- Ancho completo (no "boxed"): la cola es lo que más espacio necesita.
+- **Una card por cola**: antes de ver los casos elige entre
+  "Ver consultas pendientes de {cola de entrada} (N)" y una
+  "Ver consultas pendientes de mi especialidad: {X} (N)" **por cada especialidad que ejerce**.
+  Con una sola cola —un médico general (esa ES la cola de entrada), Psicología, o un admin, que
+  las ve todas juntas— no hay cards: la lista va directa. La API lo dice en el panel con
+  `queues[]` (`id`, `name`, `is_triage`, `specialty_ids`).
 - Tarjeta de la cola: título = especialidad (en vez de "Paciente"), "Derivado desde X" si
   aplica, botón **"Atender paciente"** y botón **"Derivar a especialista"** (modal con la lista
   → confirmación "¿Seguro que quieres derivar este paciente a X?").
-- KPIs: solo **"Sin atender"** (= pacientes esperando en tu cola) y **"Consultas cerradas por
-  mí"**.
+- KPIs: solo **"En espera por atender"** y **"Consultas cerradas por mí"**. Sin botón de
+  "Atender al siguiente paciente": se atiende desde la tarjeta del paciente.
 - Aviso bloqueante para médicos con "Otra" o sin especialidad, con enlace a su perfil.
+
+### R7 bis. Mi Perfil (UI)
+
+- **Especialidades** (antes "Especialidad"): casillas con el catálogo activo, se marcan todas las
+  que ejerza. La primera marcada queda como **principal** (`users.specialty_id`: la que usan el
+  pool, los reportes, el admin y la bandeja de interconsultas).
+- Casilla aparte **"Otra: mi especialidad no está en la lista"** + campo libre. "Otra" no se
+  ofrece como especialidad: no es la cola de nadie.
+- Se exige al menos una especialidad o una escrita.
+- Fuera la pestaña **"Disponibilidad"** (era un "Próximamente" vacío).
 
 ### R8. Detalle de consulta (UI)
 

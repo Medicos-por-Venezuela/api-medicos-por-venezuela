@@ -176,7 +176,10 @@ async def test_derivar_un_caso_que_no_es_de_tu_cola_es_403(
 ) -> None:
     destino = await _specialty(db_session)
     trauma = await add_doctor(db_session, specialty="Traumatología y ortopedia")
-    caso = await _case(db_session, await specialty_id_by_name(db_session, GENERAL))
+    # Pediatría no es ni su cola ni la de entrada.
+    caso = await _case(
+        db_session, await specialty_id_by_name(db_session, "Pediatría y subespecialidades")
+    )
 
     resp = await client.post(
         f"{PREFIX}/consultations/{caso.id}/derive",

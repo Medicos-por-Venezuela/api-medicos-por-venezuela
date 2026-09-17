@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
 from src.models.doctor import Doctor
+from src.models.doctor_specialty import DoctorSpecialty
 from src.models.profile import Profile
 from src.models.specialty import Specialty
 
@@ -112,3 +113,15 @@ async def any_specialty_id(client: AsyncClient) -> str:
     """
     resp = await client.get("/api/v1/specialties")
     return next(s["id"] for s in resp.json() if s["name"].lower() == GENERAL.lower())
+
+
+async def set_specialties(session: AsyncSession, user_id: uuid.UUID, names: list[str]) -> None:
+    """Deja a la cuenta ejerciendo esas especialidades (`doctor_specialties`), la primera como
+    principal. Es lo que decide su cola: un médico puede tener varias."""
+    ids = [await specialty_id_by_name(session, name) for name in names]
+    profile = await session.get(Profile, user_id)
+    profile.specialty_id = ids[0] if ids else None
+    profile.specialty = names[0] if names else None
+    for specialty_id in ids:
+        session.add(DoctorSpecialty(user_id=user_id, specialty_id=specialty_id))
+    await session.flush()

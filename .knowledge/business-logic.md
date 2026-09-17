@@ -21,19 +21,38 @@ llegada del paciente (`queued_at`; un caso derivado conserva la suya).
   atención es **siempre por videoconsulta**: `via_whatsapp=true` → 422.
 
 ## 2. Cola por especialidad — `services/queue_access.py` (2026-09-17)
-**La columna del match es `consultations.specialty_id`** contra `users.specialty_id`. Una sola
+**La columna del match es `consultations.specialty_id`** contra las especialidades del médico. Una sola
 función (`queue_scope`) decide qué ve y qué puede tomar cada uno; la usan panel, claim, `/queue`,
 `/queue/{id}/take` y la derivación desde la cola:
 1. Admin/super_admin: todas las colas, **salvo** si su especialidad es `mental_health_only`
    (Psicología): entonces la regla normal.
 2. Sin especialidad o con una `is_placeholder` ("Otra"): ninguna cola (`queue_blocked_reason` en el
    panel), hasta que actualice su perfil.
-3. Resto: su especialidad exacta + las de `specialty_queue_access` (sembradas: Psiquiatría →
-   Psicología, Medicina interna → Medicina general).
+3. Resto: **todas las que ejerce** (tabla `doctor_specialties`, ver 2c) + las de
+   `specialty_queue_access` de cada una (sembradas: Psiquiatría → Psicología, Medicina interna →
+   Medicina general).
+4. La **cola de entrada** (`specialties.is_general_triage`, Medicina general) la ve además todo el
+   que atiende salud física; quien solo atiende salud mental, no.
+
+`GET /consultations/panel` devuelve además `queues[]` (`id`, `name`, `is_triage`, `specialty_ids`):
+una cola por especialidad del médico más la de entrada, para que el panel las pinte en cards con
+sus contadores. Un admin **no** recibe ninguna: las ve todas juntas en una sola lista.
 
 "Otra" no se puede pedir al crear una consulta (422). Un médico puede escribir una especialidad que
 no está (`doctors.requested_specialty`); el admin la resuelve con
 `POST /doctors/{id}/specialty-request/resolve`.
+
+## 2c. Un médico, varias especialidades — `doctor_specialties` (2026-09-17)
+Un internista que además es cardiólogo ve las dos colas. El conjunto vive en
+`doctor_specialties(user_id, specialty_id)` (RLS deny-all, backfilleada desde `users.specialty_id`)
+y lo maneja `services/doctor_specialties.py` (validar ≤10, descartar las `is_placeholder`,
+reemplazar, sumar).
+
+**`users.specialty_id` sigue siendo la principal** — la que usan el pool, los reportes, el admin y
+la bandeja de interconsultas — y es el respaldo de `queue_scope` si el conjunto está vacío. Al
+guardar `specialty_ids` en `PATCH /doctors/me`, la primera pasa a principal. Resolver una
+`requested_specialty` **suma** la nueva al conjunto y solo la asciende a principal si la que había
+era de relleno o no había ninguna.
 
 ## 2b. Derivación a la cola de otra especialidad
 - Desde la cola (caso sin tomar): `POST /consultations/{id}/derive` — el mismo caso cambia de
