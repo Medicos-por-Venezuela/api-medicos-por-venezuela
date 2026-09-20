@@ -1,8 +1,8 @@
 """Capa de negocio para el dashboard de estadísticas admin.
 
-Calcula los 7 KPIs en 3 consultas de solo-conteo (round-trips), reemplazando las
-7 consultas directas a Supabase que hacía el frontend. Reutiliza `ONLINE_WINDOW`
-de `services/doctors.py` (única fuente de verdad del criterio "online" = 3 min).
+Calcula los 11 KPIs + 2 distribuciones en 5 consultas de solo-conteo (round-trips),
+reemplazando las 7 consultas directas a Supabase que hacía el frontend. Reutiliza
+`ONLINE_WINDOW` de `services/doctors.py` (única fuente de verdad del criterio "online" = 3 min).
 """
 
 from datetime import UTC, datetime
@@ -15,61 +15,100 @@ from src.models.doctor import Doctor
 from src.models.patient import Patient
 from src.models.profile import Profile
 from src.models.specialty import Specialty
-from src.schemas.stats import PublicStatsResponse, StatsResponse
+from src.schemas.stats import (
+    PublicStatsResponse,
+    SpecialtyCount,
+    StatsResponse,
+    ZoneCount,
+)
 from src.services.doctors import ONLINE_WINDOW
 
-# Bucket amplio "en progreso" (igual criterio que el KPI del panel legacy).
-IN_PROGRESS_STATUSES = {
-    "in_progress",
-    "referred_to_specialist",
-    "urgent_in_person",
-    "patient_no_show",
-    "cancelled",
-    "contacted_whatsapp",
-}
+# Universo de "médico": cuentas con rol clínico (mismo criterio que la página "Médicos y
+# administradores" y el credential-summary). Antes se contaban fichas de `doctors`, lo que
+# dejaba fuera cuentas sin ficha y no cuadraba con el resto del panel.
+DOCTOR_ROLES = ("doctor", "specialist")
+# Buckets MUTUAMENTE EXCLUYENTES por estado: cada consulta cae en exactamente uno. Antes el KPI
+# "en progreso" era un bucket amplio que incluía derivadas, no-show, urgentes y contactados.
 CLOSED_STATUSES = {"closed", "closed_by_admin"}
+ATTENDING_STATUSES = {"in_progress", "contacted_whatsapp"}
+_SIN_ZONA = "Sin zona"
+_SIN_ESPECIALIDAD = "Sin especialidad"
 
 
 async def get_dashboard_stats(session: AsyncSession) -> StatsResponse:
-    """Calcula los 7 contadores del dashboard admin."""
+    """Calcula los KPIs del panel admin y las distribuciones por zona/especialidad.
+
+    Cinco consultas de agregación (ninguna lee filas): una para médicos, una para pacientes,
+    una para los buckets de consultas y una por cada distribución de los gráficos.
+    """
     threshold = datetime.now(UTC) - ONLINE_WINDOW
 
-    # 1) Médicos: registrados = status=1 no borrados; online = de esos, con
-    # presencia (users.last_seen_at) dentro de la ventana. Una sola consulta con
-    # agregación condicional (func.count().filter -> SQL FILTER (WHERE ...)).
+    # 1) Médicos: cuentas con rol clínico; online = de esas, con presencia reciente
+    # (users.last_seen_at) dentro de la ventana. Agregación condicional en una sola consulta.
     doctors_row = (
         await session.execute(
             select(
                 func.count().label("registered"),
                 func.count().filter(Profile.last_seen_at >= threshold).label("online"),
             )
-            .select_from(Doctor)
-            .outerjoin(Profile, Doctor.user_id == Profile.id)
-            .where(Doctor.status == 1, Doctor.deleted_at.is_(None))
+            .select_from(Profile)
+            .where(Profile.role.in_(DOCTOR_ROLES))
         )
     ).one()
 
-    # 2) Pacientes: total simple.
-    patients_registered = await session.scalar(select(func.count()).select_from(Patient)) or 0
+    # 2) Pacientes: fichas vivas (soft-delete excluido). Sin filtro por cuenta: la mayoría de
+    # pacientes son anónimos y solo existen como ficha.
+    patients_registered = (
+        await session.scalar(
+            select(func.count()).select_from(Patient).where(Patient.deleted_at.is_(None))
+        )
+    ) or 0
 
-    # 3) Consultas: los 4 buckets en una sola consulta con agregación condicional.
+    # 3) Consultas: un bucket por estado, en una sola consulta con agregación condicional.
     consultations_row = (
         await session.execute(
             select(
+                func.count().filter(Consultation.status == "waiting").label("waiting"),
                 func.count()
-                .filter(
-                    Consultation.status == "waiting",
-                    Consultation.entered_call_at.isnot(None),
-                )
-                .label("waiting"),
-                func.count()
-                .filter(Consultation.status.in_(IN_PROGRESS_STATUSES))
+                .filter(Consultation.status.in_(ATTENDING_STATUSES))
                 .label("in_progress"),
+                func.count().filter(Consultation.status == "scheduled").label("scheduled"),
+                func.count()
+                .filter(Consultation.status == "referred_to_specialist")
+                .label("referred"),
+                func.count().filter(Consultation.status == "patient_no_show").label("no_show"),
+                func.count().filter(Consultation.status == "cancelled").label("cancelled"),
                 func.count().filter(Consultation.status.in_(CLOSED_STATUSES)).label("closed"),
                 func.count().filter(Consultation.status == "urgent_in_person").label("urgent"),
             ).select_from(Consultation)
         )
     ).one()
+
+    # 4) De qué zona llegan las consultas (todas, sin importar el estado). La zona vive en la
+    # ficha del paciente como texto libre; se agrupa tal cual y los vacíos van a "Sin zona".
+    zone_expr = func.coalesce(func.nullif(func.trim(Patient.affected_zone), ""), _SIN_ZONA)
+    zone_rows = (
+        await session.execute(
+            select(zone_expr.label("zone"), func.count().label("total"))
+            .select_from(Consultation)
+            .join(Patient, Patient.id == Consultation.patient_id)
+            .group_by(zone_expr)
+            .order_by(func.count().desc(), zone_expr.asc())
+        )
+    ).all()
+
+    # 5) Especialidad más pedida (todas, sin importar el estado). `specialty_id` es la columna
+    # del matching; NULL (consultas viejas) cae en "Sin especialidad".
+    specialty_expr = func.coalesce(Specialty.name, _SIN_ESPECIALIDAD)
+    specialty_rows = (
+        await session.execute(
+            select(specialty_expr.label("specialty"), func.count().label("total"))
+            .select_from(Consultation)
+            .outerjoin(Specialty, Specialty.id == Consultation.specialty_id)
+            .group_by(specialty_expr)
+            .order_by(func.count().desc(), specialty_expr.asc())
+        )
+    ).all()
 
     return StatsResponse(
         doctors_registered=doctors_row.registered,
@@ -77,8 +116,16 @@ async def get_dashboard_stats(session: AsyncSession) -> StatsResponse:
         patients_registered=patients_registered,
         consultations_waiting=consultations_row.waiting,
         consultations_in_progress=consultations_row.in_progress,
+        consultations_scheduled=consultations_row.scheduled,
+        consultations_referred=consultations_row.referred,
+        consultations_no_show=consultations_row.no_show,
+        consultations_cancelled=consultations_row.cancelled,
         consultations_closed=consultations_row.closed,
         consultations_urgent=consultations_row.urgent,
+        consultations_by_zone=[ZoneCount(zone=r.zone, total=r.total) for r in zone_rows],
+        consultations_by_specialty=[
+            SpecialtyCount(specialty=r.specialty, total=r.total) for r in specialty_rows
+        ],
     )
 
 
@@ -107,10 +154,11 @@ def round_down(n: int) -> int:
 async def get_public_stats(session: AsyncSession) -> PublicStatsResponse:
     """Las tres cifras de la banda de impacto del home, ya redondeadas.
 
-    Tres conteos y ninguna fila leída: solo `COUNT(*)`. Los criterios son los mismos que usa el
-    panel admin, para que la portada y el panel no cuenten cosas distintas — salvo en consultas,
-    donde aquí se cuentan TODAS las creadas (decisión del equipo, 2026-08-28), sin los buckets por
-    estado del dashboard.
+    Tres conteos y ninguna fila leída: solo `COUNT(*)`. Se conservan los criterios históricos de la
+    portada: médicos = fichas activas (`doctors.status == 1`, no borradas), no cuentas de usuario
+    como el KPI del panel; y consultas = TODAS las creadas (decisión del equipo, 2026-08-28), sin
+    los buckets por estado del dashboard. El número publicado va redondeado a la baja, así que el
+    orden de magnitud no cambia por contar fichas en vez de cuentas.
     """
     doctors = (
         await session.scalar(
