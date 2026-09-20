@@ -19,7 +19,7 @@ from src.models.doctor import Doctor
 from src.models.patient import Patient
 from src.models.rbac import Permission, Role, RolePermission
 from src.services import stats as stats_service
-from tests._helpers import auth_headers, make_profile
+from tests._helpers import auth_headers, make_profile, specialty_id_by_name
 
 PREFIX = "/api/v1"
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db" / "migrations"
@@ -36,36 +36,48 @@ async def _stats(db: AsyncSession) -> stats_service.StatsResponse:
 async def test_dashboard_stats_counts_doctors_and_patients(db_session: AsyncSession) -> None:
     before = await _stats(db_session)
 
+    # 2 cuentas role="doctor" (una online 1 min, otra offline 1 h)
     online_prof = make_profile(role="doctor")
     online_prof.last_seen_at = datetime.now(UTC) - timedelta(minutes=1)
     offline_prof = make_profile(role="doctor")
     offline_prof.last_seen_at = datetime.now(UTC) - timedelta(hours=1)
-    db_session.add_all([online_prof, offline_prof])
+    # 1 cuenta role="specialist" sin last_seen_at
+    specialist_prof = make_profile(role="specialist")
+    # 1 cuenta role="patient" (no debe contar)
+    patient_prof = make_profile(role="patient")
+    db_session.add_all([online_prof, offline_prof, specialist_prof, patient_prof])
     await db_session.flush()
 
-    db_session.add_all(
-        [
-            Doctor(full_name="Dr Online Stats", user_id=online_prof.id, status=1),
-            Doctor(full_name="Dr Offline Stats", user_id=offline_prof.id, status=1),
-            Doctor(full_name="Dr Baja Stats", user_id=None, status=0),
-        ]
-    )
+    # Una ficha Doctor con user_id=None para demostrar que YA NO cuenta
+    db_session.add(Doctor(full_name="Dr Sin Cuenta Stats", user_id=None, status=1))
+    await db_session.flush()
+
+    # Pacientes: 1 vivo, 1 borrado (soft delete)
     db_session.add(
         Patient(
-            full_name="Paciente Stats",
+            full_name="Paciente Stats Vivo",
             phone_whatsapp="+58412000000",
             affected_zone="Caracas",
             consent=True,
         )
     )
+    deleted_patient = Patient(
+        full_name="Paciente Stats Borrado",
+        phone_whatsapp="+58412000001",
+        affected_zone="Maracaibo",
+        consent=True,
+        deleted_at=datetime.now(UTC),
+    )
+    db_session.add(deleted_patient)
     await db_session.flush()
 
     after = await _stats(db_session)
 
-    # Solo los 2 status=1 cuentan como registrados; el de baja (status=0) no.
-    assert after.doctors_registered == before.doctors_registered + 2
-    # Solo el que tiene last_seen_at < 3 min cuenta como online.
+    # doctors_registered: 3 cuentas con rol clínico (2 doctor + 1 specialist)
+    assert after.doctors_registered == before.doctors_registered + 3
+    # doctors_online: solo la que tiene last_seen_at < 3 min (la de 1 min)
     assert after.doctors_online == before.doctors_online + 1
+    # patients_registered: solo 1 (la borrada no cuenta)
     assert after.patients_registered == before.patients_registered + 1
 
 
@@ -106,6 +118,7 @@ async def test_dashboard_stats_counts_consultations_by_bucket(db_session: AsyncS
 
     before = await _stats(db_session)
 
+    # 2 waiting (una CON entered_call_at, otra SIN) + una de cada estado restante = 11 filas
     db_session.add_all(
         [
             Consultation(
@@ -113,32 +126,132 @@ async def test_dashboard_stats_counts_consultations_by_bucket(db_session: AsyncS
             ),
             Consultation(patient_id=patient.id, status="waiting"),  # sin entered_call_at
             Consultation(patient_id=patient.id, status="in_progress"),
+            Consultation(patient_id=patient.id, status="contacted_whatsapp"),
+            Consultation(patient_id=patient.id, status="scheduled"),
             Consultation(patient_id=patient.id, status="referred_to_specialist"),
-            Consultation(patient_id=patient.id, status="urgent_in_person"),
             Consultation(patient_id=patient.id, status="patient_no_show"),
             Consultation(patient_id=patient.id, status="cancelled"),
             Consultation(patient_id=patient.id, status="closed"),
             Consultation(patient_id=patient.id, status="closed_by_admin"),
-            # "contacted_whatsapp" está en CONSULTATION_STATUSES y en el CHECK de la
-            # base; se inserta directo por ORM (no pasa por el endpoint de creación,
-            # que llama a _validate_status) porque este test solo ejercita stats.
-            Consultation(patient_id=patient.id, status="contacted_whatsapp"),
+            Consultation(patient_id=patient.id, status="urgent_in_person"),
         ]
     )
     await db_session.flush()
 
     after = await _stats(db_session)
 
-    # Solo 1 de las 2 'waiting' tiene entered_call_at.
-    assert after.consultations_waiting == before.consultations_waiting + 1
-    # in_progress + referred_to_specialist + urgent_in_person + patient_no_show +
-    # cancelled + contacted_whatsapp (urgent_in_person también pertenece a su
-    # propio KPI, además de este bucket amplio "en progreso").
-    assert after.consultations_in_progress == before.consultations_in_progress + 6
-    # closed + closed_by_admin.
+    # waiting: ambas cuentan (con o sin entered_call_at)
+    assert after.consultations_waiting == before.consultations_waiting + 2
+    # in_progress: in_progress + contacted_whatsapp
+    assert after.consultations_in_progress == before.consultations_in_progress + 2
+    # scheduled
+    assert after.consultations_scheduled == before.consultations_scheduled + 1
+    # referred
+    assert after.consultations_referred == before.consultations_referred + 1
+    # no_show
+    assert after.consultations_no_show == before.consultations_no_show + 1
+    # cancelled
+    assert after.consultations_cancelled == before.consultations_cancelled + 1
+    # closed: closed + closed_by_admin
     assert after.consultations_closed == before.consultations_closed + 2
-    # Solo urgent_in_person.
+    # urgent
     assert after.consultations_urgent == before.consultations_urgent + 1
+
+    # La suma de los 8 buckets debe ser igual al delta total de consultas (11)
+    total_buckets_delta = (
+        (after.consultations_waiting - before.consultations_waiting)
+        + (after.consultations_in_progress - before.consultations_in_progress)
+        + (after.consultations_scheduled - before.consultations_scheduled)
+        + (after.consultations_referred - before.consultations_referred)
+        + (after.consultations_no_show - before.consultations_no_show)
+        + (after.consultations_cancelled - before.consultations_cancelled)
+        + (after.consultations_closed - before.consultations_closed)
+        + (after.consultations_urgent - before.consultations_urgent)
+    )
+    assert total_buckets_delta == 11
+
+
+async def test_dashboard_stats_groups_consultations_by_zone(db_session: AsyncSession) -> None:
+    # 2 pacientes con affected_zone="Caracas", 1 con affected_zone="" (vacío -> "Sin zona")
+    patient_caracas_1 = Patient(
+        full_name="Paciente Caracas 1",
+        phone_whatsapp="+58412000010",
+        affected_zone="Caracas",
+        consent=True,
+    )
+    patient_caracas_2 = Patient(
+        full_name="Paciente Caracas 2",
+        phone_whatsapp="+58412000011",
+        affected_zone="Caracas",
+        consent=True,
+    )
+    patient_sin_zona = Patient(
+        full_name="Paciente Sin Zona",
+        phone_whatsapp="+58412000012",
+        affected_zone="",
+        consent=True,
+    )
+    db_session.add_all([patient_caracas_1, patient_caracas_2, patient_sin_zona])
+    await db_session.flush()
+
+    before = await _stats(db_session)
+    before_zone_dict = {z.zone: z.total for z in before.consultations_by_zone}
+
+    # 2 consultas para Caracas, 1 para Sin zona
+    db_session.add_all(
+        [
+            Consultation(patient_id=patient_caracas_1.id, status="waiting"),
+            Consultation(patient_id=patient_caracas_2.id, status="in_progress"),
+            Consultation(patient_id=patient_sin_zona.id, status="closed"),
+        ]
+    )
+    await db_session.flush()
+
+    after = await _stats(db_session)
+    after_zone_dict = {z.zone: z.total for z in after.consultations_by_zone}
+
+    # Comparar por delta
+    assert after_zone_dict.get("Caracas", 0) == before_zone_dict.get("Caracas", 0) + 2
+    assert after_zone_dict.get("Sin zona", 0) == before_zone_dict.get("Sin zona", 0) + 1
+
+
+async def test_dashboard_stats_groups_consultations_by_specialty(db_session: AsyncSession) -> None:
+    patient = Patient(
+        full_name="Paciente Especialidad Stats",
+        phone_whatsapp="+58412000020",
+        affected_zone="Caracas",
+        consent=True,
+    )
+    db_session.add(patient)
+    await db_session.flush()
+
+    general_id = await specialty_id_by_name(db_session, "Medicina general")
+
+    before = await _stats(db_session)
+    before_spec_dict = {s.specialty: s.total for s in before.consultations_by_specialty}
+
+    # 2 consultas con specialty_id="Medicina general", 1 con specialty_id=None
+    db_session.add_all(
+        [
+            Consultation(patient_id=patient.id, status="waiting", specialty_id=general_id),
+            Consultation(patient_id=patient.id, status="in_progress", specialty_id=general_id),
+            Consultation(patient_id=patient.id, status="closed", specialty_id=None),
+        ]
+    )
+    await db_session.flush()
+
+    after = await _stats(db_session)
+    after_spec_dict = {s.specialty: s.total for s in after.consultations_by_specialty}
+
+    # Comparar por delta
+    assert (
+        after_spec_dict.get("Medicina general", 0)
+        == before_spec_dict.get("Medicina general", 0) + 2
+    )
+    assert (
+        after_spec_dict.get("Sin especialidad", 0)
+        == before_spec_dict.get("Sin especialidad", 0) + 1
+    )
 
 
 # --- Endpoint / autorización --------------------------------------------------
@@ -150,16 +263,38 @@ async def test_dashboard_stats_endpoint_returns_all_fields_for_admin(
     resp = await client.get(f"{PREFIX}/stats/dashboard")
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert set(body) == {
+    expected_keys = {
         "doctors_registered",
         "doctors_online",
         "patients_registered",
         "consultations_waiting",
         "consultations_in_progress",
+        "consultations_scheduled",
+        "consultations_referred",
+        "consultations_no_show",
+        "consultations_cancelled",
         "consultations_closed",
         "consultations_urgent",
+        "consultations_by_zone",
+        "consultations_by_specialty",
     }
-    assert all(isinstance(v, int) for v in body.values())
+    assert set(body) == expected_keys
+    # Validar que las listas tienen dicts con las claves esperadas
+    assert isinstance(body["consultations_by_zone"], list)
+    assert isinstance(body["consultations_by_specialty"], list)
+    if body["consultations_by_zone"]:
+        assert all(
+            isinstance(item, dict) and set(item.keys()) == {"zone", "total"}
+            for item in body["consultations_by_zone"]
+        )
+    if body["consultations_by_specialty"]:
+        assert all(
+            isinstance(item, dict) and set(item.keys()) == {"specialty", "total"}
+            for item in body["consultations_by_specialty"]
+        )
+    # Los 11 KPIs son ints
+    int_keys = expected_keys - {"consultations_by_zone", "consultations_by_specialty"}
+    assert all(isinstance(body[k], int) for k in int_keys)
 
 
 async def test_dashboard_stats_endpoint_for_super_admin(

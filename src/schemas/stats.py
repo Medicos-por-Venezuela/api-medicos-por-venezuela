@@ -2,55 +2,76 @@
 
 from pydantic import BaseModel, ConfigDict, Field
 
-__all__ = ["PublicStatsResponse", "StatsResponse"]
+__all__ = ["PublicStatsResponse", "SpecialtyCount", "StatsResponse", "ZoneCount"]
+
+
+class ZoneCount(BaseModel):
+    """Consultas agrupadas por la zona del paciente (todas, sin importar el estado)."""
+
+    zone: str = Field(
+        ..., description="Zona de la ficha del paciente, o 'Sin zona' si está vacía."
+    )
+    total: int = Field(..., description="Consultas creadas por pacientes de esa zona.")
+
+
+class SpecialtyCount(BaseModel):
+    """Consultas agrupadas por la especialidad solicitada (todas, sin importar el estado)."""
+
+    specialty: str = Field(
+        ..., description="Especialidad pedida, o 'Sin especialidad' si la consulta no la trae."
+    )
+    total: int = Field(..., description="Consultas que pidieron esa especialidad.")
 
 
 class StatsResponse(BaseModel):
-    """Contadores agregados del panel admin. Sustituye a las 7 consultas directas
-    que el frontend hacía contra Supabase (ver spec `dashboard-stats`).
+    """Contadores agregados del panel admin (KPIs + distribuciones de los gráficos).
 
-    Note: the 4 consultation buckets are NOT mutually exclusive and must not be
-    summed expecting a partition. In particular, `consultations_urgent`
-    (`urgent_in_person`) is also counted within `consultations_in_progress`.
+    Los buckets de consultas son MUTUAMENTE EXCLUYENTES por estado: cada consulta cae en
+    exactamente uno, así que pueden sumarse y su total es el de consultas creadas.
     """
 
     model_config = ConfigDict(from_attributes=True)
 
     doctors_registered: int = Field(
         ...,
-        description="Médicos activos: `doctors.status == 1`, no borrados (`deleted_at` nulo).",
+        description="Médicos registrados: cuentas con rol clínico ('doctor'/'specialist').",
     )
     doctors_online: int = Field(
         ...,
         description=(
-            "De los médicos activos, cuántos tienen presencia reciente: cuenta ligada "
-            "(`users.last_seen_at`) dentro de los últimos 3 minutos."
+            "De esas cuentas, cuántas tienen presencia reciente (users.last_seen_at dentro "
+            "de los últimos 3 minutos)."
         ),
     )
-    patients_registered: int = Field(..., description="Total de pacientes registrados.")
+    patients_registered: int = Field(
+        ..., description="Fichas de pacientes vivas (deleted_at nulo)."
+    )
     consultations_waiting: int = Field(
-        ...,
-        description=(
-            "Consultas en espera con `entered_call_at` fijado (paridad con el panel legacy)."
-        ),
+        ..., description="Consultas en espera (status='waiting'), con o sin entered_call_at."
     )
     consultations_in_progress: int = Field(
         ...,
-        description=(
-            "Bucket amplio 'en progreso': in_progress, referred_to_specialist, "
-            "urgent_in_person, patient_no_show, cancelled, contacted_whatsapp. "
-            "Note: overlaps with `consultations_urgent` — buckets are not disjoint."
-        ),
+        description="Casos con médico encima: in_progress + contacted_whatsapp.",
     )
-    consultations_closed: int = Field(
-        ..., description="Consultas cerradas: closed o closed_by_admin."
+    consultations_scheduled: int = Field(
+        ..., description="Citas de la Agenda aún no atendidas (status='scheduled')."
     )
+    consultations_referred: int = Field(
+        ..., description="Derivadas a otra especialidad (status='referred_to_specialist')."
+    )
+    consultations_no_show: int = Field(
+        ..., description="El paciente no se presentó (status='patient_no_show')."
+    )
+    consultations_cancelled: int = Field(..., description="Canceladas (status='cancelled').")
+    consultations_closed: int = Field(..., description="Cerradas: closed + closed_by_admin.")
     consultations_urgent: int = Field(
-        ...,
-        description=(
-            "Consultas marcadas `urgent_in_person`. Also counted within "
-            "`consultations_in_progress`; do not sum buckets expecting a partition."
-        ),
+        ..., description="Deben ir a atención presencial urgente (status='urgent_in_person')."
+    )
+    consultations_by_zone: list[ZoneCount] = Field(
+        ..., description="Distribución de TODAS las consultas por zona del paciente."
+    )
+    consultations_by_specialty: list[SpecialtyCount] = Field(
+        ..., description="Distribución de TODAS las consultas por especialidad solicitada."
     )
 
 
