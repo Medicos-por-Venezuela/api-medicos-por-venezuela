@@ -23,17 +23,26 @@ tag_metadata = [
 @router.get(
     "/dashboard",
     response_model=StatsResponse,
-    summary="Contadores del dashboard admin (médicos, pacientes, consultas)",
+    summary="KPIs del dashboard admin + distribuciones zona/especialidad",
     responses={403: {"description": "No tienes el permiso 'stats.read'."}},
 )
 async def get_dashboard_stats(
     db: AsyncSession = Depends(get_db),
     _: Principal = Depends(require_permission("stats.read")),
 ) -> StatsResponse:
-    """Calcula, en 3 consultas de solo-conteo, los 7 KPIs del dashboard admin:
-    médicos registrados/online, pacientes registrados, y consultas agrupadas por
-    estado (en espera, en progreso, cerradas, urgentes). Reemplaza las 7 consultas
-    directas a Supabase que hacía antes el frontend."""
+    """Calcula, en 5 consultas de solo-conteo, los KPIs del panel admin y las dos
+    distribuciones para los gráficos:
+
+    - Médicos: cuentas con rol clínico ('doctor'/'specialist'), y cuántas online
+      (last_seen_at < 3 min).
+    - Pacientes: fichas vivas (deleted_at nulo).
+    - Consultas: 8 buckets MUTUAMENTE EXCLUYENTES por estado (waiting, in_progress,
+      scheduled, referred_to_specialist, patient_no_show, cancelled, closed,
+      urgent_in_person). Cada consulta cae en exactamente uno.
+    - Distribución por zona del paciente (todas las consultas, sin filtrar por estado).
+    - Distribución por especialidad solicitada (todas las consultas, sin filtrar por estado).
+
+    Reemplaza las 7 consultas directas a Supabase que hacía antes el frontend."""
     return await stats_service.get_dashboard_stats(db)
 
 
