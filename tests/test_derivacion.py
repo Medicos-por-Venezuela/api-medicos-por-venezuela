@@ -296,7 +296,9 @@ async def test_derivar_con_especialista_cierra_la_parte_del_medico_y_encola_una_
     cola = await client.get(f"{PREFIX}/consultations/panel", headers=auth_headers(especialista.id))
     assert str(hija_id) in {c["id"] for c in cola.json()["waiting"]}
     assert (
-        await client.get(f"{PREFIX}/consultations/{hija_id}", headers=auth_headers(especialista.id))
+        await client.get(
+            f"{PREFIX}/consultations/{hija_id}", headers=auth_headers(especialista.id)
+        )
     ).status_code == 403
 
     # Al tomarla, el especialista entra con sala nueva.
