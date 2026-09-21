@@ -15,7 +15,12 @@ from src.core.errors import ForbiddenError
 from src.core.ratelimit import limiter
 from src.core.security import Principal, get_current_principal, require_permission
 from src.db.session import get_db
-from src.schemas.patient import PatientCreate, PatientResponse, PatientUpdate
+from src.schemas.patient import (
+    PatientAddressResponse,
+    PatientCreate,
+    PatientResponse,
+    PatientUpdate,
+)
 from src.services import patients as patients_service
 
 router = APIRouter(prefix="/patients", tags=["patients"])
@@ -142,3 +147,39 @@ async def delete_patient(
     principal: Principal = Depends(require_permission("patients.write")),
 ) -> None:
     await patients_service.delete_patient(db, patient_id, actor_user_id=principal.id)
+
+
+@router.get(
+    "/{patient_id}/address",
+    response_model=PatientAddressResponse,
+    summary="Dirección cifrada del paciente (solo tratante o allowlist)",
+    responses={
+        403: {
+            "description": (
+                "Solo el médico que atiende el caso (o allowlist) puede ver la dirección."
+            )
+        },
+        404: {"description": "Paciente no encontrado."},
+    },
+)
+async def get_patient_address(
+    patient_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_permission("patients.read")),
+) -> PatientAddressResponse:
+    """Devuelve la dirección cifrada E2E (v1:base64 sealed box) del paciente.
+
+    Autorizado solo si:
+    - El email del principal está en la allowlist configurable (`ADDRESS_VIEWER_EMAILS`), O
+    - El principal es el médico asignado a alguna consulta de este paciente (cualquier estado).
+
+    Escribe auditoría con action="patient.address_revealed" antes de responder.
+    El servidor NUNCA descifra, loguea ni valida el contenido.
+    """
+    patient = await patients_service.get_patient_as_staff(
+        db, patient_id, may_see_doctor_patients=principal.has_permission("patients.write")
+    )
+    address_encrypted = await patients_service.patient_address_for_viewer(
+        db, patient, viewer_id=principal.id, viewer_email=principal.email
+    )
+    return PatientAddressResponse(address_encrypted=address_encrypted)

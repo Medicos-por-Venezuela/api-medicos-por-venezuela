@@ -21,6 +21,8 @@ async def _open_consultation(client: AsyncClient, doctor_id) -> str:
         json={
             "full_name": "Pac Agenda",
             "phone_whatsapp": "+58412555222",
+            "emergency_phone": "+58414555222",
+            "address_encrypted": "v1:dGVzdCBjaXBoZXJ0ZXh0",
             "affected_zone": "Caracas",
             "consent": True,
         },

@@ -7,21 +7,28 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import settings
+from src.models.consultation import Consultation
 from src.models.patient import Patient
 from src.models.profile import Profile
-from tests._helpers import add_doctor, any_specialty_id, auth_headers, make_profile
+from tests._helpers import (
+    add_doctor,
+    any_specialty_id,
+    auth_headers,
+    make_profile,
+    valid_patient_payload,
+)
 
 PREFIX = "/api/v1"
 
 
 async def test_create_and_get_patient(client: AsyncClient) -> None:
-    payload = {
-        "full_name": "Paciente de Prueba",
-        "phone_whatsapp": "+58412000000",
-        "affected_zone": "Caracas",
-        "needs_tags": ["medicina_general"],
-        "consent": True,
-    }
+    payload = valid_patient_payload(
+        full_name="Paciente de Prueba",
+        phone_whatsapp="+58412000000",
+        affected_zone="Caracas",
+        needs_tags=["medicina_general"],
+    )
     resp = await client.post(f"{PREFIX}/patients", json=payload)
     assert resp.status_code == 201, resp.text
     body = resp.json()
@@ -36,23 +43,19 @@ async def test_create_and_get_patient(client: AsyncClient) -> None:
 
 
 async def test_create_patient_requires_consent(client: AsyncClient) -> None:
-    payload = {
-        "full_name": "Sin Consentimiento",
-        "phone_whatsapp": "+58412000001",
-        "affected_zone": "Maracaibo",
-        "consent": False,
-    }
+    payload = valid_patient_payload(
+        full_name="Sin Consentimiento",
+        phone_whatsapp="+58412000001",
+        affected_zone="Maracaibo",
+        consent=False,
+    )
     resp = await client.post(f"{PREFIX}/patients", json=payload)
     assert resp.status_code == 400
 
 
 async def test_create_patient_validation_error(client: AsyncClient) -> None:
     # full_name demasiado corto (min_length=2) -> 422 de Pydantic.
-    payload = {
-        "full_name": "A",
-        "phone_whatsapp": "+58412000002",
-        "affected_zone": "Valencia",
-    }
+    payload = valid_patient_payload(full_name="A")
     resp = await client.post(f"{PREFIX}/patients", json=payload)
     assert resp.status_code == 422
 
@@ -67,12 +70,11 @@ async def test_list_update_delete_patient(
 ) -> None:
     created = await client.post(
         f"{PREFIX}/patients",
-        json={
-            "full_name": "Para Editar",
-            "phone_whatsapp": "+58412000003",
-            "affected_zone": "Mérida",
-            "consent": True,
-        },
+        json=valid_patient_payload(
+            full_name="Para Editar",
+            phone_whatsapp="+58412000003",
+            affected_zone="Mérida",
+        ),
     )
     patient_id = created.json()["id"]
 
@@ -155,13 +157,24 @@ async def test_update_missing_patient_404(client: AsyncClient) -> None:
 
 
 def _adult_payload(**over: object) -> dict:
-    base = {
-        "full_name": "Adulto Responsable",
-        "phone_whatsapp": "+58412000010",
-        "affected_zone": "Caracas",
-        "cedula": "24319284",
-        "consent": True,
-    }
+    base = valid_patient_payload(
+        full_name="Adulto Responsable",
+        phone_whatsapp="+58412000010",
+        affected_zone="Caracas",
+        cedula="24319284",
+    )
+    base.update(over)
+    return base
+
+
+def _menor_payload(parent_id: str, **over: object) -> dict:
+    base = valid_patient_payload(
+        full_name="Menor Test",
+        phone_whatsapp="+58412000010",
+        affected_zone="Caracas",
+        parent_id=parent_id,
+        parentesco="Madre",
+    )
     base.update(over)
     return base
 
@@ -182,29 +195,13 @@ async def test_menor_sin_cedula_hereda_cedula_del_adulto_mas_correlativo(
     adulto_id = adulto.json()["id"]
 
     primero = await client.post(
-        f"{PREFIX}/patients",
-        json={
-            "full_name": "Primer Menor",
-            "phone_whatsapp": "+58412000010",
-            "affected_zone": "Caracas",
-            "parent_id": adulto_id,
-            "parentesco": "Madre",
-            "consent": True,
-        },
+        f"{PREFIX}/patients", json=_menor_payload(parent_id=adulto_id, full_name="Primer Menor")
     )
     assert primero.status_code == 201, primero.text
     assert primero.json()["cedula"] == "243192841"
 
     segundo = await client.post(
-        f"{PREFIX}/patients",
-        json={
-            "full_name": "Segundo Menor",
-            "phone_whatsapp": "+58412000010",
-            "affected_zone": "Caracas",
-            "parent_id": adulto_id,
-            "parentesco": "Madre",
-            "consent": True,
-        },
+        f"{PREFIX}/patients", json=_menor_payload(parent_id=adulto_id, full_name="Segundo Menor")
     )
     assert segundo.status_code == 201, segundo.text
     assert segundo.json()["cedula"] == "243192842"
@@ -218,41 +215,28 @@ async def test_menor_con_cedula_propia_no_se_sobreescribe(client: AsyncClient) -
 
     menor = await client.post(
         f"{PREFIX}/patients",
-        json={
-            "full_name": "Menor Con Cedula",
-            "phone_whatsapp": "+58412000012",
-            "affected_zone": "Caracas",
-            "cedula": "V-30000000",
-            "parent_id": adulto_id,
-            "parentesco": "Padre",
-            "consent": True,
-        },
+        json=_menor_payload(
+            parent_id=adulto_id,
+            full_name="Menor Con Cedula",
+            phone_whatsapp="+58412000012",
+            cedula="V-30000000",
+            parentesco="Padre",
+        ),
     )
     assert menor.status_code == 201, menor.text
     assert menor.json()["cedula"] == "V-30000000"
 
 
 async def test_parentesco_sin_parent_id_falla_422(client: AsyncClient) -> None:
-    resp = await client.post(
-        f"{PREFIX}/patients",
-        json=_adult_payload(parentesco="Madre", phone_whatsapp="+58412000013"),
-    )
+    resp = await client.post(f"{PREFIX}/patients", json=_adult_payload(parentesco="Madre"))
     assert resp.status_code == 422
 
 
 async def test_parent_id_sin_parentesco_falla_422(client: AsyncClient) -> None:
-    adulto = await client.post(
-        f"{PREFIX}/patients", json=_adult_payload(phone_whatsapp="+58412000014")
-    )
+    adulto = await client.post(f"{PREFIX}/patients", json=_adult_payload())
     resp = await client.post(
         f"{PREFIX}/patients",
-        json={
-            "full_name": "Menor Sin Parentesco",
-            "phone_whatsapp": "+58412000014",
-            "affected_zone": "Caracas",
-            "parent_id": adulto.json()["id"],
-            "consent": True,
-        },
+        json=_menor_payload(parent_id=adulto.json()["id"], parentesco=None),
     )
     assert resp.status_code == 422
 
@@ -260,14 +244,13 @@ async def test_parent_id_sin_parentesco_falla_422(client: AsyncClient) -> None:
 async def test_parent_id_inexistente_falla_400(client: AsyncClient) -> None:
     resp = await client.post(
         f"{PREFIX}/patients",
-        json={
-            "full_name": "Menor Huerfano",
-            "phone_whatsapp": "+58412000015",
-            "affected_zone": "Caracas",
-            "parent_id": "00000000-0000-0000-0000-000000000000",
-            "parentesco": "Madre",
-            "consent": True,
-        },
+        json=valid_patient_payload(
+            full_name="Menor Huerfano",
+            phone_whatsapp="+58412000015",
+            affected_zone="Caracas",
+            parent_id="00000000-0000-0000-0000-000000000000",
+            parentesco="Madre",
+        ),
     )
     assert resp.status_code == 400
 
@@ -283,16 +266,13 @@ async def test_registro_completo_adulto_y_menor_primera_vez(client: AsyncClient)
 
     menor = await client.post(
         f"{PREFIX}/patients",
-        json={
-            "full_name": "Menor Primera Vez",
-            "phone_whatsapp": "+58412000020",
-            "affected_zone": "Caracas",
-            "age_range": "7",
-            "allergies": "Ninguna conocida",
-            "parent_id": adulto_id,
-            "parentesco": "Madre",
-            "consent": True,
-        },
+        json=_menor_payload(
+            parent_id=adulto_id,
+            full_name="Menor Primera Vez",
+            phone_whatsapp="+58412000020",
+            age_range="7",
+            allergies="Ninguna conocida",
+        ),
     )
     assert menor.status_code == 201, menor.text
     menor_body = menor.json()
@@ -340,6 +320,8 @@ async def test_list_patients_tolera_email_historico_invalido(
         affected_zone="Caracas",
         email="manuel fegona 29",  # sin '@': inválido para EmailStr
         consent=True,
+        emergency_phone="+58414000009",  # Distinto del WhatsApp
+        address_encrypted="v1:dGVzdCBjaXBoZXJ0ZXh0",  # "test ciphertext" en base64
     )
     db_session.add(legacy)
     await db_session.flush()
@@ -353,13 +335,12 @@ async def test_list_patients_tolera_email_historico_invalido(
     # La ENTRADA sigue exigiendo formato válido: el 422 es el que debe seguir ocurriendo.
     rechazado = await client.post(
         f"{PREFIX}/patients",
-        json={
-            "full_name": "Email Invalido",
-            "phone_whatsapp": "+58412000010",
-            "affected_zone": "Caracas",
-            "email": "manuel fegona 29",
-            "consent": True,
-        },
+        json=valid_patient_payload(
+            full_name="Email Invalido",
+            phone_whatsapp="+58412000010",
+            affected_zone="Caracas",
+            email="manuel fegona 29",
+        ),
     )
     assert rechazado.status_code == 422, rechazado.text
 
@@ -414,9 +395,11 @@ async def test_alta_de_consultorio_exige_consentimiento(
 async def test_alta_publica_sigue_exigiendo_telefono_y_zona(client: AsyncClient) -> None:
     """Relajar el NOT NULL no puede abrirle la puerta a la cola: el alta pública, que sí usa
     esos datos, los sigue exigiendo."""
-    incompleto = await client.post(
-        f"{PREFIX}/patients", json={"full_name": "Publico Incompleto", "consent": True}
-    )
+    # Falta phone_whatsapp y affected_zone (el payload base los tiene, así que los borramos)
+    payload = valid_patient_payload(full_name="Publico Incompleto")
+    del payload["phone_whatsapp"]
+    del payload["affected_zone"]
+    incompleto = await client.post(f"{PREFIX}/patients", json=payload)
     assert incompleto.status_code == 422, incompleto.text
 
 
@@ -479,12 +462,11 @@ async def test_paciente_de_alta_publica_no_es_de_ningun_medico(
     medico = await add_doctor(db_session)
     publico = await client.post(
         f"{PREFIX}/patients",
-        json={
-            "full_name": "Paciente Publico",
-            "phone_whatsapp": "+58412777777",
-            "affected_zone": "Caracas",
-            "consent": True,
-        },
+        json=valid_patient_payload(
+            full_name="Paciente Publico",
+            phone_whatsapp="+58412777777",
+            affected_zone="Caracas",
+        ),
     )
     assert publico.status_code == 201
 
@@ -606,3 +588,130 @@ async def test_el_dueno_sigue_leyendo_su_paciente_por_su_ruta(
     suyo = await client.get(f"{MIS_PACIENTES}/{privado}", headers=auth_headers(dueno.id))
     assert suyo.status_code == 200
     assert suyo.json()["cedula"] == "V-11223344"
+
+
+# --- Teléfono de emergencia y dirección cifrada E2E ---------------------------
+
+
+async def test_alta_publica_exige_emergencia_y_direccion(client: AsyncClient) -> None:
+    """Los dos campos son obligatorios en el alta pública (decisión del equipo)."""
+    sin_emergencia = valid_patient_payload()
+    del sin_emergencia["emergency_phone"]
+    assert (await client.post(f"{PREFIX}/patients", json=sin_emergencia)).status_code == 422
+
+    sin_direccion = valid_patient_payload()
+    del sin_direccion["address_encrypted"]
+    assert (await client.post(f"{PREFIX}/patients", json=sin_direccion)).status_code == 422
+
+    # La dirección debe llegar YA cifrada (v1:base64); texto plano se rechaza.
+    plano = valid_patient_payload(address_encrypted="Calle Falsa 123")
+    assert (await client.post(f"{PREFIX}/patients", json=plano)).status_code == 422
+
+
+async def test_alta_publica_rechaza_emergencia_igual_al_whatsapp(client: AsyncClient) -> None:
+    """Misma cifra con distinto formato también es el mismo teléfono."""
+    payload = valid_patient_payload(
+        phone_whatsapp="+58 412-1234567", emergency_phone="584121234567"
+    )
+    assert (await client.post(f"{PREFIX}/patients", json=payload)).status_code == 422
+
+
+async def test_alta_publica_guarda_emergencia_y_direccion_cifrada(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    resp = await client.post(
+        f"{PREFIX}/patients",
+        json=valid_patient_payload(
+            full_name="Paciente Emergencia",
+            phone_whatsapp="+58412000200",
+            emergency_phone="+58414000200",
+            address_encrypted="v1:Y2lwaGVydGV4dA==",
+        ),
+    )
+    assert resp.status_code == 201, resp.text
+    row = (
+        await db_session.execute(select(Patient).where(Patient.id == resp.json()["id"]))
+    ).scalar_one()
+    assert row.emergency_phone == "+58414000200"
+    assert row.address_encrypted == "v1:Y2lwaGVydGV4dA=="
+
+
+async def test_patch_rechaza_emergencia_igual_al_whatsapp_guardado(client: AsyncClient) -> None:
+    """El PATCH puede traer solo el teléfono de emergencia: se compara contra lo guardado."""
+    creado = await client.post(
+        f"{PREFIX}/patients",
+        json=valid_patient_payload(phone_whatsapp="+58412000201", emergency_phone="+58414000201"),
+    )
+    pid = creado.json()["id"]
+    igual = await client.patch(
+        f"{PREFIX}/patients/{pid}", json={"emergency_phone": "+58 412-000-201"}
+    )
+    assert igual.status_code == 422
+
+
+async def _paciente_con_direccion(client: AsyncClient) -> str:
+    resp = await client.post(
+        f"{PREFIX}/patients",
+        json=valid_patient_payload(
+            full_name="Paciente Dirección",
+            phone_whatsapp="+58412000300",
+            emergency_phone="+58414000300",
+            address_encrypted="v1:ZGlyZWNjaW9uLXNlY3JldGE=",
+        ),
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+async def test_direccion_solo_para_el_medico_tratante_y_la_allowlist(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch
+) -> None:
+    """La dirección es "única y exclusivamente" del médico tratante y la allowlist: ni otro
+    médico ni un admin fuera de la lista pueden pedir la ciphertext."""
+    pid = await _paciente_con_direccion(client)
+    tratante = await add_doctor(db_session)
+    otro = await add_doctor(db_session)
+    db_session.add(
+        Consultation(patient_id=uuid.UUID(pid), status="closed", assigned_doctor_id=tratante.id)
+    )
+    await db_session.flush()
+
+    suyo = await client.get(f"{PREFIX}/patients/{pid}/address", headers=auth_headers(tratante.id))
+    assert suyo.status_code == 200, suyo.text
+    assert suyo.json() == {"address_encrypted": "v1:ZGlyZWNjaW9uLXNlY3JldGE="}
+
+    ajeno = await client.get(f"{PREFIX}/patients/{pid}/address", headers=auth_headers(otro.id))
+    assert ajeno.status_code == 403
+
+    # El admin por defecto no está en la allowlist -> 403 aunque tenga patients.read.
+    assert (await client.get(f"{PREFIX}/patients/{pid}/address")).status_code == 403
+
+    monkeypatch.setattr(settings, "ADDRESS_VIEWER_EMAILS", "viewer@example.com")
+    viewer = make_profile(role="super_admin")
+    viewer.email = "viewer@example.com"
+    db_session.add(viewer)
+    await db_session.flush()
+    allow = await client.get(f"{PREFIX}/patients/{pid}/address", headers=auth_headers(viewer.id))
+    assert allow.status_code == 200, allow.text
+
+    # Cada acceso queda auditado (vía tratante y vía allowlist).
+    audit_resp = await client.get(f"{PREFIX}/audit-log", params={"resource": "patients"})
+    entries = [
+        e
+        for e in audit_resp.json()
+        if e["resource_id"] == pid and e["action"] == "patient.address_revealed"
+    ]
+    assert len(entries) == 2
+
+
+async def test_la_direccion_no_aparece_en_las_respuestas_de_paciente(client: AsyncClient) -> None:
+    pid = await _paciente_con_direccion(client)
+
+    detalle = await client.get(f"{PREFIX}/patients/{pid}")
+    assert detalle.status_code == 200
+    assert detalle.json()["emergency_phone"] == "+58414000300"
+    assert "address_encrypted" not in detalle.json()
+
+    listado = await client.get(f"{PREFIX}/patients", params={"limit": 100})
+    assert listado.status_code == 200
+    assert all("address_encrypted" not in p for p in listado.json())

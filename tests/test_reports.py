@@ -1006,3 +1006,27 @@ async def test_la_portada_dice_cuando_no_hay_filtros(
     )
     assert resp.status_code == 200, resp.text
     assert "Sin filtros: todos los registros" in _shared_strings(resp.content)
+
+
+async def test_reporte_de_pacientes_trae_emergencia_y_nunca_la_direccion(
+    client: AsyncClient, super_admin, db_session: AsyncSession
+) -> None:
+    """Decisión del equipo: el teléfono de emergencia sí se exporta (solo super_admin); la
+    dirección no entra a ningún reporte (el servidor no puede descifrarla)."""
+    marker = f"rep{uuid.uuid4().hex[:8]}"
+    await _seed_patient(
+        db_session,
+        marker,
+        emergency_phone="+58414999888",
+        address_encrypted="v1:cmVwb3J0ZS1zZWNyZXRv",
+    )
+
+    resp = await client.get(
+        f"{PREFIX}/reports/patients",
+        headers=auth_headers(super_admin.id),
+        params={"search": marker},
+    )
+    assert resp.status_code == 200, resp.text
+    row = resp.json()["rows"][0]
+    assert row["emergency_phone"] == "+58414999888"
+    assert not any("address" in key.lower() for key in row)

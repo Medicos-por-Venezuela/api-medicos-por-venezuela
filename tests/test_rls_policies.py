@@ -54,6 +54,9 @@ async def _patient_with_consultation(
         "affected_zone": "Caracas",
         "cedula": "V-11222333",
         "consent": True,
+        # Obligatorios en el alta pública (teléfono de emergencia + dirección cifrada E2E).
+        "emergency_phone": "+58414555000",
+        "address_encrypted": "v1:dGVzdCBjaXBoZXJ0ZXh0",
     }
     if user_id is not None:
         body["user_id"] = str(user_id)

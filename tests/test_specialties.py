@@ -13,7 +13,7 @@ from src.models.profile import Profile
 from src.models.specialty import Specialty
 from src.services.queue_access import ESPECIALIDAD_POR_DEFINIR, SIN_ESPECIALIDAD, queue_scope
 from src.services.specialties import compute_priority
-from tests._helpers import auth_headers, make_profile
+from tests._helpers import add_doctor, auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -303,3 +303,25 @@ async def test_admin_puede_reincorporar_una_especialidad_al_selector(
     )
     assert apagada.status_code == 200, apagada.text
     assert apagada.json()["available_for_interconsultation"] is False
+
+
+async def test_catalogo_con_with_doctors_solo_colas_con_medico(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """`?with_doctors=true` (selector del registro de pacientes) aplica la MISMA condición que
+    la derivación: sin un médico habilitado mirando la cola, la especialidad no se ofrece."""
+    nueva = Specialty(name=f"Especialidad Sin Medico {uuid.uuid4().hex[:6]}", status="active")
+    db_session.add(nueva)
+    await db_session.flush()
+
+    con_medicos = (await client.get(f"{PREFIX}/specialties?with_doctors=true&limit=100")).json()
+    assert str(nueva.id) not in {s["id"] for s in con_medicos}
+
+    # Sin el filtro sigue apareciendo: el catálogo del resto del panel no cambia.
+    todas = (await client.get(f"{PREFIX}/specialties?limit=100")).json()
+    assert str(nueva.id) in {s["id"] for s in todas}
+
+    # Con un médico habilitado (ficha verificada, cédula y licencia) sí se ofrece.
+    await add_doctor(db_session, specialty=nueva.name)
+    con_medicos = (await client.get(f"{PREFIX}/specialties?with_doctors=true&limit=100")).json()
+    assert str(nueva.id) in {s["id"] for s in con_medicos}

@@ -355,6 +355,12 @@ async def get_consultation(
         derivation = await consultations_service.get_derivation(db, consultation)
         if derivation is not None:
             response.derivation = DerivationInfo.model_validate(derivation)
+        # can_view_patient_address: true si el principal está en la allowlist O es el médico
+        # asignado a esta consulta. Lo calcula el servidor, no el cliente.
+        response.can_view_patient_address = (
+            (principal.email or "").lower() in settings.address_viewer_emails
+            or consultation.assigned_doctor_id == principal.id
+        )
         return response
     return ConsultationPatientResponse.model_validate(consultation)
 

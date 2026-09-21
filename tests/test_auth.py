@@ -116,6 +116,8 @@ async def test_auth_me_has_account_record(
         json={
             "full_name": "Con cuenta",
             "phone_whatsapp": "+58412111000",
+            "emergency_phone": "+58414111000",
+            "address_encrypted": "v1:dGVzdCBjaXBoZXJ0ZXh0",
             "affected_zone": "Caracas",
             "consent": True,
             "user_id": str(paciente.id),
@@ -181,6 +183,8 @@ async def test_patient_sees_only_own_consultations(
             json={
                 "full_name": "Dueño",
                 "phone_whatsapp": "+58412111111",
+                "emergency_phone": "+58414111111",
+                "address_encrypted": "v1:dGVzdCBjaXBoZXJ0ZXh0",
                 "affected_zone": "Caracas",
                 "consent": True,
                 "user_id": str(owner.id),
@@ -201,6 +205,8 @@ async def test_patient_sees_only_own_consultations(
             json={
                 "full_name": "Ajeno",
                 "phone_whatsapp": "+58412222222",
+                "emergency_phone": "+58414222222",
+                "address_encrypted": "v1:dGVzdCBjaXBoZXJ0ZXh0",
                 "affected_zone": "Caracas",
                 "consent": True,
             },
