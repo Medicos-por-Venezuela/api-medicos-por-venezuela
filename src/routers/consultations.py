@@ -202,7 +202,15 @@ async def list_consultations(
         viewer_user_id=principal.id,
     )
     if principal.is_staff:
-        return [ConsultationDetailResponse.model_validate(c) for c in consultations]
+        items = [ConsultationDetailResponse.model_validate(c) for c in consultations]
+        # El teléfono de emergencia es PII de contacto: solo lo ve el equipo admin y el médico
+        # asignado al caso. El resto del staff recibe el detalle sin ese campo (la cola ya
+        # anonimiza al paciente; esto cierra la misma puerta en el listado).
+        if not principal.is_admin:
+            for item in items:
+                if item.patient is not None and item.assigned_doctor_id != principal.id:
+                    item.patient.emergency_phone = None
+        return items
     return [ConsultationPatientResponse.model_validate(c) for c in consultations]
 
 
@@ -361,6 +369,13 @@ async def get_consultation(
             (principal.email or "").lower() in settings.address_viewer_emails
             or consultation.assigned_doctor_id == principal.id
         )
+        # El teléfono de emergencia solo lo ve el equipo admin y el médico asignado.
+        if (
+            response.patient is not None
+            and not principal.is_admin
+            and consultation.assigned_doctor_id != principal.id
+        ):
+            response.patient.emergency_phone = None
         return response
     return ConsultationPatientResponse.model_validate(consultation)
 

@@ -1061,8 +1061,13 @@ async def test_detalle_expone_emergencia_y_flag_de_direccion_solo_al_tratante(
     ajeno = await client.get(f"{PREFIX}/consultations/{cid}", headers=auth_headers(otro.id))
     assert ajeno.status_code == 200
     assert ajeno.json()["can_view_patient_address"] is False
-    # El teléfono de emergencia es contacto (igual que el WhatsApp): el detalle staff lo trae.
-    assert ajeno.json()["patient"]["emergency_phone"] == "+58414000400"
+    # PII de contacto: el médico NO asignado no recibe el teléfono de emergencia.
+    assert ajeno.json()["patient"]["emergency_phone"] is None
+    listado = await client.get(
+        f"{PREFIX}/consultations?patient_id={patient.id}", headers=auth_headers(otro.id)
+    )
+    assert listado.status_code == 200
+    assert all(c["patient"]["emergency_phone"] is None for c in listado.json())
 
     monkeypatch.setattr(settings, "ADDRESS_VIEWER_EMAILS", "detalle-viewer@example.com")
     viewer = make_profile(role="super_admin")
@@ -1072,6 +1077,8 @@ async def test_detalle_expone_emergencia_y_flag_de_direccion_solo_al_tratante(
     allow = await client.get(f"{PREFIX}/consultations/{cid}", headers=auth_headers(viewer.id))
     assert allow.status_code == 200
     assert allow.json()["can_view_patient_address"] is True
+    # El equipo admin sí ve el teléfono de emergencia.
+    assert allow.json()["patient"]["emergency_phone"] == "+58414000400"
 
 
 async def test_el_code_no_se_trunca_al_pasar_los_10000(db_session: AsyncSession) -> None:

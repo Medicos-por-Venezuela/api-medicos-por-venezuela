@@ -63,10 +63,12 @@ obligatoriedad se exige en el esquema Pydantic del alta pública (único escrito
   dígitos, **debe ser distinto** de `phone_whatsapp` (422 si no).
 - `DoctorPatientCreate`: `emergency_phone` opcional. Sin dirección.
 - `PatientUpdate`: `emergency_phone` y `address_encrypted` opcionales.
-- `PatientResponse`: agrega `emergency_phone` (mismo tratamiento que `phone_whatsapp`, que ya es
-  visible para staff con `patients.read`). `address_encrypted` **no aparece en ninguna respuesta**
-  salvo el endpoint dedicado.
-- `ConsultationDetailPatient`: agrega `emergency_phone` (visible en el detalle del caso).
+- `PatientResponse`: agrega `emergency_phone`, pero **solo se serializa** para el equipo admin, el
+  médico dueño del paciente de consultorio y el propio paciente; el resto del staff lo recibe en
+  `null` (PII de contacto). `address_encrypted` **no aparece en ninguna respuesta** salvo el
+  endpoint dedicado.
+- `ConsultationDetailPatient`: agrega `emergency_phone`, **solo visible** para el equipo admin y
+  el médico asignado al caso; en el listado y el detalle de un médico ajeno viaja en `null`.
 - `ConsultationDetailResponse`: agrega `can_view_patient_address: bool`, calculado server-side:
   `true` si el email del principal está en la allowlist **o** `consultation.assigned_doctor_id ==
   principal.id`. (No se confía en el cliente.)

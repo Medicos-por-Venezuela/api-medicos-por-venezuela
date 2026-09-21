@@ -715,3 +715,37 @@ async def test_la_direccion_no_aparece_en_las_respuestas_de_paciente(client: Asy
     listado = await client.get(f"{PREFIX}/patients", params={"limit": 100})
     assert listado.status_code == 200
     assert all("address_encrypted" not in p for p in listado.json())
+
+
+async def test_telefono_de_emergencia_solo_admin_o_dueno(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """PII de contacto: el admin y el médico dueño del paciente de consultorio la ven; un médico
+    ajeno con `patients.read` la recibe en null. El tratante la recibe por el detalle de su
+    consulta (ver tests/test_consultations.py)."""
+    pid = await _paciente_con_direccion(client)  # el client por defecto es admin
+
+    admin = await client.get(f"{PREFIX}/patients/{pid}")
+    assert admin.status_code == 200
+    assert admin.json()["emergency_phone"] == "+58414000300"
+
+    ajeno = await add_doctor(db_session)
+    sin_permiso = await client.get(f"{PREFIX}/patients/{pid}", headers=auth_headers(ajeno.id))
+    assert sin_permiso.status_code == 200
+    assert sin_permiso.json()["emergency_phone"] is None
+    listado = await client.get(f"{PREFIX}/patients?limit=100", headers=auth_headers(ajeno.id))
+    assert listado.status_code == 200
+    assert all(p["emergency_phone"] is None for p in listado.json())
+
+    dueno = await add_doctor(db_session)
+    creado = await client.post(
+        MIS_PACIENTES,
+        json={**_caso(), "emergency_phone": "+58414999888"},
+        headers=auth_headers(dueno.id),
+    )
+    assert creado.status_code == 201, creado.text
+    suyo = await client.get(
+        f"{MIS_PACIENTES}/{creado.json()['id']}", headers=auth_headers(dueno.id)
+    )
+    assert suyo.status_code == 200
+    assert suyo.json()["emergency_phone"] == "+58414999888"
