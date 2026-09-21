@@ -268,6 +268,8 @@ class ConsultationDetailPatient(BaseModel):
     age_range: str | None = None
     needs_tags: list[str] | None = None
     description: str | None = None
+    # Teléfono de emergencia visible en el detalle del caso.
+    emergency_phone: str | None = None
 
 
 class ConsultationResponse(ConsultationBase):
@@ -321,6 +323,9 @@ class ConsultationDetailResponse(ConsultationResponse):
     patient: ConsultationDetailPatient | None = None
     # Solo si el caso llegó derivado: quién, desde dónde y por qué (lo pone el router).
     derivation: DerivationInfo | None = None
+    # True si el principal (staff) está en la allowlist de dirección o es el médico tratante
+    # asignado a esta consulta. Lo calcula el router, no el cliente.
+    can_view_patient_address: bool = False
 
 
 class ConsultationCreatedResponse(ConsultationResponse):

@@ -42,17 +42,26 @@ async def list_specialties(
             "(excluye Medicina general). Es el selector del médico tratante."
         ),
     ),
+    with_doctors: bool | None = Query(
+        None,
+        description=(
+            "true = solo las que tienen al menos un médico habilitado mirando esa cola "
+            "(misma condición que la derivación). Es el selector del registro de pacientes."
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
 ) -> list[SpecialtyResponse]:
     """Lista pública de especialidades activas; no requiere Bearer token.
 
-    Con `?for_interconsultation=true` devuelve solo las pedibles en una interconsulta."""
+    Con `?for_interconsultation=true` devuelve solo las pedibles en una interconsulta.
+    Con `?with_doctors=true` devuelve solo las que tienen al menos un médico habilitado."""
     return await specialties_service.list_specialties(
         db,
         skip=skip,
         limit=limit,
         status="active",
         for_interconsultation=for_interconsultation,
+        with_doctors=with_doctors,
     )
 
 

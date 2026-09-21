@@ -125,3 +125,22 @@ async def set_specialties(session: AsyncSession, user_id: uuid.UUID, names: list
     for specialty_id in ids:
         session.add(DoctorSpecialty(user_id=user_id, specialty_id=specialty_id))
     await session.flush()
+
+
+def valid_patient_payload(**overrides) -> dict:
+    """Payload válido para alta pública de paciente (incluye emergency_phone y address_encrypted).
+
+    `address_encrypted` usa un ciphertext v1 válido (base64 dummy). Los tests que necesiten
+    validaciones específicas (teléfono igual, formato inválido, etc.) deben sobrescribir
+    los campos correspondientes.
+    """
+    base = {
+        "full_name": "Paciente Test",
+        "phone_whatsapp": "+58412000000",
+        "affected_zone": "Caracas",
+        "emergency_phone": "+58414000000",  # Distinto del WhatsApp
+        "address_encrypted": "v1:dGVzdCBjaXBoZXJ0ZXh0",  # "test ciphertext" en base64
+        "consent": True,
+    }
+    base.update(overrides)
+    return base

@@ -6,28 +6,28 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import settings
 from src.models.consultation import Consultation
 from src.models.patient import Patient
 from src.models.profile import Profile
 from src.models.specialty import Specialty
-from tests._helpers import GENERAL, add_doctor, any_specialty_id, auth_headers, make_profile
+from tests._helpers import (
+    GENERAL,
+    add_doctor,
+    any_specialty_id,
+    auth_headers,
+    make_profile,
+    valid_patient_payload,
+)
 
 PREFIX = "/api/v1"
 
 
-async def _create_patient(client: AsyncClient) -> str:
-    resp = await client.post(
-        f"{PREFIX}/patients",
-        json={
-            "full_name": "Paciente Consulta",
-            "phone_whatsapp": "+58412555000",
-            "affected_zone": "Caracas",
-            "consent": True,
-        },
-    )
+async def _create_patient(client: AsyncClient, full_name: str = "Paciente Test") -> str:
+    resp = await client.post(f"{PREFIX}/patients", json=valid_patient_payload(full_name=full_name))
     assert resp.status_code == 201, resp.text
     return resp.json()["id"]
 
@@ -86,14 +86,13 @@ async def test_admin_pacientes_list_enrichment_and_admin_fields(
     `consultations` directo de Supabase."""
     created = await client.post(
         f"{PREFIX}/patients",
-        json={
-            "full_name": "Ana Admin Caso",
-            "phone_whatsapp": "+58412999111",
-            "affected_zone": "Zulia",
-            "cedula": "V-12345678",
-            "email": "ana.caso@example.com",
-            "consent": True,
-        },
+        json=valid_patient_payload(
+            full_name="Ana Admin Caso",
+            phone_whatsapp="+58412999111",
+            affected_zone="Zulia",
+            cedula="V-12345678",
+            email="ana.caso@example.com",
+        ),
     )
     patient_id = created.json()["id"]
     cid = (
@@ -317,7 +316,7 @@ async def test_create_consultation_specialty_id_inexistente_falla_400(
 async def _create_waiting_consultation(client: AsyncClient) -> str:
     """Crea una consulta en espera. Sin envejecerla: el panel ya no tiene gate de 20 min, así
     que una consulta recién creada debe aparecer en la cola de inmediato (tiempo real)."""
-    patient_id = await _create_patient(client)
+    patient_id = await _create_patient(client, full_name="Paciente Consulta")
     return (
         await client.post(
             f"{PREFIX}/consultations",
@@ -454,6 +453,8 @@ async def _waiting_con_correo_y_sala(
         email="paciente@example.com",
         affected_zone="Caracas",
         consent=True,
+        emergency_phone="+584240000099",  # Distinto del WhatsApp
+        address_encrypted="v1:dGVzdCBjaXBoZXJ0ZXh0",  # "test ciphertext" en base64
     )
     db_session.add(patient)
     await db_session.flush()
@@ -849,7 +850,7 @@ async def test_consultation_entered_call_at_round_trips(
 async def test_consultation_list_includes_patient_and_doctor_names(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    patient_id = await _create_patient(client)
+    patient_id = await _create_patient(client, full_name="Paciente Consulta")
     doctor_profile = await add_doctor(db_session, specialty=GENERAL)
 
     cid = (
@@ -877,7 +878,7 @@ async def test_consultation_list_includes_patient_and_doctor_names(
 
 
 async def test_consultation_list_names_are_null_when_unassigned(client: AsyncClient) -> None:
-    patient_id = await _create_patient(client)
+    patient_id = await _create_patient(client, full_name="Paciente Consulta")
     cid = (
         await client.post(
             f"{PREFIX}/consultations",
@@ -1018,3 +1019,99 @@ async def test_el_panel_dice_si_el_paciente_entro_a_la_videollamada(
 
     despues = (await client.get(f"{PREFIX}/consultations/panel", headers=suyo)).json()
     assert fila(despues)["entered_call_at"] is not None
+
+
+async def test_detalle_expone_emergencia_y_flag_de_direccion_solo_al_tratante(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch
+) -> None:
+    """El detalle trae el teléfono de emergencia y `can_view_patient_address` calculado en el
+    servidor: True solo para el médico asignado o un email de la allowlist. La ciphertext no
+    viaja en el detalle: sale por GET /patients/{id}/address."""
+    patient = Patient(
+        full_name="Paciente Dirección Detalle",
+        phone_whatsapp="+58412000400",
+        affected_zone="Caracas",
+        consent=True,
+        emergency_phone="+58414000400",
+        address_encrypted="v1:ZGV0YWxsZS1zZWNyZXRv",
+    )
+    db_session.add(patient)
+    await db_session.flush()
+
+    cid = (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": str(patient.id), "specialty_id": await any_specialty_id(client)},
+        )
+    ).json()["id"]
+    tratante = await add_doctor(db_session, specialty=GENERAL)
+    otro = await add_doctor(db_session, specialty=GENERAL)
+    consultation = await db_session.get(Consultation, uuid.UUID(cid))
+    consultation.assigned_doctor_id = tratante.id
+    await db_session.flush()
+
+    suyo = await client.get(f"{PREFIX}/consultations/{cid}", headers=auth_headers(tratante.id))
+    assert suyo.status_code == 200, suyo.text
+    body = suyo.json()
+    assert body["patient"]["emergency_phone"] == "+58414000400"
+    assert body["can_view_patient_address"] is True
+    assert "address_encrypted" not in body
+    assert "address_encrypted" not in body["patient"]
+
+    # Un médico que no atiende el caso no puede verlo: antes recibía al paciente completo
+    # (nombre, cédula, contactos). El filtro del cliente no es la frontera.
+    ajeno = await client.get(f"{PREFIX}/consultations/{cid}", headers=auth_headers(otro.id))
+    assert ajeno.status_code == 403
+    listado = await client.get(
+        f"{PREFIX}/consultations?patient_id={patient.id}", headers=auth_headers(otro.id)
+    )
+    assert listado.status_code == 403
+
+    monkeypatch.setattr(settings, "ADDRESS_VIEWER_EMAILS", "detalle-viewer@example.com")
+    viewer = make_profile(role="super_admin")
+    viewer.email = "detalle-viewer@example.com"
+    db_session.add(viewer)
+    await db_session.flush()
+    allow = await client.get(f"{PREFIX}/consultations/{cid}", headers=auth_headers(viewer.id))
+    assert allow.status_code == 200
+    assert allow.json()["can_view_patient_address"] is True
+    # El equipo admin sí ve el teléfono de emergencia.
+    assert allow.json()["patient"]["emergency_phone"] == "+58414000400"
+
+
+async def test_el_code_no_se_trunca_al_pasar_los_10000(db_session: AsyncSession) -> None:
+    """Regresión: el trigger usaba `lpad(nextval, 4, '0')`, que TRUNCA a 4 dígitos; a partir
+    de 10.000 dos consultas seguidas generaban el mismo `code` y violaban la unique."""
+    patient = Patient(
+        full_name="Paciente Código",
+        phone_whatsapp="+58412000500",
+        affected_zone="Caracas",
+        consent=True,
+    )
+    db_session.add(patient)
+    await db_session.flush()
+
+    max_seq = (
+        await db_session.scalar(
+            text(
+                "select coalesce(max(split_part(code, '-', 3)::bigint), 0) "
+                "from public.consultations"
+            )
+        )
+    ) or 0
+    # setval no es transaccional: la secuencia queda adelantada, lo cual es inocuo.
+    await db_session.execute(
+        text("select setval('consultation_seq', :n, false)"), {"n": max_seq + 1}
+    )
+
+    first = Consultation(patient_id=patient.id, status="waiting")
+    second = Consultation(patient_id=patient.id, status="waiting")
+    db_session.add_all([first, second])
+    await db_session.flush()
+    # `code` lo pone el trigger: el ORM no lo tiene hasta releer la fila.
+    await db_session.refresh(first)
+    await db_session.refresh(second)
+
+    assert first.code != second.code
+    assert first.code.split("-")[-1] == str(max_seq + 1)
+    assert second.code.split("-")[-1] == str(max_seq + 2)

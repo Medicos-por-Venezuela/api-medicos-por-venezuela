@@ -537,6 +537,67 @@ async def claim_consultation(
     return consultation
 
 
+async def start_scheduled_consultation(
+    session: AsyncSession,
+    consultation_id: uuid.UUID,
+    *,
+    actor_user_id: uuid.UUID | None,
+    actor_is_admin: bool = False,
+) -> Consultation:
+    """Abre una cita agendada: `scheduled` → `in_progress` y le crea la sala de video si falta.
+
+    Es el equivalente al claim de la cola, pero para la Agenda: la hija agendada ya existe y ya
+    tiene médico (`schedule_follow_up`/`refer` la asignan), así que no hay carrera por tomarla —
+    la hay contra el doble clic, y la resuelve el UPDATE condicional sobre `status == 'scheduled'`:
+    la segunda petición afecta 0 filas y recibe 409 en vez de duplicar el evento.
+
+    Sin este paso `ensure_video_room` responde 409 ("La consulta ya no está abierta."): `scheduled`
+    no está entre sus estados. El correo al paciente lo encola el router con la sala ya creada."""
+    consultation = await get_consultation(session, consultation_id)
+    _ensure_can_manage(consultation, actor_user_id, actor_is_admin)
+    now = datetime.now(UTC)
+    values: dict = {
+        "status": "in_progress",
+        "opened_at": func.coalesce(Consultation.opened_at, now),
+        "video_room_url": func.coalesce(Consultation.video_room_url, new_room_url()),
+    }
+    if actor_user_id is not None:
+        # Una cita sin médico (dato legacy/manual) queda asignada a quien la atiende: sin
+        # `assigned_doctor_id` el paciente no ve la sala (`phase_of` exige médico Y sala).
+        values["assigned_doctor_id"] = func.coalesce(
+            Consultation.assigned_doctor_id, actor_user_id
+        )
+    result = await session.execute(
+        update(Consultation)
+        .where(
+            Consultation.id == consultation_id,
+            Consultation.status == "scheduled",
+        )
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount == 0:
+        raise ConflictError("Esta cita ya no está agendada.")
+    session.add(
+        ConsultationEvent(
+            consultation_id=consultation_id,
+            event_type="opened",
+            created_by=actor_user_id,
+            note="Cita agendada iniciada",
+        )
+    )
+    await audit.log_action(
+        session,
+        action="consultation.started",
+        actor_user_id=actor_user_id,
+        resource="consultations",
+        resource_id=consultation_id,
+    )
+    await session.commit()
+    await session.refresh(consultation)
+    return consultation
+
+
 def _with_specialty_names(stmt):
     """Precarga el paciente y los nombres de especialidad (actual y de origen) de una lista.
 

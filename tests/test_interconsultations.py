@@ -19,6 +19,8 @@ async def _consultation_with_patient(client: AsyncClient, *, age_range: str = "3
         json={
             "full_name": "Paciente Secreto",
             "phone_whatsapp": "+58412555111",
+            "emergency_phone": "+58414555111",
+            "address_encrypted": "v1:dGVzdCBjaXBoZXJ0ZXh0",
             "affected_zone": "Caracas",
             "age_range": age_range,
             "consent": True,

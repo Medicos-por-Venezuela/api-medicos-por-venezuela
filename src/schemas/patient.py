@@ -1,5 +1,6 @@
 """Esquemas Pydantic para patients (Create / Update / Response)."""
 
+import re
 import uuid
 from datetime import datetime
 from typing import Annotated
@@ -32,10 +33,22 @@ class PatientCreate(PatientBase):
     # El insert exige consentimiento (ver política RLS patients_insert_public).
     consent: bool = True
 
+    # Teléfono de emergencia obligatorio en el alta pública.
+    emergency_phone: str = Field(..., min_length=5, max_length=30)
+    # Dirección cifrada E2E (v1:base64 sealed box). Obligatoria en el alta pública.
+    address_encrypted: str = Field(..., pattern=r"^v1:[A-Za-z0-9+/=]+$", max_length=4000)
+
     @model_validator(mode="after")
-    def _parentesco_requiere_parent_id(self) -> "PatientCreate":
+    def _validaciones_alta_publica(self) -> "PatientCreate":
+        # parent_id y parentesco van juntos (heredado de PatientBase).
         if (self.parent_id is None) != (self.parentesco is None):
             raise ValueError("parent_id y parentesco deben venir juntos, o ninguno de los dos.")
+
+        # Normaliza ambos teléfonos a solo dígitos y exige que sean distintos.
+        whatsapp_digits = re.sub(r"\D", "", self.phone_whatsapp)
+        emergency_digits = re.sub(r"\D", "", self.emergency_phone)
+        if whatsapp_digits == emergency_digits:
+            raise ValueError("El teléfono de emergencia debe ser distinto al de WhatsApp.")
         return self
 
 
@@ -53,6 +66,20 @@ class PatientUpdate(BaseModel):
     allergies: str | None = None
     parent_id: uuid.UUID | None = None
     parentesco: str | None = None
+    # Opcionales en la actualización (misma validación que el alta si se envían).
+    emergency_phone: str | None = Field(default=None, min_length=5, max_length=30)
+    address_encrypted: str | None = Field(
+        default=None, pattern=r"^v1:[A-Za-z0-9+/=]+$", max_length=4000
+    )
+
+    @model_validator(mode="after")
+    def _validar_emergencia_distinta_whatsapp(self) -> "PatientUpdate":
+        if self.emergency_phone is not None and self.phone_whatsapp is not None:
+            whatsapp_digits = re.sub(r"\D", "", self.phone_whatsapp)
+            emergency_digits = re.sub(r"\D", "", self.emergency_phone)
+            if whatsapp_digits == emergency_digits:
+                raise ValueError("El teléfono de emergencia debe ser distinto al de WhatsApp.")
+        return self
 
 
 class DoctorPatientCreate(BaseModel):
@@ -74,6 +101,7 @@ class DoctorPatientCreate(BaseModel):
     # Opcionales acá, a diferencia del alta pública. Si el médico los tiene, se guardan.
     phone_whatsapp: str | None = Field(default=None, min_length=5, max_length=30)
     affected_zone: str | None = Field(default=None, min_length=2, max_length=100)
+    emergency_phone: str | None = Field(default=None, min_length=5, max_length=30)
     # Sin default `true` (a diferencia de PatientCreate): acá el médico ATESTIGUA que su paciente
     # autorizó compartir el caso. Una atestación que el cliente puede omitir no es una atestación.
     consent: bool = False
@@ -91,6 +119,7 @@ class DoctorPatientUpdate(BaseModel):
     description: str | None = Field(default=None, max_length=2000)
     phone_whatsapp: str | None = Field(default=None, min_length=5, max_length=30)
     affected_zone: str | None = Field(default=None, min_length=2, max_length=100)
+    emergency_phone: str | None = Field(default=None, min_length=5, max_length=30)
 
 
 class PatientResponse(PatientBase):
@@ -111,8 +140,22 @@ class PatientResponse(PatientBase):
     phone_whatsapp: str | None = None
     affected_zone: str | None = None
 
+    # Teléfono de emergencia (mismo tratamiento que phone_whatsapp: visible para staff con
+    # patients.read). address_encrypted NO se agrega aquí: sale solo en GET /patients/{id}/address.
+    emergency_phone: str | None = None
+
     id: uuid.UUID
     consent: bool
     consent_at: datetime | None = None
     created_at: datetime
     created_by_doctor_id: uuid.UUID | None = None
+
+
+class PatientAddressResponse(BaseModel):
+    """Respuesta del endpoint dedicado GET /patients/{id}/address.
+
+    Solo devuelve la ciphertext E2E (o None si el paciente es anterior a esta migración).
+    El servidor NUNCA descifra, loguea ni valida el contenido.
+    """
+
+    address_encrypted: str | None = None

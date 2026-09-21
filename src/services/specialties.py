@@ -50,15 +50,24 @@ async def list_specialties(
     limit: int = 100,
     status: str | None = None,
     for_interconsultation: bool | None = None,
+    with_doctors: bool | None = None,
 ) -> list[Specialty]:
     """Catálogo de especialidades. `for_interconsultation=True` deja solo las que se pueden
     pedir en una interconsulta asíncrona (excluye Medicina general): es el selector del médico
-    tratante. El filtro sale de la columna, nunca de comparar nombres."""
+    tratante. `with_doctors=True` deja solo las que tienen al menos un médico habilitado
+    mirando esa cola: es la MISMA condición que usa la derivación (`derivation_targets`), para
+    que el registro de pacientes no ofrezca una cola que nadie atiende. Los filtros salen de
+    columnas, nunca de comparar nombres."""
     stmt = select(Specialty).where(Specialty.deleted_at.is_(None))
     if status:
         stmt = stmt.where(Specialty.status == status)
     if for_interconsultation is not None:
         stmt = stmt.where(Specialty.available_for_interconsultation.is_(for_interconsultation))
+    if with_doctors:
+        # Import local: `services/doctors.py` importa este módulo a nivel de módulo (evita ciclo).
+        from src.services.doctors import practicing_doctor_exists
+
+        stmt = stmt.where(practicing_doctor_exists(Specialty.id))
     stmt = (
         stmt.order_by(Specialty.sort_order.asc(), Specialty.created_at.desc())
         .offset(skip)
