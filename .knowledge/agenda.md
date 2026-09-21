@@ -18,6 +18,17 @@ Lo ven: el médico en `GET /consultations/agenda` (sección "Mi agenda" de `/pan
 paciente en su portal (`/mi-caso`, por su propio scoping). Cadena/historial:
 `GET /consultations/{id}/chain`.
 
+## Iniciar una cita agendada
+
+La hija nace `scheduled` y no se atiende sola: el médico la abre al entrar a la videollamada.
+`POST /consultations/{id}/start` (permiso `queue.take`) la pasa a `in_progress`, le crea la sala
+Jitsi (idempotente, `coalesce`) y registra el evento `opened`. Es el equivalente al claim de la
+cola: sin este paso `POST /{id}/video-room` responde 409 ("La consulta ya no está abierta.") y el
+paciente —que solo ve el botón cuando la fase de sala es `ready`— no se entera de nada. Se puede
+iniciar en cualquier momento (aunque la cita sea para más tarde); el doble clic da 409 y no
+duplica sala ni evento. El frontend lo dispara el detalle del médico al confirmar "Unirse a
+videoconsulta"; el endpoint encola el correo al paciente (ver abajo).
+
 ## Notificaciones (Fase 3)
 
 `src/services/notifications.py` sobre `services/mail.py` (Mailtrap, best-effort: un fallo de correo
@@ -25,6 +36,9 @@ NUNCA rompe el agendado). Solo se escribe al paciente si `patients.email` no es 
 
 - **Al agendar**: los endpoints `schedule-follow-up` y `refer` encolan el correo "cita agendada"
   con `BackgroundTasks` de FastAPI (no bloquea la respuesta).
+- **Al iniciar la cita**: `POST /consultations/{id}/start` encola el mismo correo "tu médico ya
+  está en la sala" del claim (`video_ready_mail_args` + `send_video_ready_email`), con enlace
+  fresco a `/entrar-videoconsulta`. Solo si el paciente tiene email.
 - **~30 min antes**: `POST /consultations/agenda/send-due-reminders?window_minutes=30`
   (permiso `queue.manage`). Busca las citas `scheduled` con `scheduled_at` en [ahora, ahora+ventana]
   y `reminder_sent_at` nulo, envía y setea `reminder_sent_at` (idempotente). **1 solo intento**: si

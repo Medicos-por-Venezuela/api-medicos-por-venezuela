@@ -1,15 +1,18 @@
 """Tests del módulo Agenda: agendar seguimiento (padre→hija), firma al cerrar, agenda, cadena."""
 
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, patch
 
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.consultation import Consultation
 from src.models.patient import Patient
+from src.models.profile import Profile
 from src.services import notifications
-from tests._helpers import GENERAL, add_doctor, any_specialty_id, auth_headers
+from tests._helpers import GENERAL, add_doctor, any_specialty_id, auth_headers, make_profile
 
 PREFIX = "/api/v1"
 
@@ -291,3 +294,196 @@ async def test_detail_has_patient_and_events_have_author(
     mine = [e for e in ev.json() if e["created_by"] == str(doc.id)]
     assert mine and mine[0]["author_name"] == doc.full_name
     assert mine[0]["author_role"] == "doctor"
+
+
+# --- Iniciar una cita agendada (Agenda): scheduled → in_progress + sala ---
+#
+# La hija agendada YA EXISTE (la crean schedule-follow-up/refer); lo que faltaba era abrirla. Sin
+# este paso `ensure_video_room` responde 409 ("La consulta ya no está abierta.") y el paciente
+# —que solo ve el botón de entrar cuando la fase es `ready`— no se entera de nada.
+
+
+@contextmanager
+def _capturar_aviso_de_video():
+    """Dobla el envío del aviso "tu médico ya está en la sala" (lo encola el router). Se parchea
+    el nombre que el BackgroundTask referencia, igual que en test_consultations."""
+    enviados: list[dict] = []
+
+    async def _fake(**kwargs) -> bool:
+        enviados.append(kwargs)
+        return True
+
+    with patch("src.services.notifications.send_video_ready_email", AsyncMock(side_effect=_fake)):
+        yield enviados
+
+
+async def _scheduled_child_con_correo(
+    client: AsyncClient, db_session: AsyncSession, email: str = "agenda@example.com"
+) -> tuple[dict, Profile]:
+    """Médico + paciente CON correo + consulta tomada y agendada: (cita hija, médico)."""
+    doc = await add_doctor(db_session, specialty=GENERAL)
+    pid = (
+        await client.post(
+            f"{PREFIX}/patients",
+            json={
+                "full_name": "Pac Con Correo",
+                "phone_whatsapp": "+58412555333",
+                "emergency_phone": "+58414555333",
+                "email": email,
+                "address_encrypted": "v1:dGVzdCBjaXBoZXJ0ZXh0",
+                "affected_zone": "Caracas",
+                "consent": True,
+            },
+        )
+    ).json()["id"]
+    cid = (
+        await client.post(
+            f"{PREFIX}/consultations",
+            json={
+                "patient_id": pid,
+                "chief_complaint": "Control",
+                "specialty_id": await any_specialty_id(client),
+            },
+        )
+    ).json()["id"]
+    await client.post(f"{PREFIX}/consultations/{cid}/claim", json={}, headers=auth_headers(doc.id))
+    return await _schedule_in(client, doc, cid, timedelta(days=1)), doc
+
+
+async def test_start_scheduled_opens_it_and_creates_the_room(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = await add_doctor(db_session, specialty=GENERAL)
+    parent_cid = await _open_consultation(client, doc.id)
+    child = await _schedule_in(client, doc, parent_cid, timedelta(days=1))
+
+    resp = await client.post(
+        f"{PREFIX}/consultations/{child['id']}/start", headers=auth_headers(doc.id)
+    )
+    assert resp.status_code == 200, resp.text
+    opened = resp.json()
+    assert opened["status"] == "in_progress"
+    assert opened["video_room_url"]  # la sala se crea en el mismo paso
+    assert opened["assigned_doctor_id"] == str(doc.id)
+
+    events = (
+        await client.get(
+            f"{PREFIX}/consultations/{child['id']}/events", headers=auth_headers(doc.id)
+        )
+    ).json()
+    assert any(e["event_type"] == "opened" for e in events)
+
+
+async def test_start_scheduled_abre_la_sala_para_el_paciente(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = await add_doctor(db_session, specialty=GENERAL)
+    parent_cid = await _open_consultation(client, doc.id)
+    child = await _schedule_in(client, doc, parent_cid, timedelta(days=1))
+
+    # Antes de iniciar: fase agendada, sin enlace (no hay médico dentro de la sala todavía).
+    before = (
+        await client.get(
+            f"{PREFIX}/consultations/{child['id']}/waiting-room", headers=auth_headers(doc.id)
+        )
+    ).json()
+    assert before["phase"] == "scheduled"
+    assert before["video_room_url"] is None
+
+    await client.post(f"{PREFIX}/consultations/{child['id']}/start", headers=auth_headers(doc.id))
+
+    after = (
+        await client.get(
+            f"{PREFIX}/consultations/{child['id']}/waiting-room", headers=auth_headers(doc.id)
+        )
+    ).json()
+    assert after["phase"] == "ready"
+    assert after["video_room_url"]
+    assert after["doctor_name"] == doc.full_name
+
+
+async def test_start_scheduled_avisa_al_paciente_por_correo(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    child, doc = await _scheduled_child_con_correo(client, db_session)
+
+    with _capturar_aviso_de_video() as enviados:
+        resp = await client.post(
+            f"{PREFIX}/consultations/{child['id']}/start", headers=auth_headers(doc.id)
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert len(enviados) == 1
+    aviso = enviados[0]
+    assert aviso["to_email"] == "agenda@example.com"
+    # El enlace pasa por el sitio y registra la entrada, igual que en el claim de la cola.
+    assert "/entrar-videoconsulta?" in aviso["join_url"]
+    assert str(child["id"]) in aviso["join_url"]
+
+
+async def test_start_scheduled_sin_correo_del_paciente_no_intenta_avisar(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """`patients.email` es opcional: no tener a dónde escribir no es un fallo."""
+    doc = await add_doctor(db_session, specialty=GENERAL)
+    parent_cid = await _open_consultation(client, doc.id)
+    child = await _schedule_in(client, doc, parent_cid, timedelta(days=1))
+
+    with _capturar_aviso_de_video() as enviados:
+        resp = await client.post(
+            f"{PREFIX}/consultations/{child['id']}/start", headers=auth_headers(doc.id)
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert enviados == []
+
+
+async def test_start_scheduled_rechaza_a_otro_medico(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = await add_doctor(db_session, specialty=GENERAL)
+    other = await add_doctor(db_session, specialty=GENERAL)
+    parent_cid = await _open_consultation(client, doc.id)
+    child = await _schedule_in(client, doc, parent_cid, timedelta(days=1))
+
+    resp = await client.post(
+        f"{PREFIX}/consultations/{child['id']}/start", headers=auth_headers(other.id)
+    )
+    assert resp.status_code == 409, resp.text
+
+
+async def test_start_scheduled_doble_clic_es_409_y_no_duplica(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = await add_doctor(db_session, specialty=GENERAL)
+    parent_cid = await _open_consultation(client, doc.id)
+    child = await _schedule_in(client, doc, parent_cid, timedelta(days=1))
+
+    first = await client.post(
+        f"{PREFIX}/consultations/{child['id']}/start", headers=auth_headers(doc.id)
+    )
+    assert first.status_code == 200, first.text
+    second = await client.post(
+        f"{PREFIX}/consultations/{child['id']}/start", headers=auth_headers(doc.id)
+    )
+    assert second.status_code == 409, second.text
+    # La sala del primer clic es la que queda (el segundo no la pisó).
+    assert (
+        await client.get(f"{PREFIX}/consultations/{child['id']}", headers=auth_headers(doc.id))
+    ).json()["video_room_url"] == first.json()["video_room_url"]
+
+
+async def test_start_scheduled_requiere_permiso_queue_take(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = await add_doctor(db_session, specialty=GENERAL)
+    parent_cid = await _open_consultation(client, doc.id)
+    child = await _schedule_in(client, doc, parent_cid, timedelta(days=1))
+    paciente = make_profile(role="patient")
+    db_session.add(paciente)
+    await db_session.flush()
+
+    resp = await client.post(
+        f"{PREFIX}/consultations/{child['id']}/start", headers=auth_headers(paciente.id)
+    )
+    assert resp.status_code == 403, resp.text

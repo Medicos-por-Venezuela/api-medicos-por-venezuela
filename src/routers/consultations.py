@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.core import consultation_token
 from src.core.config import settings
+from src.core.errors import ForbiddenError
 from src.core.ratelimit import limiter
 from src.core.security import (
     Principal,
@@ -178,6 +179,7 @@ async def authorize_consultation_access(
     "",
     response_model=list[ConsultationDetailResponse] | list[ConsultationPatientResponse],
     summary="Listar consultas",
+    responses={403: {"description": "El listado es del equipo de administración."}},
 )
 async def list_consultations(
     skip: int = Query(0, ge=0),
@@ -191,7 +193,12 @@ async def list_consultations(
 ) -> list[ConsultationDetailResponse] | list[ConsultationPatientResponse]:
     """Staff ve todas las consultas con vista completa + el paciente anidado (para que el panel
     admin/pacientes no lea `patients` directo). Un paciente autenticado solo ve las suyas, sin
-    notas clínicas ni internas ni datos anidados de otros."""
+    notas clínicas ni internas ni datos anidados de otros.
+
+    El listado con identidad es del **equipo de administración** (es el panel admin). Un médico
+    ve sus casos por `/consultations/panel` (cola anonimizada) y el detalle de los que atiende."""
+    if principal.is_staff and not principal.is_admin:
+        raise ForbiddenError("El listado de consultas es del equipo de administración.")
     consultations = await consultations_service.list_consultations(
         db,
         skip=skip,
@@ -202,15 +209,9 @@ async def list_consultations(
         viewer_user_id=principal.id,
     )
     if principal.is_staff:
-        items = [ConsultationDetailResponse.model_validate(c) for c in consultations]
-        # El teléfono de emergencia es PII de contacto: solo lo ve el equipo admin y el médico
-        # asignado al caso. El resto del staff recibe el detalle sin ese campo (la cola ya
-        # anonimiza al paciente; esto cierra la misma puerta en el listado).
-        if not principal.is_admin:
-            for item in items:
-                if item.patient is not None and item.assigned_doctor_id != principal.id:
-                    item.patient.emergency_phone = None
-        return items
+        # Solo el equipo admin llega acá (los médicos reciben 403 arriba): todos los campos del
+        # paciente, incluido el teléfono de emergencia, son para administración.
+        return [ConsultationDetailResponse.model_validate(c) for c in consultations]
     return [ConsultationPatientResponse.model_validate(c) for c in consultations]
 
 
@@ -343,7 +344,10 @@ async def send_due_reminders(
     "/{consultation_id}",
     response_model=ConsultationDetailResponse | ConsultationPatientResponse,
     summary="Obtener consulta",
-    responses=_NOT_FOUND,
+    responses={
+        **_NOT_FOUND,
+        403: {"description": "Solo el médico que atiende el caso o el equipo admin."},
+    },
 )
 async def get_consultation(
     consultation_id: uuid.UUID,
@@ -352,11 +356,16 @@ async def get_consultation(
 ) -> ConsultationDetailResponse | ConsultationPatientResponse:
     """Staff recibe la vista completa (incluye notas clínicas/internas) + el paciente anidado, para
     que el panel no lea `patients` directo. Un paciente autenticado solo recibe su propia consulta
-    sin las notas del médico."""
+    sin las notas del médico.
+
+    La identidad del paciente (nombre, cédula, contacto) solo la ven el médico asignado al caso y
+    el equipo admin: el resto del staff recibe 403. El filtro del cliente no es la frontera."""
     consultation = await consultations_service.get_consultation_detail(
         db, consultation_id, viewer_is_staff=principal.is_staff, viewer_user_id=principal.id
     )
     if principal.is_staff:
+        if not principal.is_admin and consultation.assigned_doctor_id != principal.id:
+            raise ForbiddenError("Solo el médico que atiende el caso puede verlo.")
         # Poblar la relación `patient` explícitamente (evita el lazy-load async) para el detalle.
         consultation.patient = await db.get(Patient, consultation.patient_id)
         response = ConsultationDetailResponse.model_validate(consultation)
@@ -369,13 +378,6 @@ async def get_consultation(
             (principal.email or "").lower() in settings.address_viewer_emails
             or consultation.assigned_doctor_id == principal.id
         )
-        # El teléfono de emergencia solo lo ve el equipo admin y el médico asignado.
-        if (
-            response.patient is not None
-            and not principal.is_admin
-            and consultation.assigned_doctor_id != principal.id
-        ):
-            response.patient.emergency_phone = None
         return response
     return ConsultationPatientResponse.model_validate(consultation)
 
@@ -571,6 +573,36 @@ async def claim_consultation(
         doctor_user_id=principal.id,
         doctor_specialty_id=principal.specialty_id,
         is_admin=principal.is_admin,
+    )
+    video_args = await notifications.video_ready_mail_args(db, consultation)
+    if video_args:
+        background_tasks.add_task(notifications.send_video_ready_email, **video_args)
+    return ConsultationResponse.model_validate(consultation)
+
+
+@router.post(
+    "/{consultation_id}/start",
+    response_model=ConsultationResponse,
+    summary="Iniciar una cita agendada (scheduled → in_progress + sala)",
+    responses={
+        **_NOT_FOUND,
+        409: {"description": "La cita ya no está agendada o es de otro médico."},
+    },
+)
+async def start_scheduled_consultation(
+    consultation_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_permission("queue.take")),
+) -> ConsultationResponse:
+    """El médico inicia su cita agendada (Agenda): la pasa a `in_progress`, le crea la sala de
+    video si falta y avisa al paciente por correo ("tu médico ya está en la sala"), igual que el
+    claim de la cola.
+
+    Se puede iniciar en cualquier momento, aunque la cita sea para más tarde. El doble clic no
+    duplica nada: el UPDATE es condicional sobre `status == 'scheduled'` y el segundo da 409."""
+    consultation = await consultations_service.start_scheduled_consultation(
+        db, consultation_id, actor_user_id=principal.id, actor_is_admin=principal.is_admin
     )
     video_args = await notifications.video_ready_mail_args(db, consultation)
     if video_args:

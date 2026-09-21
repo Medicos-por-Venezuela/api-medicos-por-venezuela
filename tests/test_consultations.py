@@ -1058,16 +1058,14 @@ async def test_detalle_expone_emergencia_y_flag_de_direccion_solo_al_tratante(
     assert "address_encrypted" not in body
     assert "address_encrypted" not in body["patient"]
 
+    # Un médico que no atiende el caso no puede verlo: antes recibía al paciente completo
+    # (nombre, cédula, contactos). El filtro del cliente no es la frontera.
     ajeno = await client.get(f"{PREFIX}/consultations/{cid}", headers=auth_headers(otro.id))
-    assert ajeno.status_code == 200
-    assert ajeno.json()["can_view_patient_address"] is False
-    # PII de contacto: el médico NO asignado no recibe el teléfono de emergencia.
-    assert ajeno.json()["patient"]["emergency_phone"] is None
+    assert ajeno.status_code == 403
     listado = await client.get(
         f"{PREFIX}/consultations?patient_id={patient.id}", headers=auth_headers(otro.id)
     )
-    assert listado.status_code == 200
-    assert all(c["patient"]["emergency_phone"] is None for c in listado.json())
+    assert listado.status_code == 403
 
     monkeypatch.setattr(settings, "ADDRESS_VIEWER_EMAILS", "detalle-viewer@example.com")
     viewer = make_profile(role="super_admin")
