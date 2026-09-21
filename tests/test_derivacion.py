@@ -291,9 +291,24 @@ async def test_derivar_con_especialista_cierra_la_parte_del_medico_y_encola_una_
     panel = await client.get(f"{PREFIX}/consultations/panel", headers=auth_headers(doc.id))
     assert str(padre.id) not in {c["id"] for c in panel.json()["mine"]}
 
-    # El especialista la ve en su cola y, en el detalle, quién la derivó y por qué.
+    # El especialista la ve en su cola (anonimizada). El detalle con la identidad y la
+    # derivación se abre recién cuando la toma: antes de eso no es su médico tratante.
     cola = await client.get(f"{PREFIX}/consultations/panel", headers=auth_headers(especialista.id))
     assert str(hija_id) in {c["id"] for c in cola.json()["waiting"]}
+    assert (
+        await client.get(
+            f"{PREFIX}/consultations/{hija_id}", headers=auth_headers(especialista.id)
+        )
+    ).status_code == 403
+
+    # Al tomarla, el especialista entra con sala nueva.
+    took = await client.post(
+        f"{PREFIX}/consultations/{hija_id}/claim", headers=auth_headers(especialista.id)
+    )
+    assert took.status_code == 200, took.text
+    assert "/vamed-" in took.json()["video_room_url"]
+
+    # Ya como médico tratante, el detalle le trae quién la derivó y por qué.
     detalle = await client.get(
         f"{PREFIX}/consultations/{hija_id}", headers=auth_headers(especialista.id)
     )
@@ -304,13 +319,6 @@ async def test_derivar_con_especialista_cierra_la_parte_del_medico_y_encola_una_
     assert body["derivation"]["from_specialty"] == GENERAL
     assert body["derivation"]["by_name"] == doc.full_name
     assert body["derivation"]["reason"] == "Sospecha de lesión de menisco"
-
-    # Al tomarla, el especialista entra con sala nueva.
-    took = await client.post(
-        f"{PREFIX}/consultations/{hija_id}/claim", headers=auth_headers(especialista.id)
-    )
-    assert took.status_code == 200, took.text
-    assert "/vamed-" in took.json()["video_room_url"]
 
     assert len(enviados) == 1
     assert f"cid={hija_id}" in enviados[0]["waiting_url"]

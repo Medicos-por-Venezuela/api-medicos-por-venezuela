@@ -22,6 +22,9 @@ class Patient(Base):
     # El alta pública los sigue exigiendo vía el CHECK
     # `ck_patients_contacto_requerido_en_alta_publica`, no vía NOT NULL.
     phone_whatsapp: Mapped[str | None] = mapped_column(String, nullable=True)
+    emergency_phone: Mapped[str | None] = mapped_column(
+        String, nullable=True
+    )  # Distinto del WhatsApp; visible para admin y médico tratante.
     affected_zone: Mapped[str | None] = mapped_column(String, nullable=True)
     needs_tags: Mapped[list[str]] = mapped_column(
         ARRAY(Text), nullable=False, server_default=text("'{}'")
@@ -35,6 +38,9 @@ class Patient(Base):
     cedula: Mapped[str | None] = mapped_column(String, nullable=True)
     email: Mapped[str | None] = mapped_column(String, nullable=True)
     allergies: Mapped[str | None] = mapped_column(Text, nullable=True)
+    address_encrypted: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )  # Cifrado E2E (v1:base64 sealed box). La API NUNCA la descifra.
     # Carga familiar: un menor referencia a su adulto responsable (otra fila de
     # patients). parentesco solo aplica cuando parent_id está seteado.
     parent_id: Mapped[uuid.UUID | None] = mapped_column(

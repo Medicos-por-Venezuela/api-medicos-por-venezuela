@@ -1,12 +1,19 @@
 """Capa de negocio para patients."""
 
+import re
 import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.errors import BadRequestError, ForbiddenError, NotFoundError
+from src.core.config import settings
+from src.core.errors import (
+    BadRequestError,
+    ForbiddenError,
+    NotFoundError,
+    UnprocessableError,
+)
 from src.models.patient import Patient
 from src.schemas.patient import (
     DoctorPatientCreate,
@@ -15,6 +22,18 @@ from src.schemas.patient import (
     PatientUpdate,
 )
 from src.services import audit
+
+
+def _ensure_emergency_phone_differs(emergency: str | None, whatsapp: str | None) -> None:
+    """El teléfono de emergencia debe ser distinto del WhatsApp.
+
+    El esquema Pydantic lo valida cuando ambos viajan en el mismo payload; acá se cubre el
+    PATCH (donde puede venir solo uno) y el alta por médico, comparando contra lo ya guardado.
+    """
+    if emergency is None:
+        return
+    if re.sub(r"\D", "", emergency) == re.sub(r"\D", "", whatsapp or ""):
+        raise UnprocessableError("El teléfono de emergencia debe ser distinto al de WhatsApp.")
 
 
 async def _resolve_dependent_cedula(session: AsyncSession, parent_id: uuid.UUID) -> str | None:
@@ -112,6 +131,10 @@ async def update_patient(
 ) -> Patient:
     patient = await get_patient(session, patient_id)
     changes = data.model_dump(exclude_unset=True)
+    if "emergency_phone" in changes:
+        _ensure_emergency_phone_differs(
+            changes["emergency_phone"], changes.get("phone_whatsapp", patient.phone_whatsapp)
+        )
     for field, value in changes.items():
         setattr(patient, field, value)
     await audit.log_action(
@@ -154,6 +177,7 @@ async def create_doctor_patient(
         raise BadRequestError(
             "Se requiere declarar el consentimiento del paciente (consent = true)."
         )
+    _ensure_emergency_phone_differs(data.emergency_phone, data.phone_whatsapp)
     patient = Patient(**data.model_dump(), created_by_doctor_id=doctor_id)
     patient.consent_at = datetime.now(UTC)
     session.add(patient)
@@ -203,6 +227,10 @@ async def update_doctor_patient(
 ) -> Patient:
     patient = await _own_patient(session, patient_id, doctor_id)
     changes = data.model_dump(exclude_unset=True)
+    if "emergency_phone" in changes:
+        _ensure_emergency_phone_differs(
+            changes["emergency_phone"], changes.get("phone_whatsapp", patient.phone_whatsapp)
+        )
     for field, value in changes.items():
         setattr(patient, field, value)
     await audit.log_action(
@@ -249,3 +277,72 @@ async def delete_patient(
         resource_id=patient.id,
     )
     await session.commit()
+
+
+# --- Dirección cifrada E2E (v1:base64 sealed box) ---
+#
+# La dirección se cifra en el navegador del paciente con la clave pública clínica (X25519
+# sealed box). La API NUNCA la descifra, ni la loguea, ni la valida: solo almacena y
+# sirve la ciphertext a quien esté autorizado (médico tratante o allowlist).
+#
+# Autorización para ver la dirección:
+# - Email del principal en `settings.address_viewer_emails` (allowlist configurable, default:
+#   la responsable de protección de datos).
+# - O el principal es el médico asignado a ALGUNA consulta de este paciente (consulta viva:
+#   cualquier estado sirve mientras `assigned_doctor_id == viewer_id`).
+#
+# Si no se cumple ninguna, se lanza ForbiddenError. Antes de devolver la ciphertext se
+# escribe auditoría con action="patient.address_revealed" y metadata indicando la vía
+# ("allowlist" o "tratante").
+
+
+async def patient_address_for_viewer(
+    session: AsyncSession, patient: Patient, *, viewer_id: uuid.UUID, viewer_email: str | None
+) -> str | None:
+    """Devuelve `patient.address_encrypted` si el viewer está autorizado; si no, 403.
+
+    Autorizado si:
+    - `viewer_email` (en minúsculas) está en `settings.address_viewer_emails`, O
+    - Existe una consulta del paciente con `assigned_doctor_id == viewer_id`.
+
+    Escribe auditoría ANTES de devolver la ciphertext
+    (action="patient.address_revealed", metadata con `via: "allowlist" | "tratante"`).
+    Commitea la transacción.
+    """
+    email_lower = (viewer_email or "").strip().lower()
+    via = None
+
+    # 1) Allowlist configurable (super admin / DPO).
+    if email_lower and email_lower in settings.address_viewer_emails:
+        via = "allowlist"
+
+    # 2) Médico tratante: alguna consulta asignada a este viewer.
+    if via is None:
+        from src.models.consultation import Consultation
+
+        existe = await session.scalar(
+            select(1)
+            .where(
+                Consultation.patient_id == patient.id,
+                Consultation.assigned_doctor_id == viewer_id,
+            )
+            .limit(1)
+        )
+        if existe is not None:
+            via = "tratante"
+
+    if via is None:
+        raise ForbiddenError("Solo el médico que atiende el caso puede ver la dirección.")
+
+    # Auditoría ANTES de devolver la ciphertext.
+    await audit.log_action(
+        session,
+        action="patient.address_revealed",
+        actor_user_id=viewer_id,
+        resource="patients",
+        resource_id=patient.id,
+        metadata={"via": via},
+    )
+    await session.commit()
+
+    return patient.address_encrypted

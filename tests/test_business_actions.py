@@ -26,6 +26,8 @@ async def _patient(client: AsyncClient, needs: list[str], allergies: str | None 
             json={
                 "full_name": "Paciente Negocio",
                 "phone_whatsapp": "+58412800000",
+                "emergency_phone": "+58414800000",
+                "address_encrypted": "v1:dGVzdCBjaXBoZXJ0ZXh0",
                 "affected_zone": "Caracas",
                 "needs_tags": needs,
                 "consent": True,
@@ -390,6 +392,8 @@ async def test_el_paciente_dueno_entra_con_su_sesion(
             json={
                 "full_name": "Paciente Con Cuenta",
                 "phone_whatsapp": "+58412800077",
+                "emergency_phone": "+58414800077",
+                "address_encrypted": "v1:dGVzdCBjaXBoZXJ0ZXh0",
                 "affected_zone": "Caracas",
                 "consent": True,
                 "user_id": str(patient_user.id),

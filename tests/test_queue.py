@@ -18,6 +18,8 @@ async def _waiting_consultation(client: AsyncClient) -> str:
             json={
                 "full_name": "Paciente Cola",
                 "phone_whatsapp": "+58412777000",
+                "emergency_phone": "+58414777000",
+                "address_encrypted": "v1:dGVzdCBjaXBoZXJ0ZXh0",
                 "affected_zone": "Caracas",
                 "consent": True,
             },

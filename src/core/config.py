@@ -170,6 +170,18 @@ class Settings(BaseSettings):
     # --- CORS ---
     BACKEND_CORS_ORIGINS: str = "*"
 
+    # --- Dirección cifrada E2E (v1:base64 sealed box) ---
+    # Emails (coma-separados) que pueden ver la DIRECCIÓN cifrada de cualquier paciente, además del
+    # médico tratante. La dirección va cifrada E2E: esto solo controla a quién se le entrega la
+    # ciphertext. Default: la responsable de protección de datos.
+    ADDRESS_VIEWER_EMAILS: str = "orianaramirez@gmail.com"
+
+    @property
+    def address_viewer_emails(self) -> frozenset[str]:
+        return frozenset(
+            e.strip().lower() for e in self.ADDRESS_VIEWER_EMAILS.split(",") if e.strip()
+        )
+
     # --- Anti-abuso (rate limiting) ---
     # Storage en memoria por proceso; para varias instancias, usar Redis.
     RATE_LIMIT_ENABLED: bool = True
