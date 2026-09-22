@@ -33,9 +33,11 @@ from src.core.tz import to_local
 from src.db.session import AsyncSessionLocal
 from src.models.audit_log import AuditLog
 from src.models.marketing_survey_response import MarketingSurveyResponse
+from src.models.professional_type import ProfessionalType
 from src.models.rbac import Permission, Role, RolePermission
+from src.models.specialty import Specialty
 from src.services import marketing as marketing_service
-from tests._helpers import auth_headers, make_profile
+from tests._helpers import auth_headers, make_doctor_row, make_profile, specialty_id_by_name
 
 PREFIX = "/api/v1"
 SURVEYS = f"{PREFIX}/marketing/surveys"
@@ -437,7 +439,7 @@ async def test_encuesta_inexistente_en_el_listado_da_422(client: AsyncClient, su
     [
         ("medicos-generales", {"role_active_detail"}, {"timezone", "timezone_other"}),
         ("psicologos", {"timezone", "timezone_other"}, {"role_active_detail"}),
-        ("especialistas", {"timezone", "timezone_other"}, {"role_active_detail"}),
+        ("especialistas", {"timezone", "timezone_other", "specialty"}, {"role_active_detail"}),
     ],
 )
 async def test_cada_encuesta_trae_sus_columnas(
@@ -453,7 +455,10 @@ async def test_cada_encuesta_trae_sus_columnas(
     body = resp.json()
     assert {"columns", "rows", "total", "filters"} == set(body)
     keys = [c["key"] for c in body["columns"]]
-    assert keys[:3] == ["email", "updated_at", "roles"]
+    assert keys[0] == "doctor_name"
+    assert keys[1] == "email"
+    assert {"updated_at", "roles"} <= set(keys)
+    assert ("specialty" in keys) is (survey == "especialistas")
     assert tiene <= set(keys)
     assert not no_tiene & set(keys)
     expected = marketing_service.survey_columns(marketing_service.SURVEYS[survey])
@@ -503,6 +508,105 @@ async def test_listado_resuelve_etiquetas_y_solo_trae_su_encuesta(
     assert especialistas.json()["rows"][0]["roles"].startswith(
         "Atender pacientes directamente en mi especialidad"
     )
+
+
+async def test_listado_matchea_el_correo_con_la_ficha_del_medico(
+    client: AsyncClient, anon_client: AsyncClient, super_admin, db_session: AsyncSession
+) -> None:
+    """El nombre sale del cruce por correo con `doctors` (sin distinguir mayúsculas), y la fila
+    trae `doctor_id`/`professional_type` ocultos para abrir la ficha. Una respuesta sin ficha se
+    queda sin nombre, sin inventar uno."""
+    marker = _marker()
+    specialty_id = await specialty_id_by_name(db_session, "Medicina general")
+    ptype_id = await db_session.scalar(
+        select(ProfessionalType.id).where(ProfessionalType.deleted_at.is_(None)).limit(1)
+    )
+    profile = make_profile(role="doctor")
+    db_session.add(profile)
+    await db_session.flush()
+    doctor = make_doctor_row(
+        profile.id,
+        email=f"Dra.{marker}@Example.com",  # a propósito con mayúsculas
+        full_name=f"Dra. {marker}",
+        specialty_id=specialty_id,
+        professional_type_id=ptype_id,
+    )
+    db_session.add(doctor)
+    await db_session.flush()
+
+    email = f"dra.{marker}@example.com"
+    await anon_client.post(f"{SURVEYS}/especialistas/responses", json=_answers(email))
+    sin_ficha = f"{marker}-sin-ficha@example.com"
+    await anon_client.post(f"{SURVEYS}/especialistas/responses", json=_answers(sin_ficha))
+
+    resp = await client.get(
+        f"{SURVEYS}/especialistas/responses",
+        headers=auth_headers(super_admin.id),
+        params={"search": marker},
+    )
+    assert resp.status_code == 200, resp.text
+    rows = {r["email"]: r for r in resp.json()["rows"]}
+    assert rows[email]["doctor_name"] == f"Dra. {marker}"
+    assert rows[email]["doctor_id"] == str(doctor.id)
+    assert rows[email]["professional_type"] is not None
+    assert rows[email]["specialty"] == "Medicina general"
+    assert rows[sin_ficha]["doctor_name"] is None
+    assert rows[sin_ficha]["doctor_id"] == ""
+
+
+async def test_filtro_por_especialidad_acota_listado_y_exportacion(
+    client: AsyncClient, anon_client: AsyncClient, super_admin, db_session: AsyncSession
+) -> None:
+    """`specialty_id` deja solo las respuestas cuyo médico tiene esa especialidad principal, y el
+    Excel trae lo mismo que la tabla (misma condición, una sola definición)."""
+    marker = _marker()
+    spec_a = Specialty(name=f"Especialidad {marker} A")
+    spec_b = Specialty(name=f"Especialidad {marker} B")
+    db_session.add_all([spec_a, spec_b])
+    await db_session.flush()
+
+    emails = {}
+    for label, spec in (("a", spec_a), ("b", spec_b)):
+        profile = make_profile(role="doctor")
+        db_session.add(profile)
+        await db_session.flush()
+        db_session.add(
+            make_doctor_row(
+                profile.id,
+                email=f"{label}.{marker}@example.com",
+                full_name=f"Dr. {label} {marker}",
+                specialty_id=spec.id,
+            )
+        )
+        await db_session.flush()
+        email = f"{label}.{marker}@example.com"
+        emails[label] = email
+        await anon_client.post(f"{SURVEYS}/especialistas/responses", json=_answers(email))
+
+    resp = await client.get(
+        f"{SURVEYS}/especialistas/responses",
+        headers=auth_headers(super_admin.id),
+        params={"search": marker, "specialty_id": str(spec_a.id)},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["total"] == 1
+    assert [r["email"] for r in body["rows"]] == [emails["a"]]
+    assert body["filters"] == [
+        ["Búsqueda (correo)", marker],
+        ["Especialidad", spec_a.name],
+    ]
+
+    export = await client.get(
+        f"{SURVEYS}/especialistas/responses/export",
+        headers=auth_headers(super_admin.id),
+        params={"search": marker, "specialty_id": str(spec_a.id)},
+    )
+    assert export.status_code == 200, export.text
+    strings = _shared_strings(export.content)
+    assert f"Dr. a {marker}" in strings
+    assert f"Dr. b {marker}" not in strings
+    assert len(re.findall(r'<row r="(?!1")', _sheet_xml(export.content))) == 1
 
 
 async def test_filtro_por_fecha_incluye_el_dia_final(
@@ -596,6 +700,7 @@ async def test_export_es_un_xlsx_con_las_respuestas_y_queda_en_audit_log(
     assert email in strings
     assert "Asumir un rol más activo (coordinar, liderar)" in strings
     assert "Rol más activo: qué tiene en mente" in strings
+    assert "Profesional" in strings
     # Exactamente la fila del filtro (la 1 es la cabecera).
     assert len(re.findall(r'<row r="(?!1")', _sheet_xml(resp.content))) == 1
 

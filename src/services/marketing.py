@@ -32,13 +32,17 @@ import uuid
 from dataclasses import dataclass
 from datetime import date
 
-from sqlalchemy import ColumnElement, Select, func, select
+from sqlalchemy import ColumnElement, Select, and_, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from src.core.errors import BadRequestError, UnprocessableError
 from src.core.tz import day_bounds, to_local
+from src.models.doctor import Doctor
 from src.models.marketing_survey_response import MarketingSurveyResponse
+from src.models.professional_type import ProfessionalType
+from src.models.specialty import Specialty
 from src.schemas.marketing import SurveyResponseCreate
 from src.services.reports import (
     MAX_EXPORT_ROWS,
@@ -114,7 +118,8 @@ class Survey:
     """Lo que distingue a una encuesta de las otras dos.
 
     `active_detail_role`: rol que trae su propio "cuéntanos qué tienes en mente" (además del de
-    "Otra"). `asks_timezone`: si pregunta dónde está.
+    "Otra"). `asks_timezone`: si pregunta dónde está. `shows_specialty`: solo la encuesta de
+    especialistas enseña y filtra por la especialidad del médico.
     """
 
     slug: str
@@ -123,6 +128,7 @@ class Survey:
     roles: dict[str, str]
     active_detail_role: str | None
     asks_timezone: bool
+    shows_specialty: bool
 
 
 SURVEYS: dict[str, Survey] = {
@@ -142,6 +148,7 @@ SURVEYS: dict[str, Survey] = {
         },
         active_detail_role=None,
         asks_timezone=True,
+        shows_specialty=False,
     ),
     "especialistas": Survey(
         slug="especialistas",
@@ -156,6 +163,7 @@ SURVEYS: dict[str, Survey] = {
         },
         active_detail_role=None,
         asks_timezone=True,
+        shows_specialty=True,
     ),
     # Sin zona horaria: la encuesta va a médicos en Venezuela ("Horas de Venezuela"). La
     # disponibilidad se pregunta a todos, como en las otras dos: al principio solo se pedía a quien
@@ -172,6 +180,7 @@ SURVEYS: dict[str, Survey] = {
         },
         active_detail_role="rol_activo",
         asks_timezone=False,
+        shows_specialty=False,
     ),
 }
 
@@ -300,13 +309,19 @@ class ResponseFilters:
     # cuenta como respuesta a ese envío.
     answered_from: date | None = None
     answered_to: date | None = None
+    # Id de la especialidad principal del médico (match por correo con `doctors`); solo lo usa la
+    # encuesta que enseña la columna.
+    specialty_id: uuid.UUID | None = None
 
 
-def describe_response_filters(f: ResponseFilters) -> list[tuple[str, str]]:
+def describe_response_filters(
+    f: ResponseFilters, *, specialty_name: str | None = None
+) -> list[tuple[str, str]]:
     """Los filtros aplicados, legibles, para la portada del Excel y los chips del panel."""
     return describe_filters(
         [
             ("Búsqueda (correo)", f.search),
+            ("Especialidad", specialty_name),
             ("Respondieron desde", f.answered_from),
             ("Respondieron hasta", f.answered_to),
         ]
@@ -315,9 +330,17 @@ def describe_response_filters(f: ResponseFilters) -> list[tuple[str, str]]:
 
 def survey_columns(survey: Survey) -> tuple[Column, ...]:
     """Columnas del listado de UNA encuesta: las preguntas que esa encuesta no hace no salen, para
-    que el Excel de médicos generales no traiga dos columnas de zona horaria siempre vacías."""
+    que el Excel de médicos generales no traiga dos columnas de zona horaria siempre vacías.
+
+    "Profesional" y "Especialidad" salen del cruce con `doctors` por correo.
+    """
     columns = [
+        Column("doctor_name", "Profesional", 30),
         Column("email", "Correo", 32),
+    ]
+    if survey.shows_specialty:
+        columns.append(Column("specialty", "Especialidad", 24))
+    columns += [
         Column("updated_at", "Última respuesta", 18, "datetime"),
         Column("roles", "Cómo quiere participar", 60),
     ]
@@ -350,24 +373,36 @@ def _labels(codes: list[str], labels: dict[str, str]) -> str:
     return "; ".join(labels.get(code, code) for code in codes)
 
 
-def response_row(survey: Survey, r: MarketingSurveyResponse, columns: tuple[Column, ...]) -> dict:
-    """Una fila del listado, ya presentada (etiquetas en español, fechas en hora de Caracas)."""
+def response_row(survey: Survey, r, columns: tuple[Column, ...]) -> dict:
+    """Una fila del listado, ya presentada (etiquetas en español, fechas en hora de Caracas).
+
+    `r` es la fila completa (Row) que viene del join: `r[0]` es `MarketingSurveyResponse` y
+    `r.doctor_name`, `r.specialty_name`, `r.professional_type_name`, `r.doctor_id` son los labels
+    del cruce con `doctors`."""
+    response = r[0]
     values = {
-        "email": r.email,
-        "updated_at": to_local(r.updated_at),
-        "roles": _labels(r.roles, survey.roles),
-        "role_active_detail": r.role_active_detail,
-        "role_other_detail": r.role_other_detail,
-        "moments": _labels(r.moments, MOMENTS),
-        "days": _labels(r.days, DAYS),
-        "weekly_hours": WEEKLY_HOURS.get(r.weekly_hours or "", r.weekly_hours),
-        "availability_notes": r.availability_notes,
-        "timezone": TIMEZONES.get(r.timezone or "", r.timezone),
-        "timezone_other": r.timezone_other,
-        "notes": r.notes,
-        "created_at": to_local(r.created_at),
+        "doctor_name": r.doctor_name,
+        "email": response.email,
+        "specialty": r.specialty_name,
+        "updated_at": to_local(response.updated_at),
+        "roles": _labels(response.roles, survey.roles),
+        "role_active_detail": response.role_active_detail,
+        "role_other_detail": response.role_other_detail,
+        "moments": _labels(response.moments, MOMENTS),
+        "days": _labels(response.days, DAYS),
+        "weekly_hours": WEEKLY_HOURS.get(response.weekly_hours or "", response.weekly_hours),
+        "availability_notes": response.availability_notes,
+        "timezone": TIMEZONES.get(response.timezone or "", response.timezone),
+        "timezone_other": response.timezone_other,
+        "notes": response.notes,
+        "created_at": to_local(response.created_at),
     }
-    return {column.key: values[column.key] for column in columns}
+    row = {column.key: values[column.key] for column in columns}
+    # Claves que NO son columnas (el Excel las ignora porque solo recorre `columns`): el panel
+    # las usa para abrir la ficha del profesional.
+    row["doctor_id"] = str(r.doctor_id) if r.doctor_id else ""
+    row["professional_type"] = r.professional_type_name
+    return row
 
 
 def response_conditions(survey_slug: str, filters: ResponseFilters) -> list[ColumnElement[bool]]:
@@ -386,8 +421,38 @@ def response_conditions(survey_slug: str, filters: ResponseFilters) -> list[Colu
 
 
 def responses_query(survey_slug: str, filters: ResponseFilters) -> Select:
-    """Consulta del listado."""
-    stmt = select(MarketingSurveyResponse).where(*response_conditions(survey_slug, filters))
+    """Consulta del listado, con la ficha del profesional resuelta por correo.
+
+    El correo de la respuesta se guarda en minúsculas y el de `doctors` puede no estarlo, así
+    que el cruce va por `lower(doctors.email)`. `deleted_at is null` además de ser el índice
+    único parcial de la ficha viva: sin él, una ficha borrada volvería a aparecer aquí."""
+    doctor = aliased(Doctor)
+    specialty = aliased(Specialty)
+    ptype = aliased(ProfessionalType)
+    stmt = (
+        select(
+            MarketingSurveyResponse,
+            doctor.id.label("doctor_id"),
+            doctor.full_name.label("doctor_name"),
+            specialty.name.label("specialty_name"),
+            ptype.name.label("professional_type_name"),
+        )
+        .select_from(MarketingSurveyResponse)
+        .outerjoin(
+            doctor,
+            and_(
+                func.lower(doctor.email) == MarketingSurveyResponse.email,
+                doctor.deleted_at.is_(None),
+            ),
+        )
+        .outerjoin(specialty, specialty.id == doctor.specialty_id)
+        .outerjoin(ptype, ptype.id == doctor.professional_type_id)
+        .where(*response_conditions(survey_slug, filters))
+    )
+    # El filtro por especialidad vive aquí y no en `response_conditions` porque necesita el join
+    # con `doctors`; los gráficos no lo reciben (su dependencia no declara el parámetro).
+    if filters.specialty_id is not None:
+        stmt = stmt.where(doctor.specialty_id == filters.specialty_id)
     # La respuesta más reciente primero, con el id de desempate: sin él, dos respuestas del mismo
     # instante pueden repetirse u omitirse entre páginas.
     return stmt.order_by(MarketingSurveyResponse.updated_at.desc(), MarketingSurveyResponse.id)
@@ -404,12 +469,17 @@ async def responses_report(
     """Respuestas de una encuesta. Sin `limit` devuelve todas (exportación)."""
     survey = SURVEYS[survey_slug]
     columns = survey_columns(survey)
+    specialty_name = None
+    if filters.specialty_id is not None:
+        specialty_name = await session.scalar(
+            select(Specialty.name).where(Specialty.id == filters.specialty_id)
+        )
     return await run_report(
         session,
         responses_query(survey.slug, filters),
         columns,
-        lambda r: response_row(survey, r[0], columns),
-        describe_response_filters(filters),
+        lambda r: response_row(survey, r, columns),
+        describe_response_filters(filters, specialty_name=specialty_name),
         skip=skip,
         limit=limit,
     )
