@@ -12,6 +12,7 @@ Dos públicos sobre el mismo recurso:
   mismo permiso. Son agregados: no devuelven ningún correo.
 """
 
+import uuid
 from datetime import date
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
@@ -67,11 +68,21 @@ def response_filters(
         None,
         description="Última respuesta hasta esta fecha (inclusive, hora de Venezuela).",
     ),
+    specialty_id: uuid.UUID | None = Query(
+        None,
+        description=(
+            "Id de la especialidad principal del médico (cruce por correo con `doctors`). "
+            "Solo tiene efecto en las encuestas que muestran la columna Especialidad."
+        ),
+    ),
 ) -> marketing_service.ResponseFilters:
     """Filtros del listado, declarados una sola vez para la vista previa y la exportación: si se
     escribieran aparte, un filtro nuevo llegaría a uno y no al otro."""
     return marketing_service.ResponseFilters(
-        search=search, answered_from=answered_from, answered_to=answered_to
+        search=search,
+        answered_from=answered_from,
+        answered_to=answered_to,
+        specialty_id=specialty_id,
     )
 
 
@@ -236,7 +247,11 @@ async def list_survey_responses(
 
     Cada encuesta trae SUS columnas: médicos generales no tiene zona horaria pero sí "rol más
     activo"; psicólogos y especialistas al revés. Las opciones marcadas llegan ya como el texto que
-    vio quien respondió."""
+    vio quien respondió.
+
+    Ahora todas las encuestas traen la columna "Profesional" (nombre del médico por cruce con
+    `doctors` por correo). La encuesta de especialistas trae además "Especialidad" (especialidad
+    principal del médico) y permite filtrar por `specialty_id`."""
     report = await marketing_service.responses_report(db, survey, filters, skip=skip, limit=limit)
     return report_preview(report)
 
