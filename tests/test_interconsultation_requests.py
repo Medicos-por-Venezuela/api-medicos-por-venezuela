@@ -13,10 +13,11 @@ import uuid
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.clinical_crypto import PREFIX as CIPHERTEXT_PREFIX
 from src.core.config import settings
 from src.models.audit_log import AuditLog
 from src.models.interconsultation_request import (
@@ -29,6 +30,7 @@ from src.models.profile import Profile
 from src.models.specialty import Specialty
 from src.services import interconsultation_requests as requests_service
 from src.services import mail as mail_service
+from src.services.clinical_access import READ_CLINICAL_DATA
 from tests._helpers import add_doctor, auth_headers, make_profile
 
 PREFIX = "/api/v1"
@@ -338,6 +340,9 @@ async def test_no_se_puede_pedir_sobre_un_paciente_ajeno(
     )
     assert intento.status_code == 403, intento.text
     assert sin_correo == []
+    # El intento sobre el paciente ajeno queda en el audit como denegado.
+    (denegada,) = await _denegadas(db_session, intruso, "patients")
+    assert denegada.resource_id == ajeno and denegada.ip
 
 
 async def test_modo_doctor_deriva_la_especialidad_y_avisa_solo_a_uno(
@@ -655,6 +660,9 @@ async def test_un_medico_de_otra_especialidad_no_puede_tomar(
 
     intento = await client.post(f"{SOLICITUDES}/{request_id}/take", headers=auth_headers(ajeno.id))
     assert intento.status_code == 403, intento.text
+    (denegada,) = await _denegadas(db_session, ajeno, "interconsultation_requests")
+    assert denegada.resource_id == request_id and denegada.ip
+    assert denegada.metadata_["ids"] == [request_id]
 
 
 async def test_una_dirigida_a_otro_no_la_puede_tomar_un_tercero(
@@ -812,6 +820,13 @@ async def test_cancelar_una_ajena_es_403(
         f"{SOLICITUDES}/{request_id}/cancel", headers=auth_headers(intruso.id)
     )
     assert intento.status_code == 403, intento.text
+    # El 403 queda en el audit (`_mia`), commiteado antes del error: no se lo lleva el rollback.
+    (denegada,) = await _denegadas(db_session, intruso, "interconsultation_requests")
+    assert denegada.resource_id == request_id and denegada.ip
+    # Y la solicitud sigue abierta.
+    fila = await db_session.get(InterconsultationRequest, uuid.UUID(request_id))
+    await db_session.refresh(fila)
+    assert fila.status == "open"
 
 
 async def test_cierra_el_tratante_y_NO_el_especialista(
@@ -985,3 +1000,176 @@ async def test_pedir_interconsulta_tiene_rate_limit(
         )
         codigos.append(r.status_code)
     assert 429 in codigos, f"sin rate limit: {codigos}"
+
+
+# ============================================================================
+# 3. Contenido clínico: cifrado, y leído solo por quien lo necesita
+# ============================================================================
+
+MOTIVO = "Dolor torácico atípico de dos semanas, ECG sin cambios agudos."
+NOTAS = "Notas reservadas al equipo tratante: troponinas seriadas negativas."
+
+
+async def _lecturas(db_session: AsyncSession, actor) -> list[AuditLog]:
+    return list(
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.action == READ_CLINICAL_DATA,
+                    AuditLog.actor_user_id == actor.id,
+                    AuditLog.resource == "interconsultation_requests",
+                )
+            )
+        ).scalars()
+    )
+
+
+async def _denegadas(db_session: AsyncSession, actor, resource: str) -> list[AuditLog]:
+    """Intentos denegados (403) de `actor` sobre un recurso concreto."""
+    rows = (
+        await db_session.execute(
+            select(AuditLog).where(
+                AuditLog.action == READ_CLINICAL_DATA,
+                AuditLog.actor_user_id == actor.id,
+                AuditLog.resource == resource,
+            )
+        )
+    ).scalars()
+    return [r for r in rows if r.metadata_["outcome"] == "denied"]
+
+
+async def _caso_con_notas(
+    client: AsyncClient, db_session: AsyncSession, sp: Specialty
+) -> tuple[Profile, str]:
+    tratante = await _medico(db_session)
+    paciente = await _paciente_de(client, tratante)
+    creada = await client.post(
+        SOLICITUDES,
+        json=_payload(paciente, sp.id, clinical_notes=NOTAS),
+        headers=auth_headers(tratante.id),
+    )
+    assert creada.status_code == 201, creada.text
+    return tratante, creada.json()["id"]
+
+
+async def test_se_guarda_cifrado_y_el_correo_de_difusion_no_lleva_el_motivo(
+    client: AsyncClient, db_session: AsyncSession, sin_correo: list[dict]
+) -> None:
+    sp = await _especialidad_pedible(db_session)
+    await _medico(db_session, sp)
+    _, request_id = await _caso_con_notas(client, db_session, sp)
+
+    crudo = (
+        await db_session.execute(
+            text(
+                "select chief_complaint, clinical_notes from interconsultation_requests "
+                "where id = :id"
+            ),
+            {"id": uuid.UUID(request_id)},
+        )
+    ).one()
+    assert crudo.chief_complaint.startswith(CIPHERTEXT_PREFIX)
+    assert crudo.clinical_notes.startswith(CIPHERTEXT_PREFIX)
+
+    (difusion,) = sin_correo
+    for parte in (difusion["subject"], difusion["text"], difusion["html"]):
+        assert "Dolor torácico" not in parte
+        assert "troponinas" not in parte
+    assert "/panel-medico" in difusion["text"]
+
+
+async def test_la_bandeja_ve_el_motivo_pero_no_las_notas(
+    client: AsyncClient, db_session: AsyncSession, sin_correo: list[dict]
+) -> None:
+    """Como la cola: el motivo para decidir si lo toma, las notas solo al equipo tratante."""
+    sp = await _especialidad_pedible(db_session)
+    _, request_id = await _caso_con_notas(client, db_session, sp)
+    especialista = await _medico(db_session, sp)
+
+    bandeja = await client.get(f"{SOLICITUDES}/inbox", headers=auth_headers(especialista.id))
+    assert bandeja.status_code == 200, bandeja.text
+    caso = next(c for c in bandeja.json() if c["id"] == request_id)
+    assert caso["chief_complaint"] == MOTIVO
+    assert caso["clinical_notes"] is None
+    assert caso["clinical_access"] == "summary"
+    assert "troponinas" not in bandeja.text
+
+    (entrada,) = await _lecturas(db_session, especialista)
+    assert entrada.metadata_["via"] == "queue_scope"
+    assert entrada.metadata_["tiers"] == ["summary"]
+    assert request_id in entrada.metadata_["ids"]
+
+
+async def test_el_que_toma_y_el_tratante_ven_motivo_y_notas(
+    client: AsyncClient, db_session: AsyncSession, sin_correo: list[dict], monkeypatch
+) -> None:
+    avisos: list[dict] = []
+
+    async def fake_send_mail(**kwargs) -> bool:
+        avisos.append(kwargs)
+        return True
+
+    import src.routers.interconsultation_requests as router_mod
+
+    monkeypatch.setattr(router_mod, "send_mail", fake_send_mail)
+
+    sp = await _especialidad_pedible(db_session)
+    tratante, request_id = await _caso_con_notas(client, db_session, sp)
+    especialista = await _medico(db_session, sp)
+
+    tomada = await client.post(
+        f"{SOLICITUDES}/{request_id}/take", headers=auth_headers(especialista.id)
+    )
+    assert tomada.status_code == 200, tomada.text
+    assert tomada.json()["chief_complaint"] == MOTIVO
+    assert tomada.json()["clinical_notes"] == NOTAS
+    assert tomada.json()["clinical_access"] == "full"
+
+    mios = await client.get(f"{SOLICITUDES}/taken-by-me", headers=auth_headers(especialista.id))
+    assert mios.json()[0]["clinical_notes"] == NOTAS
+
+    lecturas = await _lecturas(db_session, especialista)
+    assert {e.metadata_["via"] for e in lecturas} == {"interconsultation"}
+    assert all(e.metadata_["ids"] == [request_id] for e in lecturas)
+
+    # El aviso de "tomaron tu caso" tampoco lleva texto clínico.
+    (aviso,) = avisos
+    assert "Dolor torácico" not in aviso["text"] + aviso["html"]
+
+    mias = await client.get(f"{SOLICITUDES}/mine", headers=auth_headers(tratante.id))
+    caso = next(s for s in mias.json() if s["id"] == request_id)
+    assert caso["chief_complaint"] == MOTIVO
+    assert caso["clinical_notes"] == NOTAS
+    assert caso["clinical_access"] == "full"
+    vias = {e.metadata_["via"] for e in await _lecturas(db_session, tratante)}
+    assert vias == {"assigned_doctor"}
+
+    cerrada = await client.post(
+        f"{SOLICITUDES}/{request_id}/close",
+        json={"closing_note": "Resuelto por teléfono."},
+        headers=auth_headers(tratante.id),
+    )
+    assert cerrada.status_code == 200, cerrada.text
+    nota = await db_session.scalar(
+        text("select closing_note from interconsultation_requests where id = :id"),
+        {"id": uuid.UUID(request_id)},
+    )
+    assert nota.startswith(CIPHERTEXT_PREFIX)
+
+
+async def test_el_admin_en_la_bandeja_no_ve_el_motivo(
+    client: AsyncClient, db_session: AsyncSession, sin_correo: list[dict], admin_identity: Profile
+) -> None:
+    """El admin tiene `interconsultation_requests.take`, pero no ejerce: aunque el caso le
+    aparezca en la bandeja, sale sin contenido clínico y no deja lectura en el audit."""
+    sp = await _especialidad_pedible(db_session)
+    _, request_id = await _caso_con_notas(client, db_session, sp)
+    admin_identity.specialty_id = sp.id
+    await db_session.flush()
+
+    bandeja = await client.get(f"{SOLICITUDES}/inbox")
+    assert bandeja.status_code == 200, bandeja.text
+    caso = next(c for c in bandeja.json() if c["id"] == request_id)
+    assert caso["chief_complaint"] is None and caso["clinical_notes"] is None
+    assert caso["clinical_access"] == "none"
+    assert await _lecturas(db_session, admin_identity) == []

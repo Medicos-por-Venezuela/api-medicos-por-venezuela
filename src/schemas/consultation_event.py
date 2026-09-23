@@ -5,6 +5,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.schemas.clinical import ClinicalAccessMixin, ClinicalNote
+
 
 class ConsultationEventCreate(BaseModel):
     """Entrada del cliente: `created_by` se omite deliberadamente (siempre del JWT)."""
@@ -16,13 +18,16 @@ class ConsultationEventCreate(BaseModel):
     note: str | None = Field(default=None, max_length=2000)
 
 
-class ConsultationEventResponse(BaseModel):
+class ConsultationEventResponse(ClinicalAccessMixin):
+    """Evento del historial. `note` es nota del médico (`ClinicalNote`): en null salvo para el
+    equipo tratante del caso."""
+
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     consultation_id: uuid.UUID
     event_type: str
-    note: str | None = None
+    note: ClinicalNote = None
     created_by: uuid.UUID | None = None
     created_at: datetime
     # Autor resuelto server-side (join con users): evita que el frontend lea `users` directo para

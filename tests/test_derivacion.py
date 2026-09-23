@@ -319,6 +319,14 @@ async def test_derivar_con_especialista_cierra_la_parte_del_medico_y_encola_una_
     assert body["derivation"]["from_specialty"] == GENERAL
     assert body["derivation"]["by_name"] == doc.full_name
     assert body["derivation"]["reason"] == "Sospecha de lesión de menisco"
+    assert body["clinical_access"] == "full"
+
+    # El motivo de la derivación es nota del médico: el admin ve de dónde viene y quién la
+    # derivó, pero no por qué.
+    admin_detalle = (await client.get(f"{PREFIX}/consultations/{hija_id}")).json()
+    assert admin_detalle["derivation"]["by_name"] == doc.full_name
+    assert admin_detalle["derivation"]["reason"] is None
+    assert admin_detalle["clinical_access"] == "none"
 
     assert len(enviados) == 1
     assert f"cid={hija_id}" in enviados[0]["waiting_url"]
@@ -380,3 +388,70 @@ async def test_un_caso_no_derivado_no_trae_bloque_de_derivacion(
     detalle = await client.get(f"{PREFIX}/consultations/{padre.id}", headers=auth_headers(doc.id))
     assert detalle.json()["derivation"] is None
     assert detalle.json()["specialty"] == GENERAL
+
+
+async def test_la_cadena_da_notas_del_caso_pedido_y_sus_ancestros_no_de_otras_ramas(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A atiende R y lo deriva a la cola de otra especialidad (hija C1); P toma C1 y escribe su
+    nota. A sigue siendo tratante de R, pero eso no le da las notas de P: la cadena se decide
+    eslabón a eslabón. P, en cambio, hereda las notas de R (su ancestro): las necesita."""
+    destino = await _specialty(db_session)
+    p = await add_doctor(db_session, specialty=destino.name)
+    a = await add_doctor(db_session, specialty=GENERAL)
+    # Sin correos de verdad: los avisos de derivación y de sala lista se capturan.
+    with (
+        _capturar_avisos(),
+        patch("src.services.notifications.send_video_ready_email", AsyncMock(return_value=True)),
+    ):
+        r = await _tomado(client, db_session, a.id)
+        nota_a = await client.patch(
+            f"{PREFIX}/consultations/{r.id}",
+            json={"internal_note": "Nota de A sobre R"},
+            headers=auth_headers(a.id),
+        )
+        assert nota_a.status_code == 200, nota_a.text
+        derivada = await client.post(
+            f"{PREFIX}/consultations/{r.id}/refer-to-queue",
+            json={"specialty_id": str(destino.id), "reason": "Evaluación por especialista"},
+            headers=auth_headers(a.id),
+        )
+        assert derivada.status_code == 201, derivada.text
+        c1 = derivada.json()["id"]
+        took = await client.post(f"{PREFIX}/consultations/{c1}/claim", headers=auth_headers(p.id))
+        assert took.status_code == 200, took.text
+    nota_p = await client.patch(
+        f"{PREFIX}/consultations/{c1}",
+        json={"internal_note": "Nota privada de P"},
+        headers=auth_headers(p.id),
+    )
+    assert nota_p.status_code == 200, nota_p.text
+
+    # A pide la cadena de R: R en claro; C1 (rama que atiende P) en null.
+    de_a = await client.get(f"{PREFIX}/consultations/{r.id}/chain", headers=auth_headers(a.id))
+    assert de_a.status_code == 200, de_a.text
+    por_id = {c["id"]: c for c in de_a.json()}
+    assert por_id[str(r.id)]["clinical_access"] == "full"
+    assert por_id[str(r.id)]["internal_note"] == "Nota de A sobre R"
+    assert por_id[c1]["clinical_access"] == "none"
+    assert por_id[c1]["internal_note"] is None and por_id[c1]["chief_complaint"] is None
+    assert "Nota privada de P" not in de_a.text
+
+    # P pide la cadena de C1: su caso y el ancestro R, ambos en claro.
+    de_p = await client.get(f"{PREFIX}/consultations/{c1}/chain", headers=auth_headers(p.id))
+    assert de_p.status_code == 200, de_p.text
+    por_id = {c["id"]: c for c in de_p.json()}
+    assert por_id[str(r.id)]["clinical_access"] == "full"
+    assert por_id[str(r.id)]["internal_note"] == "Nota de A sobre R"
+    assert por_id[c1]["internal_note"] == "Nota privada de P"
+
+    # El audit de A solo lista lo que se le concedió: nunca C1.
+    lecturas_a = (
+        await db_session.scalars(
+            select(AuditLog).where(
+                AuditLog.action == "READ_CLINICAL_DATA", AuditLog.actor_user_id == a.id
+            )
+        )
+    ).all()
+    leidos = {i for e in lecturas_a for i in e.metadata_["ids"]}
+    assert str(r.id) in leidos and c1 not in leidos

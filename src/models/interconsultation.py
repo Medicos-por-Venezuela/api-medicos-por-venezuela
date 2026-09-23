@@ -9,12 +9,14 @@ otro día).
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, text
+from sqlalchemy import DateTime, ForeignKey, String, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
+from src.core.clinical_crypto import Sealed
 from src.db.base import Base
+from src.db.encrypted import EncryptedText
 
 
 class Interconsultation(Base):
@@ -32,7 +34,9 @@ class Interconsultation(Base):
     # user_id del médico que ATIENDE la consulta (quien invita).
     created_by_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'active'"))
-    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    note: Mapped[Sealed | None] = mapped_column(
+        EncryptedText("interconsultations.note"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

@@ -12,6 +12,8 @@ from src.services import calendar as calendar_service
 from tests._helpers import GENERAL, add_doctor, any_specialty_id, auth_headers, make_profile
 
 PREFIX = "/api/v1"
+# Motivo reconocible: el feed .ics no puede llevarlo (sin texto clínico fuera de la API).
+MOTIVO = "Dolor-ics-no-debe-salir"
 
 
 async def _open_consultation(client: AsyncClient, doctor_id) -> str:
@@ -31,7 +33,7 @@ async def _open_consultation(client: AsyncClient, doctor_id) -> str:
             f"{PREFIX}/consultations",
             json={
                 "patient_id": p.json()["id"],
-                "chief_complaint": "Dolor",
+                "chief_complaint": MOTIVO,
                 "specialty_id": await any_specialty_id(client),
             },
         )
@@ -87,6 +89,9 @@ async def test_ics_feed_lists_scheduled_events(
     assert "BEGIN:VCALENDAR" in body
     assert "BEGIN:VEVENT" in body
     assert child["code"] in body
+    # El calendario lo sondea Google/Apple/Outlook y copia el evento en su nube: sin motivo.
+    assert MOTIVO not in body
+    assert "Motivo" not in body
 
 
 async def test_rotate_revokes_old_token(client: AsyncClient, db_session: AsyncSession) -> None:

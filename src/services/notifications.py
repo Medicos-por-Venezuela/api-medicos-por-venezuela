@@ -475,10 +475,10 @@ async def send_due_reminders(session: AsyncSession, window_minutes: int = 30) ->
 # El correo de difusión sale a TODOS los médicos de una especialidad, incluidos los que nunca
 # van a tomar el caso. Por eso lleva lo mínimo para decidir si vale la pena abrir el panel, y
 # jamás identidad del paciente ni del médico que pide (la bandeja tampoco la muestra).
-
-# El motivo se recorta: mandar la nota clínica entera a cientos de bandejas ajenas es repartir
-# datos del caso a gente que no lo va a atender. Para decidir "esto es lo mío" alcanza con esto.
-_MOTIVO_EN_CORREO = 200
+#
+# Tampoco lleva el motivo ni ningún otro texto clínico (tasks/cifrado-datos-clinicos/spec.md):
+# un correo sale de la API y queda en buzones, reenvíos y backups que no controlamos. El motivo
+# se lee en el panel, donde la lectura se autoriza y queda en el audit_log.
 
 
 def panel_url() -> str:
@@ -487,30 +487,24 @@ def panel_url() -> str:
     return f"{settings.FRONTEND_URL.rstrip('/')}/panel-medico"
 
 
-def _recorta(texto: str, tope: int = _MOTIVO_EN_CORREO) -> str:
-    texto = " ".join(texto.split())
-    return texto if len(texto) <= tope else texto[: tope - 1].rstrip() + "…"
-
-
 def interconsultation_broadcast_email(
-    specialty_name: str, chief_complaint: str, age_range: str | None
+    specialty_name: str, age_range: str | None
 ) -> tuple[str, str, str]:
     """(subject, text, html) del aviso a los especialistas de que hay un caso para su
-    especialidad. SIN identidad del paciente ni del médico solicitante."""
-    edad = f"Edad: {age_range}\n" if age_range else ""
-    edad_html = f"<strong>Edad:</strong> {esc(age_range)}<br>" if age_range else ""
-    motivo = _recorta(chief_complaint)
+    especialidad. SIN identidad del paciente ni del médico solicitante, y SIN texto clínico."""
+    edad = f"Edad: {age_range}\n\n" if age_range else ""
+    edad_html = f"<p><strong>Edad:</strong> {esc(age_range)}</p>" if age_range else ""
     subject = f"Solicitud de interconsulta en {specialty_name}"
     panel = panel_url()
     text = (
         f"Un colega busca apoyo de {specialty_name}.\n\n"
-        f"{edad}Motivo: {motivo}\n\n"
+        f"{edad}"
         f"Entra a tu panel para ver el caso y tomarlo si puedes ayudar:\n{panel}\n\n"
         "El primer especialista que lo tome recibe los datos de contacto del médico tratante.\n"
     )
     html = (
         f"<p>Un colega busca apoyo de <strong>{esc(specialty_name)}</strong>.</p>"
-        f"<p>{edad_html}<strong>Motivo:</strong> {esc(motivo)}</p>"
+        f"{edad_html}"
         f'<p><a href="{panel}">Entra a tu panel</a> para ver el caso y tomarlo si puedes '
         "ayudar.</p>"
         "<p>El primer especialista que lo tome recibe los datos de contacto del médico "
@@ -520,21 +514,20 @@ def interconsultation_broadcast_email(
 
 
 def interconsultation_taken_email(
-    specialist_name: str | None, specialty_name: str, chief_complaint: str
+    specialist_name: str | None, specialty_name: str
 ) -> tuple[str, str, str]:
-    """(subject, text, html) del aviso al médico TRATANTE de que su caso fue tomado."""
+    """(subject, text, html) del aviso al médico TRATANTE de que su caso fue tomado. Sin texto
+    clínico: el tratante sabe de qué caso se trata desde su panel."""
     quien = specialist_name or f"Un especialista en {specialty_name}"
-    motivo = _recorta(chief_complaint)
     subject = "Un especialista tomó tu solicitud de interconsulta"
     panel = panel_url()
     text = (
-        f"{quien} tomó tu solicitud de interconsulta.\n\n"
-        f"Motivo del caso: {motivo}\n\n"
+        f"{quien} tomó tu solicitud de interconsulta de {specialty_name}.\n\n"
         f"Se pondrá en contacto contigo. Sus datos también están en tu panel:\n{panel}\n"
     )
     html = (
-        f"<p><strong>{esc(quien)}</strong> tomó tu solicitud de interconsulta.</p>"
-        f"<p><strong>Motivo del caso:</strong> {esc(motivo)}</p>"
+        f"<p><strong>{esc(quien)}</strong> tomó tu solicitud de interconsulta de "
+        f"{esc(specialty_name)}.</p>"
         "<p>Se pondrá en contacto contigo. Sus datos también están en "
         f'<a href="{panel}">tu panel</a>.</p>'
     )

@@ -5,10 +5,16 @@ Autorización (replica las RLS):
 - Sala de video / entered-call: sin sesión pero con el token de acceso de ESA consulta.
 - Leer: staff ve todo; un paciente autenticado solo ve lo suyo (anti-IDOR).
 - Actualizar / cerrar / eventos: staff. Eliminar: admin.
+
+Contenido clínico (motivo, notas, motivo de derivación, notas de eventos): cada respuesta se
+valida con el permiso clínico del caller sobre ESE caso (`clinical_context(grant)`, ver
+`src/services/clinical_access.py`). Sin permiso sale en null con `clinical_access = "none"`
+(el admin, siempre); toda lectura concedida queda en `audit_log` como `READ_CLINICAL_DATA`.
 """
 
 import logging
 import uuid
+from collections.abc import Sequence
 
 from fastapi import (
     APIRouter,
@@ -22,11 +28,13 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.core import consultation_token
 from src.core.config import settings
 from src.core.errors import ForbiddenError
+from src.core.observability import client_ip
 from src.core.ratelimit import limiter
 from src.core.security import (
     Principal,
@@ -38,6 +46,7 @@ from src.core.security import (
 from src.db.session import get_db, get_session_factory
 from src.models.consultation import Consultation
 from src.models.patient import Patient
+from src.schemas.clinical import ClinicalGrant, clinical_context
 from src.schemas.consultation import (
     ChainItem,
     ConsultationClaimRequest,
@@ -65,8 +74,14 @@ from src.schemas.consultation_event import (
     ConsultationEventCreate,
     ConsultationEventResponse,
 )
+from src.services import (
+    clinical_access,
+    notifications,
+    queue_access,
+    registration_mail,
+    waiting_room,
+)
 from src.services import consultations as consultations_service
-from src.services import notifications, registration_mail, waiting_room
 
 logger = logging.getLogger("mpv.api")
 
@@ -88,6 +103,80 @@ _TOKEN_RESPONSES = {
 # `Referer`. Sigue viajando en la URL hasta el frontend (el paciente llega por link), pero de
 # ahí al backend ya no.
 _CONSULTATION_TOKEN_HEADER = "X-Consultation-Token"
+
+# `resource` de las entradas READ_CLINICAL_DATA de este router.
+_AUDIT_RESOURCE = "consultations"
+
+
+async def _audit_read(
+    db: AsyncSession,
+    request: Request,
+    principal: Principal,
+    grants: Sequence[tuple[uuid.UUID, ClinicalGrant | None]],
+) -> None:
+    """Una entrada de audit por respuesta con los ids leídos (no-op si no se concedió nada)."""
+    await clinical_access.audit_clinical_read(
+        db,
+        principal=principal,
+        ip=client_ip(request),
+        resource=_AUDIT_RESOURCE,
+        grants=grants,
+    )
+
+
+async def _respond[T: BaseModel](
+    db: AsyncSession,
+    request: Request,
+    principal: Principal,
+    schema: type[T],
+    consultation: Consultation,
+    grant: ClinicalGrant | None,
+) -> T:
+    """Serializa UNA consulta con el permiso clínico del caller y audita si hubo lectura.
+    Primero se valida y después se audita: el audit commitea."""
+    out = schema.model_validate(consultation, context=clinical_context(grant))
+    await _audit_read(db, request, principal, [(consultation.id, grant)])
+    return out
+
+
+def _treating(principal: Principal, consultation: Consultation) -> ClinicalGrant | None:
+    """Permiso del médico tratante (asignado y habilitado) sobre el caso, tal como quedó."""
+    return clinical_access.treating_doctor_grant(principal, consultation.assigned_doctor_id)
+
+
+async def _treating_or_admin(
+    db: AsyncSession, request: Request, principal: Principal, consultation: Consultation
+) -> ClinicalGrant | None:
+    """Detalle / cadena / eventos de un caso: el tratante lo ve con notas; el admin recibe 200
+    con lo clínico en null (gestiona el caso, no su contenido); cualquier otro, 403 auditado."""
+    grant = _treating(principal, consultation)
+    if grant is None and not principal.is_admin:
+        await clinical_access.audit_clinical_denied(
+            db,
+            principal=principal,
+            ip=client_ip(request),
+            resource=_AUDIT_RESOURCE,
+            resource_id=consultation.id,
+        )
+        raise ForbiddenError("Solo el médico que atiende el caso puede verlo.")
+    return grant
+
+
+def _queue_item_grants(
+    principal: Principal, scope: queue_access.QueueScope | None, items: Sequence[Consultation]
+) -> list[ClinicalGrant | None]:
+    """Permiso por fila de una lista de cola: tratante si es suyo, SUMMARY si está en espera sin
+    asignar en su cola (`scope` = `clinical_access.queue_grant`), nada en otro caso."""
+    return [
+        clinical_access.grant_for_queue_item(
+            principal,
+            scope,
+            assigned_doctor_id=c.assigned_doctor_id,
+            specialty_id=c.specialty_id,
+            status=c.status,
+        )
+        for c in items
+    ]
 
 
 async def _queue_appointment_email(
@@ -182,6 +271,7 @@ async def authorize_consultation_access(
     responses={403: {"description": "El listado es del equipo de administración."}},
 )
 async def list_consultations(
+    request: Request,
     skip: int = Query(0, ge=0),
     # Cap 200: el monitor admin/pacientes muestra los casos recientes (hasta 200) y filtra/ordena
     # en el cliente. Endpoint solo-staff; el default sigue en 100.
@@ -191,9 +281,12 @@ async def list_consultations(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ) -> list[ConsultationDetailResponse] | list[ConsultationPatientResponse]:
-    """Staff ve todas las consultas con vista completa + el paciente anidado (para que el panel
-    admin/pacientes no lea `patients` directo). Un paciente autenticado solo ve las suyas, sin
-    notas clínicas ni internas ni datos anidados de otros.
+    """Staff ve todas las consultas con el paciente anidado (para que el panel admin/pacientes no
+    lea `patients` directo) pero **sin contenido clínico**: motivo, notas y antecedentes van en
+    null con `clinical_access = "none"`. Un admin que además ejerce recibe, fila a fila, lo que le
+    toca como médico (sus casos completos; los de su cola en espera sin asignar, solo el
+    motivo; un caso cancelado o cerrado sin médico, nada). Un
+    paciente autenticado solo ve las suyas, con su motivo (`summary`) y sin notas del médico.
 
     El listado con identidad es del **equipo de administración** (es el panel admin). Un médico
     ve sus casos por `/consultations/panel` (cola anonimizada) y el detalle de los que atiende."""
@@ -210,9 +303,25 @@ async def list_consultations(
     )
     if principal.is_staff:
         # Solo el equipo admin llega acá (los médicos reciben 403 arriba): todos los campos del
-        # paciente, incluido el teléfono de emergencia, son para administración.
-        return [ConsultationDetailResponse.model_validate(c) for c in consultations]
-    return [ConsultationPatientResponse.model_validate(c) for c in consultations]
+        # paciente, incluido el teléfono de emergencia, son para administración. Lo clínico no.
+        scope = await clinical_access.queue_grant(db, principal)
+        grants = _queue_item_grants(principal, scope, consultations)
+        staff_rows = [
+            ConsultationDetailResponse.model_validate(c, context=clinical_context(g))
+            for c, g in zip(consultations, grants, strict=True)
+        ]
+        await _audit_read(
+            db, request, principal, [(c.id, g) for c, g in zip(consultations, grants, strict=True)]
+        )
+        return staff_rows
+    # El servicio ya filtró por `patients.user_id = caller`: todas son suyas.
+    owner = clinical_access.patient_owner_grant()
+    patient_rows = [
+        ConsultationPatientResponse.model_validate(c, context=clinical_context(owner))
+        for c in consultations
+    ]
+    await _audit_read(db, request, principal, [(c.id, owner) for c in consultations])
+    return patient_rows
 
 
 @router.post(
@@ -239,11 +348,17 @@ async def create_consultation(
     paciente anónimo no tiene sesión con la que volver a pedirlo. El frontend lo lleva en la
     URL de /sala-espera en lugar del id crudo.
 
+    Sin contenido clínico en la respuesta (`clinical_access = "none"`): el llamante es anónimo y
+    el `patient_id` del cuerpo no prueba que la ficha sea suya (el motivo puede salir de sus
+    antecedentes).
+
     `request` es obligatorio para slowapi (lee la IP del cliente), aunque no se use aquí."""
     consultation = await consultations_service.create_consultation(db, payload)
     await _queue_new_patient_alert(background_tasks, db, consultation)
     return ConsultationCreatedResponse(
-        **ConsultationResponse.model_validate(consultation).model_dump(),
+        **ConsultationResponse.model_validate(
+            consultation, context=clinical_context(None)
+        ).model_dump(),
         access_token=consultation_token.issue(consultation.id),
     )
 
@@ -255,6 +370,7 @@ async def create_consultation(
     summary="Cola del panel médico (espera + mías + cerradas)",
 )
 async def consultation_panel(
+    request: Request,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("queue.read")),
 ) -> ConsultationPanelResponse:
@@ -265,16 +381,36 @@ async def consultation_panel(
     tener varias) más la de entrada (Medicina general, donde caen los pacientes que no saben qué
     necesitan) si atiende salud física. Con una sola cola el panel muestra la lista directa. Un
     admin las ve todas: si además es especialista se le añade una cola `is_rest` con el resto, y
-    si no ejerce ninguna especialidad no recibe colas (una sola lista)."""
+    si no ejerce ninguna especialidad no recibe colas (una sola lista).
+
+    Contenido clínico por fila (`clinical_access`): en `mine`, `full`; en `waiting`, `summary`
+    (motivo, antecedentes, alergias) si el caso está en SUS colas como médico, y `none` (null) si
+    no — el admin que no ejerce los recibe todos en null. El audit va por petición (una fila
+    por vía de acceso con todos los ids), no por fila del panel."""
     waiting, mine, my_closed, scope = await consultations_service.get_panel(
         db,
         principal.id,
         doctor_specialty_id=principal.specialty_id,
         is_admin=principal.is_admin,
     )
-    return ConsultationPanelResponse(
-        waiting=[PanelWaitingItem.model_validate(c) for c in waiting],
-        mine=[PanelConsultationItem.model_validate(c) for c in mine],
+    # El alcance de la cola que da SUMMARY es el del principal COMO MÉDICO. Para un no-admin es
+    # el mismo que ya calculó el panel; al admin se le calcula aparte (sin la vista global).
+    clinical_scope = (
+        scope
+        if not principal.is_admin and clinical_access.practices_medicine(principal)
+        else await clinical_access.queue_grant(db, principal)
+    )
+    waiting_grants = _queue_item_grants(principal, clinical_scope, waiting)
+    mine_grants = [_treating(principal, c) for c in mine]
+    response = ConsultationPanelResponse(
+        waiting=[
+            PanelWaitingItem.model_validate(c, context=clinical_context(g))
+            for c, g in zip(waiting, waiting_grants, strict=True)
+        ],
+        mine=[
+            PanelConsultationItem.model_validate(c, context=clinical_context(g))
+            for c, g in zip(mine, mine_grants, strict=True)
+        ],
         my_closed_count=my_closed,
         queue_blocked_reason=scope.blocked_reason,
         queues=[
@@ -288,6 +424,16 @@ async def consultation_panel(
             for g in scope.groups
         ],
     )
+    await _audit_read(
+        db,
+        request,
+        principal,
+        [
+            *zip((c.id for c in waiting), waiting_grants, strict=True),
+            *zip((c.id for c in mine), mine_grants, strict=True),
+        ],
+    )
+    return response
 
 
 # NOTA: antes de "/{consultation_id}" por lo mismo que "/panel".
@@ -314,13 +460,24 @@ async def derivation_targets(
     summary="Mi agenda: citas agendadas del médico autenticado",
 )
 async def my_agenda(
+    request: Request,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("queue.read")),
 ) -> list[ConsultationResponse]:
     """Citas AGENDADAS (status 'scheduled') asignadas al médico autenticado, por fecha ascendente.
-    El paciente ve las suyas por su propio scoping (list_consultations, viewer_is_staff=False)."""
+    El paciente ve las suyas por su propio scoping (list_consultations, viewer_is_staff=False).
+    Son casos suyos: el médico habilitado los recibe con notas (`full`); un admin que no ejerce,
+    con lo clínico en null."""
     agenda = await consultations_service.list_agenda(db, doctor_user_id=principal.id)
-    return [ConsultationResponse.model_validate(c) for c in agenda]
+    grants = [_treating(principal, c) for c in agenda]
+    rows = [
+        ConsultationResponse.model_validate(c, context=clinical_context(g))
+        for c, g in zip(agenda, grants, strict=True)
+    ]
+    await _audit_read(
+        db, request, principal, [(c.id, g) for c, g in zip(agenda, grants, strict=True)]
+    )
+    return rows
 
 
 @router.post(
@@ -351,35 +508,46 @@ async def send_due_reminders(
 )
 async def get_consultation(
     consultation_id: uuid.UUID,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ) -> ConsultationDetailResponse | ConsultationPatientResponse:
-    """Staff recibe la vista completa (incluye notas clínicas/internas) + el paciente anidado, para
-    que el panel no lea `patients` directo. Un paciente autenticado solo recibe su propia consulta
+    """Staff recibe la vista de staff + el paciente anidado, para que el panel no lea `patients`
+    directo. Un paciente autenticado solo recibe su propia consulta, con su motivo (`summary`) y
     sin las notas del médico.
 
     La identidad del paciente (nombre, cédula, contacto) solo la ven el médico asignado al caso y
-    el equipo admin: el resto del staff recibe 403. El filtro del cliente no es la frontera."""
+    el equipo admin: el resto del staff recibe 403 (queda en `audit_log` como intento denegado).
+    El contenido clínico (motivo, notas, antecedentes, motivo de derivación) solo va en claro para
+    el médico tratante (`full`); el admin recibe esos campos en null (`none`)."""
     consultation = await consultations_service.get_consultation_detail(
         db, consultation_id, viewer_is_staff=principal.is_staff, viewer_user_id=principal.id
     )
     if principal.is_staff:
-        if not principal.is_admin and consultation.assigned_doctor_id != principal.id:
-            raise ForbiddenError("Solo el médico que atiende el caso puede verlo.")
+        grant = await _treating_or_admin(db, request, principal, consultation)
+        context = clinical_context(grant)
         # Poblar la relación `patient` explícitamente (evita el lazy-load async) para el detalle.
         consultation.patient = await db.get(Patient, consultation.patient_id)
-        response = ConsultationDetailResponse.model_validate(consultation)
+        response = ConsultationDetailResponse.model_validate(consultation, context=context)
         derivation = await consultations_service.get_derivation(db, consultation)
         if derivation is not None:
-            response.derivation = DerivationInfo.model_validate(derivation)
+            response.derivation = DerivationInfo.model_validate(derivation, context=context)
         # can_view_patient_address: true si el principal está en la allowlist O es el médico
         # asignado a esta consulta. Lo calcula el servidor, no el cliente.
         response.can_view_patient_address = (
             (principal.email or "").lower() in settings.address_viewer_emails
             or consultation.assigned_doctor_id == principal.id
         )
+        await _audit_read(db, request, principal, [(consultation.id, grant)])
         return response
-    return ConsultationPatientResponse.model_validate(consultation)
+    return await _respond(
+        db,
+        request,
+        principal,
+        ConsultationPatientResponse,
+        consultation,
+        clinical_access.patient_owner_grant(),
+    )
 
 
 @router.patch(
@@ -388,6 +556,11 @@ async def get_consultation(
     summary="Actualizar consulta (estado / asignación / notas)",
     responses={
         **_NOT_FOUND,
+        403: {
+            "description": "Motivo o notas clínicas (`chief_complaint`, `clinical_notes`, "
+            "`internal_note`) enviados por quien no es el médico que atiende el caso, o "
+            "`assigned_doctor_id` = quien llama (tomar un caso es solo por el claim atómico)."
+        },
         409: {"description": "La consulta está asignada a otro médico."},
         422: {"description": "`status` inválido."},
     },
@@ -395,15 +568,30 @@ async def get_consultation(
 async def update_consultation(
     consultation_id: uuid.UUID,
     payload: ConsultationUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("consultations.write")),
 ) -> ConsultationResponse:
-    return await consultations_service.update_consultation(
+    """Estado, prioridad, asignación y gestión admin (`nota_admin`, `admin_seguimiento`) los
+    cambia el admin o el médico del caso. Motivo y notas clínicas, **solo el médico tratante**:
+    si otro (el admin incluido) los manda, 403. El admin asigna el caso a OTRO médico, nunca a sí
+    mismo (403): tomarlo es solo por el claim atómico. La respuesta trae lo clínico en claro solo
+    si el caller queda como médico tratante del caso; si no, en null."""
+    consultation = await consultations_service.update_consultation(
         db,
         consultation_id,
         payload,
         actor_user_id=principal.id,
         actor_is_admin=principal.is_admin,
+        actor_practices=clinical_access.practices_medicine(principal),
+    )
+    return await _respond(
+        db,
+        request,
+        principal,
+        ConsultationResponse,
+        consultation,
+        _treating(principal, consultation),
     )
 
 
@@ -428,17 +616,24 @@ async def delete_consultation(
     "/{consultation_id}/close",
     response_model=ConsultationResponse,
     summary="Cerrar consulta o marcar ausencia (staff)",
-    responses={**_NOT_FOUND, 409: {"description": "La consulta está asignada a otro médico."}},
+    responses={
+        **_NOT_FOUND,
+        403: {"description": "Nota de cierre enviada por quien no es el médico que atiende."},
+        409: {"description": "La consulta está asignada a otro médico."},
+    },
 )
 async def close_consultation(
     consultation_id: uuid.UUID,
     payload: ConsultationCloseRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("consultations.close")),
 ) -> ConsultationResponse:
     """Cierra (`closed`) o marca `patient_no_show`, guarda la nota y registra el evento.
-    El autor del cierre es el médico autenticado."""
-    return await consultations_service.close_consultation(
+    El autor del cierre es el médico autenticado. La nota es clínica: solo la escribe el médico
+    tratante (un admin cierra sin nota; con nota, 403). Lo clínico de la respuesta, solo en claro
+    para el médico tratante."""
+    consultation = await consultations_service.close_consultation(
         db,
         consultation_id,
         payload.outcome,
@@ -446,6 +641,15 @@ async def close_consultation(
         note=payload.note,
         signature=payload.signature,
         actor_is_admin=principal.is_admin,
+        actor_practices=clinical_access.practices_medicine(principal),
+    )
+    return await _respond(
+        db,
+        request,
+        principal,
+        ConsultationResponse,
+        consultation,
+        _treating(principal, consultation),
     )
 
 
@@ -454,17 +658,24 @@ async def close_consultation(
     response_model=ConsultationResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Agendar seguimiento: cierra esta consulta (firmada) y crea la hija agendada",
-    responses={**_NOT_FOUND, 409: {"description": "La consulta está asignada a otro médico."}},
+    responses={
+        **_NOT_FOUND,
+        403: {"description": "Nota de cierre enviada por quien no es el médico que atiende."},
+        409: {"description": "La consulta está asignada a otro médico."},
+    },
 )
 async def schedule_follow_up(
     consultation_id: uuid.UUID,
     payload: ScheduleFollowUpRequest,
     background_tasks: BackgroundTasks,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("consultations.close")),
 ) -> ConsultationResponse:
     """Cierra la consulta actual (firmada) y crea una consulta HIJA agendada para otra fecha,
-    continuando la cadena de seguimiento. Devuelve la consulta hija creada."""
+    continuando la cadena de seguimiento. Devuelve la consulta hija creada (con lo clínico en
+    claro solo para el médico tratante, que es quien la sigue). La nota de cierre solo la escribe
+    el médico tratante (403 si no)."""
     child = await consultations_service.schedule_follow_up(
         db,
         parent_id=consultation_id,
@@ -473,9 +684,12 @@ async def schedule_follow_up(
         signature=payload.signature,
         actor_user_id=principal.id,
         actor_is_admin=principal.is_admin,
+        actor_practices=clinical_access.practices_medicine(principal),
     )
     await _queue_appointment_email(background_tasks, db, child)
-    return child
+    return await _respond(
+        db, request, principal, ConsultationResponse, child, _treating(principal, child)
+    )
 
 
 @router.post(
@@ -483,17 +697,26 @@ async def schedule_follow_up(
     response_model=ConsultationResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Agendar con especialista: entrega esta consulta (derivada) y agenda con otro médico",
-    responses={**_NOT_FOUND, 409: {"description": "La consulta está asignada a otro médico."}},
+    responses={
+        **_NOT_FOUND,
+        403: {"description": "Quien refiere no es el médico que atiende el caso."},
+        409: {"description": "La consulta está asignada a otro médico."},
+    },
 )
 async def refer_to_specialist(
     consultation_id: uuid.UUID,
     payload: ScheduleReferralRequest,
     background_tasks: BackgroundTasks,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("consultations.close")),
 ) -> ConsultationResponse:
     """Deriva la consulta a OTRO médico: la actual queda 'referred_to_specialist' y se crea una
-    hija agendada asignada al especialista, con el motivo firmado. Devuelve la consulta hija."""
+    hija agendada asignada al especialista, con el motivo firmado. Solo refiere el médico
+    tratante (el motivo es clínico). Devuelve la consulta hija: como ya es del especialista, sale
+    con lo clínico en null (`clinical_access = "none"`); él la ve completa en su detalle.
+
+    El correo al especialista no lleva el motivo: solo fecha, código de caso y enlace."""
     child = await consultations_service.schedule_referral(
         db,
         parent_id=consultation_id,
@@ -503,13 +726,14 @@ async def refer_to_specialist(
         signature=payload.signature,
         actor_user_id=principal.id,
         actor_is_admin=principal.is_admin,
+        actor_practices=clinical_access.practices_medicine(principal),
     )
     await _queue_appointment_email(background_tasks, db, child)
-    # Email "te refirieron una cita" al especialista (si lo tiene habilitado; opt-out).
+    # Email "te refirieron una cita" al especialista (si lo tiene habilitado; opt-out). Sin el
+    # motivo: el correo sale del sistema y ningún texto clínico viaja por él.
     ref_text = (
         "Un colega te refirió un paciente para una cita.\n\n"
         f"Fecha y hora: {notifications.fmt_when(payload.scheduled_at)}\n"
-        f"Motivo: {payload.reason}\n"
         f"Código de caso: {child.code}\n\n"
         "Ingresa a tu agenda en Médicos por Venezuela.\n"
     )
@@ -522,24 +746,51 @@ async def refer_to_specialist(
     )
     if ref_args:
         background_tasks.add_task(notifications.send_mail, **ref_args)
-    return child
+    return await _respond(
+        db, request, principal, ConsultationResponse, child, _treating(principal, child)
+    )
 
 
 @router.get(
     "/{consultation_id}/chain",
     response_model=list[ChainItem],
     summary="Historial de la cadena de seguimiento (padre→hijas) de una consulta",
-    responses=_NOT_FOUND,
+    responses={
+        **_NOT_FOUND,
+        403: {"description": "Solo el médico que atiende el caso o el equipo admin."},
+    },
 )
 async def consultation_chain(
     consultation_id: uuid.UUID,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("consultations.read")),
+    principal: Principal = Depends(require_permission("consultations.read")),
 ) -> list[ChainItem]:
     """Todas las consultas de la cadena (raíz + descendientes) a la que pertenece esta consulta,
-    ordenadas — para ver el historial de seguimiento completo."""
+    ordenadas — para ver el historial de seguimiento completo.
+
+    Pertenencia sobre la consulta PEDIDA: su médico tratante la recibe con motivo y notas
+    (`full`), y también sus ANCESTROS (el especialista referido necesita las notas previas); el
+    admin, la cadena con lo clínico en null; cualquier otro médico, 403 (auditado).
+
+    El acceso se decide eslabón a eslabón: las hijas y las ramas hermanas (p. ej. la derivación
+    que tomó otro especialista) salen en null (`clinical_access = "none"`) salvo que quien llama
+    sea también el médico tratante de ESE eslabón. Solo se auditan los eslabones concedidos."""
+    requested = await consultations_service.get_consultation(db, consultation_id)  # 404
+    grant = await _treating_or_admin(db, request, principal, requested)
     chain = await consultations_service.get_chain(db, consultation_id)
-    return [ChainItem.model_validate(c) for c in chain]
+    lineage = (
+        consultations_service.lineage_ids(chain, consultation_id) if grant is not None else set()
+    )
+    grants = [grant if c.id in lineage else _treating(principal, c) for c in chain]
+    items = [
+        ChainItem.model_validate(c, context=clinical_context(g))
+        for c, g in zip(chain, grants, strict=True)
+    ]
+    await _audit_read(
+        db, request, principal, [(c.id, g) for c, g in zip(chain, grants, strict=True)]
+    )
+    return items
 
 
 @router.post(
@@ -555,6 +806,7 @@ async def consultation_chain(
 async def claim_consultation(
     consultation_id: uuid.UUID,
     background_tasks: BackgroundTasks,
+    request: Request,
     payload: ConsultationClaimRequest | None = None,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("queue.take")),
@@ -565,6 +817,9 @@ async def claim_consultation(
     La atención es **siempre por videoconsulta**: el mismo UPDATE crea la sala si el caso no
     tenía, y al paciente le sale el correo "tu médico ya está en la sala" con el enlace. El
     cuerpo es opcional; `{"via_whatsapp": true}` (el panel anterior) responde 422.
+
+    Al tomarlo pasa a ser su médico tratante: la respuesta trae lo clínico en claro (`full`) si
+    ejerce; un admin que no ejerce lo recibe en null.
     """
     del payload  # solo existe para rechazar `via_whatsapp: true` en la validación
     consultation = await consultations_service.claim_consultation(
@@ -577,7 +832,14 @@ async def claim_consultation(
     video_args = await notifications.video_ready_mail_args(db, consultation)
     if video_args:
         background_tasks.add_task(notifications.send_video_ready_email, **video_args)
-    return ConsultationResponse.model_validate(consultation)
+    return await _respond(
+        db,
+        request,
+        principal,
+        ConsultationResponse,
+        consultation,
+        _treating(principal, consultation),
+    )
 
 
 @router.post(
@@ -592,6 +854,7 @@ async def claim_consultation(
 async def start_scheduled_consultation(
     consultation_id: uuid.UUID,
     background_tasks: BackgroundTasks,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("queue.take")),
 ) -> ConsultationResponse:
@@ -600,14 +863,22 @@ async def start_scheduled_consultation(
     claim de la cola.
 
     Se puede iniciar en cualquier momento, aunque la cita sea para más tarde. El doble clic no
-    duplica nada: el UPDATE es condicional sobre `status == 'scheduled'` y el segundo da 409."""
+    duplica nada: el UPDATE es condicional sobre `status == 'scheduled'` y el segundo da 409.
+    Lo clínico de la respuesta, en claro solo para el médico tratante."""
     consultation = await consultations_service.start_scheduled_consultation(
         db, consultation_id, actor_user_id=principal.id, actor_is_admin=principal.is_admin
     )
     video_args = await notifications.video_ready_mail_args(db, consultation)
     if video_args:
         background_tasks.add_task(notifications.send_video_ready_email, **video_args)
-    return ConsultationResponse.model_validate(consultation)
+    return await _respond(
+        db,
+        request,
+        principal,
+        ConsultationResponse,
+        consultation,
+        _treating(principal, consultation),
+    )
 
 
 @router.post(
@@ -630,7 +901,8 @@ async def derive_consultation(
 ) -> ConsultationResponse:
     """Pasa un caso que nadie tomó a la cola de otra especialidad. Es el mismo caso: conserva
     su hora de llegada, así que el paciente no pierde el turno. Solo lo deriva quien lo ve en su
-    cola, y se le avisa al paciente por correo."""
+    cola, y se le avisa al paciente por correo. El caso sigue sin médico, así que la respuesta
+    va sin contenido clínico (`clinical_access = "none"`)."""
     consultation = await consultations_service.derive_in_queue(
         db,
         consultation_id,
@@ -640,7 +912,7 @@ async def derive_consultation(
         actor_is_admin=principal.is_admin,
     )
     await _queue_derivation_email(background_tasks, db, consultation)
-    return ConsultationResponse.model_validate(consultation)
+    return ConsultationResponse.model_validate(consultation, context=clinical_context(None))
 
 
 @router.post(
@@ -650,6 +922,7 @@ async def derive_consultation(
     summary="Derivar con especialista: cierra esta consulta y manda al paciente a otra cola",
     responses={
         **_NOT_FOUND,
+        403: {"description": "Quien deriva no es el médico que atiende el caso."},
         409: {"description": "La consulta no se está atendiendo o es de otro médico."},
         422: {"description": "Especialidad de destino inválida, igual a la actual o sin médicos."},
     },
@@ -664,7 +937,9 @@ async def refer_to_queue(
     """El médico que atiende deriva al paciente a otra especialidad, sin cita: su consulta queda
     `referred_to_specialist` (firmada, con el motivo) y se crea una consulta hija en la cola de
     la especialidad destino, con la hora de llegada original. La atiende el primer especialista
-    que la tome, que verá quién la derivó y por qué. Devuelve la consulta hija."""
+    que la tome, que verá quién la derivó y por qué. Solo deriva el médico tratante (el motivo es
+    clínico). Devuelve la consulta hija, que ya no es suya: sin contenido clínico
+    (`clinical_access = "none"`)."""
     child = await consultations_service.refer_to_queue(
         db,
         consultation_id,
@@ -673,9 +948,10 @@ async def refer_to_queue(
         signature=payload.signature,
         actor_user_id=principal.id,
         actor_is_admin=principal.is_admin,
+        actor_practices=clinical_access.practices_medicine(principal),
     )
     await _queue_derivation_email(background_tasks, db, child)
-    return ConsultationResponse.model_validate(child)
+    return ConsultationResponse.model_validate(child, context=clinical_context(None))
 
 
 @router.get(
@@ -764,8 +1040,10 @@ async def mark_entered_call(
 ) -> ConsultationResponse:
     """Registra `entered_call_at` una sola vez, si la consulta está en `waiting`/`in_progress`.
     Reemplaza la RPC mark_patient_entered_call. Sin sesión: el paciente en la sala puede no
-    estar autenticado, pero debe presentar el token de acceso de SU consulta."""
-    return await consultations_service.mark_entered_call(db, consultation_id)
+    estar autenticado, pero debe presentar el token de acceso de SU consulta. La respuesta va
+    sin contenido clínico (`clinical_access = "none"`): el token de sala no da acceso a él."""
+    consultation = await consultations_service.mark_entered_call(db, consultation_id)
+    return ConsultationResponse.model_validate(consultation, context=clinical_context(None))
 
 
 @router.post(
@@ -787,8 +1065,10 @@ async def ensure_video_room(
 ) -> ConsultationResponse:
     """Genera la sala Jitsi si no existe (mientras el caso siga en espera o en atención); si ya
     existe, devuelve la misma URL (idempotente). Exige el token de acceso de ESA consulta:
-    devolver la URL de una videoconsulta médica a quien solo conozca el id era el hallazgo M3."""
-    return await consultations_service.ensure_video_room(db, consultation_id)
+    devolver la URL de una videoconsulta médica a quien solo conozca el id era el hallazgo M3.
+    La respuesta va sin contenido clínico (`clinical_access = "none"`)."""
+    consultation = await consultations_service.ensure_video_room(db, consultation_id)
+    return ConsultationResponse.model_validate(consultation, context=clinical_context(None))
 
 
 # --- Eventos / auditoría de la consulta ---
@@ -798,15 +1078,29 @@ async def ensure_video_room(
     "/{consultation_id}/events",
     response_model=list[ConsultationEventResponse],
     summary="Listar eventos de la consulta (staff)",
-    responses=_NOT_FOUND,
+    responses={
+        **_NOT_FOUND,
+        403: {"description": "Solo el médico que atiende el caso o el equipo admin."},
+    },
 )
 async def list_consultation_events(
     consultation_id: uuid.UUID,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _: Principal = Depends(require_permission("consultations.read")),
+    principal: Principal = Depends(require_permission("consultations.read")),
 ) -> list[ConsultationEventResponse]:
-    """Historial de auditoría de la consulta (cronológico)."""
-    return await consultations_service.list_events(db, consultation_id)
+    """Historial de auditoría de la consulta (cronológico). Las notas de los eventos son del
+    médico: en claro para el médico tratante (`full`); el admin recibe el historial con `note`
+    en null; cualquier otro médico, 403 (auditado)."""
+    consultation = await consultations_service.get_consultation(db, consultation_id)  # 404
+    grant = await _treating_or_admin(db, request, principal, consultation)
+    events = await consultations_service.list_events(db, consultation_id)
+    items = [
+        ConsultationEventResponse.model_validate(e, context=clinical_context(grant))
+        for e in events
+    ]
+    await _audit_read(db, request, principal, [(consultation_id, grant)])
+    return items
 
 
 @router.post(
@@ -817,19 +1111,29 @@ async def list_consultation_events(
     responses={
         **_NOT_FOUND,
         400: {"description": "El `consultation_id` del cuerpo no coincide con la ruta."},
+        403: {"description": "Evento con `note` de quien no es el médico que atiende el caso."},
         409: {"description": "La consulta está asignada a otro médico."},
     },
 )
 async def create_consultation_event(
     consultation_id: uuid.UUID,
     payload: ConsultationEventCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("consultations.write")),
 ) -> ConsultationEventResponse:
-    return await consultations_service.create_event(
+    """Registra un evento en el historial del caso (autor = el JWT). Un evento con `note` solo lo
+    escribe el médico tratante (la nota es clínica); el admin registra eventos sin nota."""
+    event = await consultations_service.create_event(
         db,
         consultation_id,
         payload,
         created_by=principal.id,
         actor_is_admin=principal.is_admin,
+        actor_practices=clinical_access.practices_medicine(principal),
     )
+    consultation = await consultations_service.get_consultation(db, consultation_id)
+    grant = _treating(principal, consultation)
+    out = ConsultationEventResponse.model_validate(event, context=clinical_context(grant))
+    await _audit_read(db, request, principal, [(consultation_id, grant)])
+    return out

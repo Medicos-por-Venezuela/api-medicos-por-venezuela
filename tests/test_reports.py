@@ -309,7 +309,10 @@ async def test_patient_row_trae_ficha_origen_y_ultimo_caso(
     row = resp.json()["rows"][0]
     assert row["full_name"] == f"Paciente {marker}"
     assert row["origin"] == "Cola pública"
-    assert row["allergies"] == "Penicilina"
+    # Datos clínicos (cifrados): fuera del reporte, el super_admin no los lee.
+    assert "allergies" not in row and "description" not in row
+    columnas = {c["key"] for c in resp.json()["columns"]}
+    assert not columnas & {"allergies", "description"}
     assert row["needs_tags"] == "Fiebre"
     assert row["consent"] == "Sí"
     assert row["consultations_total"] == 2
@@ -662,12 +665,12 @@ async def test_export_sin_resultados_produce_un_libro_abrible(
 async def test_export_escribe_como_texto_lo_que_parece_una_formula(
     client: AsyncClient, super_admin, db_session: AsyncSession
 ) -> None:
-    """La descripción la escribe el paciente en el alta PÚBLICA, y la búsqueda de la portada la
+    """El nombre lo escribe el paciente en el alta PÚBLICA, y la búsqueda de la portada la
     teclea quien exporta. xlsxwriter, por defecto, escribe como fórmula todo texto que empiece por
     `=`: el Excel de un super_admin acababa con un `=HYPERLINK(...)` activo que puso un tercero."""
     marker = f"rep{uuid.uuid4().hex[:8]}"
     await _seed_patient(
-        db_session, marker, description='=HYPERLINK("https://phishing.example","Ver caso")'
+        db_session, marker, full_name='=HYPERLINK("https://phishing.example","Ver caso")'
     )
 
     resp = await client.get(
@@ -730,7 +733,9 @@ async def test_consultas_columnas_empiezan_por_las_del_monitor(
     cabeceras = [c["header"] for c in resp.json()["columns"]]
     assert cabeceras[:4] == ["Estado", "Médico asignado", "Paciente", "Tiempo en progreso"]
     assert cabeceras[4] == "Horas en progreso"
-    assert cabeceras[5] == "Motivo de consulta"
+    # El motivo de consulta ya no sale: es clínico (cifrado) y el super_admin no lo lee.
+    assert "Motivo de consulta" not in cabeceras
+    assert "chief_complaint" not in {c["key"] for c in resp.json()["columns"]}
 
 
 async def test_consulta_row_trae_paciente_medico_y_tiempo(
@@ -758,7 +763,7 @@ async def test_consulta_row_trae_paciente_medico_y_tiempo(
     assert row["patient"] == f"Paciente {marker}"
     assert row["elapsed"] == "4 horas"  # mismo texto que pinta el modal
     assert row["elapsed_hours"] == pytest.approx(4.0, abs=0.2)
-    assert row["chief_complaint"] == f"Motivo {marker}"
+    assert "chief_complaint" not in row
     assert row["patient_phone"] == "+584121111111"
 
 
@@ -869,8 +874,43 @@ async def test_export_de_consultas_es_un_xlsx_con_los_datos(
 
     cadenas = _shared_strings(resp.content)
     assert f"Paciente {marker}" in cadenas
-    assert f"Motivo {marker}" in cadenas
+    # El motivo es clínico (cifrado): ni la columna ni su texto llegan al Excel del admin.
+    assert f"Motivo {marker}" not in cadenas
+    assert "Motivo de consulta" not in cadenas
     assert "Tiempo en progreso" in cadenas
+
+
+async def test_busqueda_de_consultas_no_mira_el_motivo(
+    client: AsyncClient, super_admin, db_session: AsyncSession
+) -> None:
+    """El motivo está cifrado: un ILIKE sobre él no puede coincidir nunca, y además sería una
+    forma de sondear contenido clínico a ciegas. La búsqueda ya no lo incluye."""
+    marker = uuid.uuid4().hex[:10]
+    patient = await _seed_patient(db_session, marker)
+    await _seed_consultation(
+        db_session, marker, patient=patient, chief_complaint=f"solo-en-el-motivo-{marker}"
+    )
+    _, total = await _consultation_rows(client, super_admin, search=f"solo-en-el-motivo-{marker}")
+    assert total == 0
+
+
+async def test_export_de_pacientes_sin_descripcion_ni_alergias(
+    client: AsyncClient, super_admin, db_session: AsyncSession
+) -> None:
+    marker = f"rep{uuid.uuid4().hex[:8]}"
+    await _seed_patient(db_session, marker, allergies=f"Alergia {marker}")
+
+    resp = await client.get(
+        f"{PREFIX}/reports/patients/export",
+        headers=auth_headers(super_admin.id),
+        params={"search": marker},
+    )
+    assert resp.status_code == 200, resp.text
+    cadenas = _shared_strings(resp.content)
+    assert f"Paciente {marker}" in cadenas
+    assert f"Alergia {marker}" not in cadenas
+    assert "Caso de prueba" not in cadenas
+    assert "Alergias" not in cadenas and "Descripción del caso" not in cadenas
 
 
 async def test_export_de_consultas_trae_lo_mismo_que_la_vista_previa(

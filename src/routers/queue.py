@@ -6,21 +6,27 @@ el error de lock (fila bloqueada) en un 409 con mensaje específico de dominio.
 
 El médico que toma el caso es SIEMPRE el titular del JWT (no se confía en ids del
 cliente): evita IDOR.
+
+Contenido clínico: en la cola, SUMMARY (motivo) para el médico cuya cola incluye el caso; al
+tomarlo, el tratante lo recibe completo. El admin que no ejerce, en null. Cada lectura concedida
+queda en `audit_log` (`READ_CLINICAL_DATA`).
 """
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
 from src.core.exceptions import is_lock_not_available
+from src.core.observability import client_ip
 from src.core.security import Principal, require_permission
 from src.db.session import get_db
+from src.schemas.clinical import clinical_context
 from src.schemas.consultation import ConsultationResponse, QueueReleaseResponse
+from src.services import clinical_access, queue_access
 from src.services import queue as queue_service
-from src.services import queue_access
 
 router = APIRouter(prefix="/queue", tags=["queue"])
 tag_metadata = [
@@ -44,19 +50,52 @@ _LOCK_DETAIL = (
     summary="Board: consultas en espera",
 )
 async def list_queue(
+    request: Request,
     limit: int = Query(100, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("queue.read")),
 ) -> list[ConsultationResponse]:
     """Lista las consultas en espera sin asignar de las colas del médico (su especialidad y las
-    que tenga habilitadas; un admin ve todas), las más antiguas primero (FIFO)."""
+    que tenga habilitadas; un admin ve todas), las más antiguas primero (FIFO).
+
+    Solo el motivo (`clinical_access = "summary"`) y solo en los casos de SUS colas como médico;
+    las notas nunca. Un admin que no ejerce recibe lo clínico en null (`none`)."""
     scope = await queue_access.queue_scope(
         db,
         user_id=principal.id,
         specialty_id=principal.specialty_id,
         is_admin=principal.is_admin,
     )
-    return await queue_service.list_queue(db, scope, limit=limit)
+    items = await queue_service.list_queue(db, scope, limit=limit)
+    # El SUMMARY sale del alcance COMO MÉDICO (sin la vista global de admin): para un no-admin
+    # es el mismo `scope`; al admin se le calcula aparte.
+    clinical_scope = (
+        scope
+        if not principal.is_admin and clinical_access.practices_medicine(principal)
+        else await clinical_access.queue_grant(db, principal)
+    )
+    grants = [
+        clinical_access.grant_for_queue_item(
+            principal,
+            clinical_scope,
+            assigned_doctor_id=c.assigned_doctor_id,
+            specialty_id=c.specialty_id,
+            status=c.status,
+        )
+        for c in items
+    ]
+    rows = [
+        ConsultationResponse.model_validate(c, context=clinical_context(g))
+        for c, g in zip(items, grants, strict=True)
+    ]
+    await clinical_access.audit_clinical_read(
+        db,
+        principal=principal,
+        ip=client_ip(request),
+        resource="consultations",
+        grants=[(c.id, g) for c, g in zip(items, grants, strict=True)],
+    )
+    return rows
 
 
 @router.post(
@@ -72,11 +111,14 @@ async def list_queue(
 )
 async def take_consultation(
     consultation_id: uuid.UUID,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("queue.take")),
 ) -> ConsultationResponse:
     """Asignación **atómica anti-colisión** de una consulta en espera al médico
     autenticado. El ganador recibe `200`, el perdedor `409` (o `404`), sin colgarse.
+    Quien la toma queda como médico tratante: la respuesta trae lo clínico en claro (`full`) si
+    ejerce; un admin que no ejerce lo recibe en null.
     """
     scope = await queue_access.queue_scope(
         db,
@@ -85,12 +127,24 @@ async def take_consultation(
         is_admin=principal.is_admin,
     )
     try:
-        return await queue_service.take_consultation(db, consultation_id, principal.id, scope)
+        consultation = await queue_service.take_consultation(
+            db, consultation_id, principal.id, scope
+        )
     except DBAPIError as exc:
         if not is_lock_not_available(exc):
             raise
         await db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_LOCK_DETAIL) from None
+    grant = clinical_access.treating_doctor_grant(principal, consultation.assigned_doctor_id)
+    out = ConsultationResponse.model_validate(consultation, context=clinical_context(grant))
+    await clinical_access.audit_clinical_read(
+        db,
+        principal=principal,
+        ip=client_ip(request),
+        resource="consultations",
+        grants=[(consultation.id, grant)],
+    )
+    return out
 
 
 @router.post(

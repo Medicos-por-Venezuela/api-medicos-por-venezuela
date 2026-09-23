@@ -107,7 +107,11 @@ async def user_by_token(session: AsyncSession, token: uuid.UUID) -> Profile | No
 
 
 async def agenda_ics_for_user(session: AsyncSession, user: Profile) -> str:
-    """.ics de la agenda de `user`: médico → sus citas asignadas; paciente → las suyas."""
+    """.ics de la agenda de `user`: médico → sus citas asignadas; paciente → las suyas.
+
+    Sin motivo de consulta ni otro texto clínico: el feed lo sondea Google/Apple/Outlook por una
+    URL sin JWT y el evento queda copiado en su nube (tasks/cifrado-datos-clinicos/spec.md). El
+    código basta para encontrar el caso en el panel."""
     if user.role in ("doctor", "specialist"):
         consults = await consultations_service.list_agenda(session, doctor_user_id=user.id)
         events = [
@@ -115,11 +119,7 @@ async def agenda_ics_for_user(session: AsyncSession, user: Profile) -> str:
                 "uid": f"{c.id}@{_UID_DOMAIN}",
                 "start": c.scheduled_at,
                 "summary": f"Cita: {c.patient_name or 'Paciente'}",
-                "description": (
-                    f"Paciente: {c.patient_name or 'N/D'}\n"
-                    f"Motivo: {c.chief_complaint or 'N/D'}\n"
-                    f"Código: {c.code}"
-                ),
+                "description": f"Paciente: {c.patient_name or 'N/D'}\nCódigo: {c.code}",
             }
             for c in consults
             if c.scheduled_at
@@ -133,11 +133,7 @@ async def agenda_ics_for_user(session: AsyncSession, user: Profile) -> str:
             "start": c.scheduled_at,
             "summary": "Cita médica"
             + (f" con {c.assigned_doctor_name}" if c.assigned_doctor_name else ""),
-            "description": (
-                f"Médico: {c.assigned_doctor_name or 'Por asignar'}\n"
-                f"Motivo: {c.chief_complaint or 'N/D'}\n"
-                f"Código: {c.code}"
-            ),
+            "description": f"Médico: {c.assigned_doctor_name or 'Por asignar'}\nCódigo: {c.code}",
         }
         for c in consults
         if c.scheduled_at

@@ -19,6 +19,11 @@ def _prod_secrets(monkeypatch) -> None:
     monkeypatch.setattr(
         main_module.settings, "CONSULTATION_TOKEN_SECRET", "un-secreto-real-de-produccion"
     )
+    monkeypatch.setattr(
+        main_module.settings,
+        "CLINICAL_DATA_ENCRYPTION_KEY",
+        "cHJvZHVjY2lvbi1jbGF2ZS1jbGluaWNhLTMyYnl0ZXM=",
+    )
 
 
 async def test_lifespan_falla_en_prod_si_service_role_key_default(monkeypatch) -> None:
@@ -95,3 +100,33 @@ async def test_lifespan_ok_en_dev_aunque_cors_sea_wildcard(monkeypatch) -> None:
 
     async with main_module.lifespan(main_module.app):
         pass
+
+
+async def test_lifespan_falla_en_prod_si_clave_clinica_default(monkeypatch) -> None:
+    """La clave clínica por defecto está en el repo: en prod cifraría con una clave pública."""
+    monkeypatch.setattr(main_module, "_IS_PROD", True)
+    _prod_secrets(monkeypatch)
+    monkeypatch.setattr(
+        main_module.settings,
+        "CLINICAL_DATA_ENCRYPTION_KEY",
+        main_module._INSECURE_CLINICAL_KEY_DEFAULT,
+    )
+
+    with pytest.raises(RuntimeError, match="CLINICAL_DATA_ENCRYPTION_KEY"):
+        async with main_module.lifespan(main_module.app):
+            pass
+
+
+async def test_lifespan_clave_clinica_default_con_espacio_tambien_falla(monkeypatch) -> None:
+    """Un salto de línea al final de la env no debe colar la clave pública de desarrollo."""
+    monkeypatch.setattr(main_module, "_IS_PROD", True)
+    _prod_secrets(monkeypatch)
+    monkeypatch.setattr(
+        main_module.settings,
+        "CLINICAL_DATA_ENCRYPTION_KEY",
+        main_module._INSECURE_CLINICAL_KEY_DEFAULT + "\n",
+    )
+
+    with pytest.raises(RuntimeError, match="CLINICAL_DATA_ENCRYPTION_KEY"):
+        async with main_module.lifespan(main_module.app):
+            pass

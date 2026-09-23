@@ -4,12 +4,17 @@ Dos vistas distintas por seguridad:
 - `InterconsultationResponse`: la ve el médico que ATIENDE (a quién invitó).
 - `InterconsultationForInvitee`: la ve el médico INVITADO — SOLO motivo, notas y edad del paciente,
   el video para unirse, y nada de identidad (sin nombre/cédula/teléfono/zona).
+
+Los campos clínicos (motivo, notas, nota de la invitación) salen cifrados de la BD y solo se
+descifran con el permiso que concede el router (ver src/schemas/clinical.py).
 """
 
 import uuid
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from src.schemas.clinical import ClinicalAccessMixin, ClinicalNote, ClinicalSummary
 
 __all__ = [
     "InterconsultationCreate",
@@ -26,7 +31,7 @@ class InterconsultationCreate(BaseModel):
     note: str | None = Field(default=None, max_length=1000)
 
 
-class InterconsultationResponse(BaseModel):
+class InterconsultationResponse(ClinicalAccessMixin):
     """Vista del médico que ATIENDE: a quién invitó y el estado. La consulta sigue abierta."""
 
     model_config = ConfigDict(from_attributes=True)
@@ -38,22 +43,22 @@ class InterconsultationResponse(BaseModel):
     invited_doctor_name: str | None = None
     created_by_id: uuid.UUID
     status: str
-    note: str | None = None
+    note: ClinicalNote = None
     created_at: datetime
 
 
-class InterconsultationForInvitee(BaseModel):
+class InterconsultationForInvitee(ClinicalAccessMixin):
     """Vista del médico INVITADO: SOLO lo clínicamente relevante, sin identidad del paciente.
     Único dato del paciente: la edad (`patient_age_range`)."""
 
     id: uuid.UUID
     consultation_id: uuid.UUID
     status: str
-    note: str | None = None  # mensaje/razón del médico que invitó
+    note: ClinicalNote = None  # mensaje/razón del médico que invitó
     # Datos de la consulta que el invitado necesita para dar la segunda opinión.
-    chief_complaint: str | None = None  # motivo
-    internal_note: str | None = None  # notas del médico
-    clinical_notes: str | None = None  # notas clínicas
+    chief_complaint: ClinicalSummary = None  # motivo
+    internal_note: ClinicalNote = None  # notas del médico
+    clinical_notes: ClinicalNote = None  # notas clínicas
     # ÚNICO dato del paciente que se expone.
     patient_age_range: str | None = None  # edad
     # Para unirse a la misma videoconsulta que el médico que atiende.

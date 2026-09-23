@@ -7,6 +7,8 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
+from src.schemas.clinical import ClinicalAccessMixin, ClinicalSummary
+
 
 class PatientBase(BaseModel):
     full_name: str = Field(..., min_length=2, max_length=200)
@@ -62,8 +64,9 @@ class PatientUpdate(BaseModel):
     age_range: str | None = None
     email: EmailStr | None = None
     needs_tags: list[str] | None = None
-    description: str | None = None
-    allergies: str | None = None
+    # Clínicos: solo los escribe el médico que trata al paciente (403 al resto, ver el servicio).
+    description: str | None = Field(default=None, max_length=2000)
+    allergies: str | None = Field(default=None, max_length=500)
     parent_id: uuid.UUID | None = None
     parentesco: str | None = None
     # Opcionales en la actualización (misma validación que el alta si se envían).
@@ -122,8 +125,15 @@ class DoctorPatientUpdate(BaseModel):
     emergency_phone: str | None = Field(default=None, min_length=5, max_length=30)
 
 
-class PatientResponse(PatientBase):
+class PatientResponse(PatientBase, ClinicalAccessMixin):
+    """Ficha del paciente. `description` y `allergies` son clínicos (cifrados en la BD): salen
+    en null salvo que el router conceda acceso (el propio paciente o un médico que lo trata).
+    El admin gestiona la ficha pero no lee su contenido clínico."""
+
     model_config = ConfigDict(from_attributes=True)
+
+    description: ClinicalSummary = None
+    allergies: ClinicalSummary = None
 
     # `str` y no `EmailStr` a propósito (mismo criterio que DoctorResponse.email): FastAPI valida
     # también la RESPUESTA, así que una sola fila histórica con un email mal formado hacía fallar

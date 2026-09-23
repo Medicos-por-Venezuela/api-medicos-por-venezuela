@@ -4,9 +4,14 @@ Foco de seguridad: el médico INVITADO ve solo motivo, notas y edad — NUNCA la
 paciente (nombre/cédula/teléfono/zona).
 """
 
+import uuid
+
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.models.audit_log import AuditLog
+from src.services.clinical_access import READ_CLINICAL_DATA
 from tests._helpers import GENERAL, add_doctor, any_specialty_id, auth_headers
 
 PREFIX = "/api/v1"
@@ -85,7 +90,10 @@ async def test_la_interconsulta_se_persiste_de_verdad(
         db_session.commit = original_commit  # type: ignore[method-assign]
 
     assert resp.status_code == 201, resp.text
-    assert commits == 1, (
+    # Dos commits: el del alta y el de la traza `READ_CLINICAL_DATA` (la respuesta devuelve la
+    # nota en claro al que atiende, y esa lectura se audita con su propio commit). Si alguien
+    # quita el del alta, queda 1 y esto se pone rojo.
+    assert commits == 2, (
         "create_interconsultation no commiteó: get_db hace rollback al cerrar la sesión, así que "
         "la fila se descarta aunque la API responda 201 con un id real (bug de prod 2026-08-02)"
     )
@@ -177,3 +185,111 @@ async def test_cannot_invite_self(client: AsyncClient, db_session: AsyncSession)
         headers=auth_headers(attending.id),
     )
     assert resp.status_code == 409
+
+
+# --- Contenido clínico: equipo tratante del caso, admin redactado, resto 403 -----------------
+
+
+async def _lecturas(db: AsyncSession, actor_id, outcome: str = "granted") -> list[AuditLog]:
+    filas = (
+        await db.execute(
+            select(AuditLog).where(
+                AuditLog.action == READ_CLINICAL_DATA,
+                AuditLog.actor_user_id == actor_id,
+                AuditLog.resource == "consultations",
+            )
+        )
+    ).scalars()
+    return [f for f in filas if f.metadata_["outcome"] == outcome]
+
+
+async def _con_interconsulta(client: AsyncClient, db_session: AsyncSession):
+    attending = await add_doctor(db_session, specialty=GENERAL)
+    invited = await add_doctor(db_session, specialty=GENERAL)
+    cid = await _consultation_with_patient(client)
+    await _claim(client, cid, attending.id)
+    resp = await client.post(
+        f"{PREFIX}/interconsultations",
+        json={"consultation_id": cid, "invited_doctor_id": str(invited.id), "note": "revisa ECG"},
+        headers=auth_headers(attending.id),
+    )
+    assert resp.status_code == 201, resp.text
+    return attending, invited, cid, resp.json()
+
+
+async def test_el_que_atiende_recibe_su_nota_y_el_invitado_el_caso_auditado(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    attending, invited, cid, creada = await _con_interconsulta(client, db_session)
+    assert creada["note"] == "revisa ECG"
+    assert creada["clinical_access"] == "full"
+
+    me = await client.get(f"{PREFIX}/interconsultations/me", headers=auth_headers(invited.id))
+    assert me.status_code == 200, me.text
+    (item,) = me.json()
+    assert item["chief_complaint"] == "Dolor de pecho"
+    assert item["note"] == "revisa ECG"
+    assert item["clinical_access"] == "full"
+
+    (entrada,) = await _lecturas(db_session, invited.id)
+    assert entrada.metadata_["via"] == "interconsultation"
+    assert entrada.metadata_["ids"] == [cid]
+    assert entrada.resource_id == cid
+    assert entrada.metadata_["tiers"] == ["notes", "summary"]
+
+
+async def test_for_consultation_tratante_ve_la_nota_admin_redactado(
+    client: AsyncClient, db_session: AsyncSession, admin_identity
+) -> None:
+    attending, _, cid, _ = await _con_interconsulta(client, db_session)
+
+    suya = await client.get(
+        f"{PREFIX}/interconsultations/for-consultation/{cid}", headers=auth_headers(attending.id)
+    )
+    assert suya.status_code == 200, suya.text
+    assert suya.json()["note"] == "revisa ECG"
+    assert suya.json()["clinical_access"] == "full"
+
+    # El admin opera (ve que existe, a quién se invitó y el estado) sin leer la nota.
+    admin = await client.get(f"{PREFIX}/interconsultations/for-consultation/{cid}")
+    assert admin.status_code == 200, admin.text
+    assert admin.json()["note"] is None
+    assert admin.json()["clinical_access"] == "none"
+    assert admin.json()["status"] == "active"
+    assert await _lecturas(db_session, admin_identity.id) == []
+
+
+async def test_for_consultation_otro_medico_403_y_queda_auditado(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Cierra la brecha: antes bastaba ser staff para leer la interconsulta de cualquier caso.
+    Tampoco el INVITADO entra por acá: su vista (datos limitados) es `/interconsultations/me`."""
+    _, invited, cid, _ = await _con_interconsulta(client, db_session)
+    otro = await add_doctor(db_session, specialty=GENERAL)
+
+    for intruso in (otro, invited):
+        resp = await client.get(
+            f"{PREFIX}/interconsultations/for-consultation/{cid}",
+            headers=auth_headers(intruso.id),
+        )
+        assert resp.status_code == 403, resp.text
+        assert "revisa" not in resp.text
+        (denegada,) = await _lecturas(db_session, intruso.id, outcome="denied")
+        assert denegada.resource_id == cid
+
+
+async def test_for_consultation_sin_interconsulta_y_consulta_inexistente(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    attending = await add_doctor(db_session, specialty=GENERAL)
+    cid = await _consultation_with_patient(client)
+    await _claim(client, cid, attending.id)
+
+    vacia = await client.get(
+        f"{PREFIX}/interconsultations/for-consultation/{cid}", headers=auth_headers(attending.id)
+    )
+    assert vacia.status_code == 200
+    assert vacia.json() is None
+
+    inexistente = await client.get(f"{PREFIX}/interconsultations/for-consultation/{uuid.uuid4()}")
+    assert inexistente.status_code == 404
