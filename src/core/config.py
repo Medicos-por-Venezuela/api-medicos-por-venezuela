@@ -213,7 +213,7 @@ class Settings(BaseSettings):
     # correo masivo, y un 429 ahí es un médico que quería participar y se va. El abuso cuesta
     # poco en comparación —no llega a ningún médico ni entra a la cola; como mucho, filas basura
     # en un listado—, así que el tope solo tiene que frenar un script, no a una campaña.
-    # Ojo: si detrás del proxy la API no ve la IP real del cliente, este tope lo comparten TODOS
+    # Hasta que uvicorn confió en Caddy (docs/proxy-e-ip-real.md) este tope lo compartían TODOS
     # los que respondían a la vez; ahora es por IP, pero una oficina o un NAT móvil siguen
     # compartiendo IP, así que no se ajusta al volumen de una sola persona.
     SURVEY_RESPONSE_RATE_LIMIT: str = "60/minute"
