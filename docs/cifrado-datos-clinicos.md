@@ -56,17 +56,28 @@ en SQL) y `address_encrypted` (ya va cifrada de extremo a extremo con otro esque
    Desde ese momento todo lo que se escribe se guarda cifrado; lo viejo se sigue leyendo
    (en claro en la base, pero ya enmascarado para quien no tiene permiso).
 3. Backfill de lo histórico, en horario de baja demanda (cada fila cifrada dispara un evento de
-   Realtime y el panel de los médicos refresca):
+   Realtime y el panel de los médicos refresca). Todo corre en un contenedor efímero de la imagen
+   recién desplegada (`run --rm`), con el mismo `.env.production` que la API, desde el directorio
+   del repo en el EC2:
    ```bash
-   # KID = el que la API deja en su log de arranque ("Clave clínica activa: kid=…").
-   docker compose -f docker-compose.prod.yml run --rm api python scripts/encrypt_clinical_data.py --dry-run --expect-kid KID
-   docker compose -f docker-compose.prod.yml run --rm api python scripts/encrypt_clinical_data.py --expect-kid KID
-   docker compose -f docker-compose.prod.yml run --rm api python scripts/encrypt_clinical_data.py --verify --expect-kid KID
+   cd ~/api-medicos-por-venezuela            # o donde esté el repo en el EC2
+   C="docker compose -f docker-compose.prod.yml run --rm api python scripts/encrypt_clinical_data.py"
+
+   # kid de la clave con la que arrancó la API (no es secreto):
+   KID=$(docker logs mpv-api 2>&1 | grep -o 'kid=[0-9a-f]*' | tail -1 | cut -d= -f2); echo "$KID"
+
+   $C --dry-run --expect-kid "$KID"                          # cuenta lo pendiente, no escribe
+   $C --expect-kid "$KID" --operator tu.correo@dominio.org   # cifra (queda en audit_log)
+   $C --verify --expect-kid "$KID"                           # exit 0 = nada en claro
+   $C --vacuum                                               # borra de disco las versiones en claro
    ```
-   `--expect-kid` evita el peor error posible: correrlo desde una shell sin la env y cifrar
-   producción con la clave de desarrollo (que está en el repo). Por si acaso, el script se niega
-   a usar la clave de desarrollo contra una base remota. Una fila que no descifra (clave ajena,
-   manipulada) no aborta la corrida: se informa por id, sin contenido, y el script sale con 1.
+   - `--expect-kid` evita el peor error: cifrar producción con la clave de desarrollo (está en el
+     repo). Además, el script se niega a usar esa clave contra una base remota.
+   - `--operator` es obligatorio al escribir: la corrida queda en `audit_log` como
+     `clinical_data.bulk_encrypt`, con una fila al empezar y otra al terminar (o al fallar).
+   - Una fila que no descifra (clave ajena, manipulada) no aborta la corrida: se informa por id,
+     sin contenido, y el script sale con 1.
+   - Es idempotente: si se corta, se vuelve a lanzar el mismo comando.
 4. Desplegar el frontend (rama `dev_aws`) con el marcador de confidencial y sin la edición de la
    nota del médico en el panel admin.
 5. PR aparte: mover `db/post-backfill/20260923_134911_clinical_ciphertext_checks_despues_del_backfill.sql`
@@ -82,16 +93,25 @@ del SQL Editor. Justo donde no debe estar.
 
 Si tras el backfill hay que volver a una API anterior al cifrado (que no sabe leer `enc:v1:`):
 
-1. Si ya se aplicaron los `CHECK` de `db/post-backfill/`, quitarlos (el script se niega a
-   descifrar mientras existan).
-2. Desplegar la API anterior.
-3. Descifrar todo, incluido lo que la API nueva haya escrito mientras tanto:
+1. **Antes de nada, conservar la imagen con cifrado.** `deploy.sh` reconstruye siempre la misma
+   etiqueta (`api-medicos-por-venezuela`): al desplegar la versión vieja, la nueva —la única que
+   trae el script— desaparece.
    ```bash
-   docker compose -f docker-compose.prod.yml run --rm api python scripts/encrypt_clinical_data.py --decrypt --yes --expect-kid KID
-   docker compose -f docker-compose.prod.yml run --rm api python scripts/encrypt_clinical_data.py --decrypt --verify
+   docker tag api-medicos-por-venezuela api-medicos-por-venezuela:cifrado
+   KID=$(docker logs mpv-api 2>&1 | grep -o 'kid=[0-9a-f]*' | tail -1 | cut -d= -f2); echo "$KID"
    ```
-   Ojo: el script tiene que correr con la imagen NUEVA (la vieja no lo trae) y con la clave.
-   Deja la base otra vez en claro: es una medida de emergencia, no un estado para quedarse.
+2. Si ya se aplicaron los `CHECK` de `db/post-backfill/`, quitarlos (el script se niega a
+   descifrar mientras existan).
+3. Desplegar la API anterior (`./deploy.sh <rama o commit anterior>`).
+4. Descifrar todo con la imagen conservada, incluido lo que la API nueva escribió mientras tanto:
+   ```bash
+   D="docker run --rm --env-file .env.production api-medicos-por-venezuela:cifrado python scripts/encrypt_clinical_data.py"
+   $D --decrypt --dry-run --expect-kid "$KID"
+   $D --decrypt --yes --expect-kid "$KID" --operator tu.correo@dominio.org
+   $D --decrypt --verify
+   ```
+   Queda en `audit_log` como `clinical_data.bulk_decrypt`. Deja la base otra vez en claro: es
+   una medida de emergencia, no un estado para quedarse.
 
 ## Ensayo con copia de producción (2026-09-23)
 
@@ -135,6 +155,18 @@ where action = 'READ_CLINICAL_DATA'
   and (resource_id = 'X' or metadata->'ids' ? 'X')
 order by created_at desc;
 ```
+
+```sql
+-- ¿Quién corrió el script de cifrado / descifrado masivo, y qué hizo?
+select created_at, action, metadata->>'phase' as fase, metadata->>'operator' as operador,
+       metadata->>'total' as filas, metadata->>'host' as host, correlation_id
+from audit_log
+where resource = 'clinical_data'
+order by created_at desc;
+```
+
+Una corrida con `started` y sin `finished` ni `failed` es una corrida cortada (el proceso murió):
+lo que alcanzó a hacer está escrito, lote a lote, y basta con relanzarla.
 
 Se auditan como `denied` los 403 sobre un recurso concreto: detalle, cadena y eventos de una
 consulta, interconsulta de una consulta, ficha de paciente y solicitudes de interconsulta.

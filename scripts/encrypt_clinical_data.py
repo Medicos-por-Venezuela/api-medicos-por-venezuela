@@ -23,15 +23,23 @@ claro en la base, así que exige `--yes`, y se niega si ya están los CHECK de
 `--decrypt --yes` (lo que la API nueva escribió cifrado mientras tanto también se descifra) y
 `--decrypt --verify`. Se puede repetir.
 
+Auditoría: toda corrida que ESCRIBE (cifrar o `--decrypt --yes`) exige `--operator` (quién la
+lanza) y deja en `audit_log` una fila `clinical_data.bulk_encrypt` / `clinical_data.bulk_decrypt`
+ANTES de tocar datos (si no se puede escribir, no toca nada) y otra al terminar con los conteos
+—o con el error, si falla a mitad—, unidas por el mismo `correlation_id`. El script corre fuera
+de la API, así que sin esto un descifrado masivo no dejaría rastro. No frena a quien tenga la
+clave y escriba su propio código: deja constancia de los usos legítimos.
+
 Uso (con el mismo .env / DATABASE_URL que la API):
   uv run python scripts/encrypt_clinical_data.py --generate-key   # clave nueva, no toca la BD
   uv run python scripts/encrypt_clinical_data.py --dry-run        # cuenta lo pendiente
-  uv run python scripts/encrypt_clinical_data.py                  # cifra
+  uv run python scripts/encrypt_clinical_data.py --operator yo@x  # cifra
   uv run python scripts/encrypt_clinical_data.py --verify         # exit 1 si queda algo
-  uv run python scripts/encrypt_clinical_data.py --decrypt --dry-run   # cuenta lo cifrado
-  uv run python scripts/encrypt_clinical_data.py --decrypt --yes       # ROLLBACK: descifra
-  uv run python scripts/encrypt_clinical_data.py --decrypt --verify    # exit 1 si queda cifrado
-En producción, desde la imagen desplegada:
+  uv run python scripts/encrypt_clinical_data.py --vacuum         # VACUUM FULL de las tablas
+  uv run python scripts/encrypt_clinical_data.py --decrypt --dry-run                # cuenta
+  uv run python scripts/encrypt_clinical_data.py --decrypt --yes --operator yo@x    # ROLLBACK
+  uv run python scripts/encrypt_clinical_data.py --decrypt --verify   # exit 1 si queda cifrado
+En producción, desde la imagen desplegada (ver docs/cifrado-datos-clinicos.md):
   docker compose -f docker-compose.prod.yml run --rm api python scripts/encrypt_clinical_data.py
 """
 
@@ -39,7 +47,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
+import json
+import socket
 import sys
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -145,6 +157,42 @@ async def process(
         result.raced += len(ids) - len(updated)
 
 
+async def audit_run(
+    conn, *, run_id: str, action: str, operator: str, phase: str, detail: dict
+) -> None:
+    """Una fila en `audit_log` (append-only). Si el operador es el correo de una cuenta, queda
+    también como `actor_user_id` para cruzarlo con el resto de su actividad."""
+    actor = await conn.fetchval(
+        "select id from public.users where lower(email) = lower($1) limit 1", operator
+    )
+    metadata = {
+        "phase": phase,
+        "operator": operator,
+        # Dentro de un contenedor son el usuario del contenedor y su id: poco útiles solos,
+        # pero distinguen una corrida desde el EC2 de una desde el portátil de alguien.
+        "os_user": getpass.getuser(),
+        "host": socket.gethostname(),
+        **detail,
+    }
+    await conn.execute(
+        "insert into public.audit_log (actor_user_id, action, resource, metadata, correlation_id) "
+        "values ($1, $2, 'clinical_data', $3::jsonb, $4)",
+        actor,
+        action,
+        json.dumps(metadata),
+        run_id,
+    )
+
+
+async def vacuum(conn) -> None:
+    """`VACUUM (FULL, ANALYZE)` de las tablas con columnas cifradas: un UPDATE deja la versión
+    vieja de la fila (en claro, antes del backfill) en disco hasta que se reescribe la tabla.
+    Toma un lock exclusivo por tabla; con el volumen actual son milisegundos."""
+    for table in sorted({t.table for t in encrypted_targets()}):
+        await conn.execute(f'vacuum (full, analyze) public."{table}"')
+        print(f"  VACUUM FULL {table}: OK")
+
+
 async def run(args: argparse.Namespace) -> int:
     import asyncpg
 
@@ -162,11 +210,30 @@ async def run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    writes = not (args.dry_run or args.verify or args.vacuum)
+    operator = (args.operator or "").strip()
+    if writes and len(operator) < 3:
+        print(
+            "Esta corrida escribe datos clínicos: indica quién la lanza con --operator "
+            "(tu correo). Queda en audit_log.",
+            file=sys.stderr,
+        )
+        return 2
     targets = encrypted_targets()
     print(f"Clave activa: {kid}. Columnas cifradas: {len(targets)}.")
     conn = await asyncpg.connect(**_connect_kwargs())
+    if args.vacuum:
+        try:
+            await vacuum(conn)
+        finally:
+            await conn.close()
+        return 0
     total = 0
     unreadable = 0
+    counts: dict[str, int] = {}
+    raced_total = 0
+    run_id = uuid.uuid4().hex
+    action = "clinical_data.bulk_decrypt" if args.decrypt else "clinical_data.bulk_encrypt"
     try:
         if args.decrypt and not (args.dry_run or args.verify):
             checks = await conn.fetchval(
@@ -179,6 +246,17 @@ async def run(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 2
+        if writes:
+            # Antes de tocar nada: si el audit no se puede escribir, la corrida no empieza.
+            await audit_run(
+                conn,
+                run_id=run_id,
+                action=action,
+                operator=operator,
+                phase="started",
+                detail={"kid": kid},
+            )
+            print(f"Corrida auditada: {action} (correlation_id {run_id}).")
         for t in targets:
             r = await process(
                 conn,
@@ -189,6 +267,9 @@ async def run(args: argparse.Namespace) -> int:
             )
             total += r.done
             unreadable += len(r.unreadable)
+            raced_total += r.raced
+            if r.done:
+                counts[t.field] = r.done
             if r.done or r.raced:
                 done_verb = "descifradas" if args.decrypt else "cifradas"
                 verb = "pendientes" if (args.dry_run or args.verify) else done_verb
@@ -197,6 +278,47 @@ async def run(args: argparse.Namespace) -> int:
             if r.unreadable:
                 muestra = ", ".join(r.unreadable[:10])
                 print(f"  {t.field}: {len(r.unreadable)} INDESCIFRABLES (ids: {muestra})")
+        if writes:
+            await audit_run(
+                conn,
+                run_id=run_id,
+                action=action,
+                operator=operator,
+                phase="finished",
+                detail={
+                    "kid": kid,
+                    "total": total,
+                    "counts": counts,
+                    "raced": raced_total,
+                    "unreadable": unreadable,
+                },
+            )
+    except Exception as exc:
+        if writes:
+            # Lo que alcanzó a procesarse ya está escrito, lote a lote: que conste hasta dónde.
+            # Si la conexión es lo que falló, este audit también fallará: se avisa y se deja
+            # subir el error original, que es el que el operador necesita ver.
+            try:
+                await audit_run(
+                    conn,
+                    run_id=run_id,
+                    action=action,
+                    operator=operator,
+                    phase="failed",
+                    detail={
+                        "kid": kid,
+                        "total": total,
+                        "counts": counts,
+                        "error": type(exc).__name__,
+                    },
+                )
+            except Exception:
+                print(
+                    f"No se pudo auditar el fallo (correlation_id {run_id}): consta solo el "
+                    "inicio de la corrida.",
+                    file=sys.stderr,
+                )
+        raise
     finally:
         await conn.close()
     if args.verify:
@@ -232,12 +354,22 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--dry-run", action="store_true", help="Solo cuenta lo pendiente.")
     mode.add_argument("--verify", action="store_true", help="Exit 1 si queda algo pendiente.")
     mode.add_argument("--generate-key", action="store_true", help="Imprime una clave nueva.")
+    mode.add_argument(
+        "--vacuum",
+        action="store_true",
+        help="VACUUM (FULL, ANALYZE) de las tablas cifradas (tras el backfill).",
+    )
     parser.add_argument(
         "--decrypt",
         action="store_true",
         help="ROLLBACK: descifra y deja las columnas en claro (con --yes, --dry-run o --verify).",
     )
     parser.add_argument("--yes", action="store_true", help="Confirma --decrypt.")
+    parser.add_argument(
+        "--operator",
+        help="Quién lanza la corrida (su correo). Obligatorio al cifrar o descifrar: va al "
+        "audit_log.",
+    )
     parser.add_argument("--batch-size", type=int, default=200)
     parser.add_argument(
         "--expect-kid",
