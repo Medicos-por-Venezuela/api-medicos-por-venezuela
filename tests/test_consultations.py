@@ -1624,3 +1624,65 @@ async def test_un_caso_cancelado_o_cerrado_sin_medico_no_da_motivo_por_cola(
     leidos = {i for r in await _lecturas(db_session, dual.id) for i in r.metadata_["ids"]}
     assert casos["waiting"] in leidos
     assert casos["cancelled"] not in leidos and casos["closed"] not in leidos
+
+
+async def test_listado_paginado_disjunto_con_desempate_por_id(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """ "Cargar más" en admin/pacientes pagina con skip/limit. Cinco casos del mismo paciente
+    creados en la misma transacción comparten created_at: el orden entre ellos lo decide el id
+    (descendente), sin repetir ni omitir ninguno entre páginas."""
+    patient_id = await _create_patient(client, "Paciente Paginado")
+    sembrados = []
+    for _ in range(5):
+        c = Consultation(patient_id=uuid.UUID(patient_id))
+        db_session.add(c)
+        await db_session.flush()
+        sembrados.append(str(c.id))
+
+    vistos: list[str] = []
+    for skip in range(0, 6, 2):
+        page = await client.get(
+            f"{PREFIX}/consultations",
+            params={"patient_id": patient_id, "skip": skip, "limit": 2},
+        )
+        assert page.status_code == 200, page.text
+        vistos.extend(c["id"] for c in page.json())
+
+    assert len(vistos) == len(set(vistos)) == 5
+    assert vistos == sorted(sembrados, reverse=True)
+
+
+async def test_admin_deja_la_traza_admin_update_pero_no_notas_clinicas(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Regresión 2026-09-23: "Gestionar caso" hace PATCH (entraba) y luego registra un evento
+    `admin_update` con "Estado: …; médico: …". Ese evento daba 403 por llevar nota y el panel
+    decía "No se pudo actualizar el caso". La traza operativa sí; una nota clínica, no."""
+    cid, _ = await _caso_atendido(client, db_session)
+
+    traza = await client.post(
+        f"{PREFIX}/consultations/{cid}/events",
+        json={
+            "consultation_id": cid,
+            "event_type": "admin_update",
+            "note": "Estado: Cerrada; médico: Sin asignar",
+        },
+    )
+    assert traza.status_code == 201, traza.text
+    assert traza.json()["note"] is None  # se guarda, pero se lee como nota del tratante
+
+    clinica = await client.post(
+        f"{PREFIX}/consultations/{cid}/events",
+        json={"consultation_id": cid, "event_type": "note", "note": "Sospecha de angina"},
+    )
+    assert clinica.status_code == 403
+
+    raw = await db_session.scalar(
+        text(
+            "select note from consultation_events where consultation_id = :id "
+            "and event_type = 'admin_update' order by created_at desc limit 1"
+        ),
+        {"id": cid},
+    )
+    assert raw.startswith("enc:v1:")

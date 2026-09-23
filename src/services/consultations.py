@@ -41,6 +41,8 @@ _OPEN_ASSIGNED_STATUSES = ("in_progress", "contacted_whatsapp")
 _ROOM_STATUSES = ("waiting", *_OPEN_ASSIGNED_STATUSES)
 # Evento que deja escrito quién derivó un caso a otra cola y por qué.
 DERIVED_EVENT = "derived"
+# Traza operativa que deja el panel (admin o médico) al cambiar estado, médico o especialidad.
+ADMIN_UPDATE_EVENT = "admin_update"
 # Campos clínicos que se escriben por PATCH: solo los toca el médico tratante (ni el admin).
 _CLINICAL_UPDATE_FIELDS = frozenset({"chief_complaint", "clinical_notes", "internal_note"})
 
@@ -84,7 +86,13 @@ async def list_consultations(
     if not viewer_is_staff:
         # Un paciente solo ve las consultas ligadas a su propia cuenta (RLS select_own).
         stmt = stmt.where(Patient.user_id == viewer_user_id)
-    stmt = stmt.order_by(Consultation.created_at.desc()).offset(skip).limit(limit)
+    # Desempate por id: consultas creadas en la misma transacción comparten created_at, y sin
+    # columna única el OFFSET de "Cargar más" en admin/pacientes podía repetir u omitir casos.
+    stmt = (
+        stmt.order_by(Consultation.created_at.desc(), Consultation.id.desc())
+        .offset(skip)
+        .limit(limit)
+    )
     rows = (await session.execute(stmt)).all()
     consultations = []
     for row in rows:
@@ -1110,9 +1118,12 @@ async def create_event(
     _ensure_can_manage(consultation, created_by, actor_is_admin)
     if data.consultation_id != consultation_id:
         raise BadRequestError("El consultation_id del cuerpo no coincide con el de la ruta.")
-    # La nota de un evento es texto clínico: solo la escribe el médico tratante. El admin puede
-    # registrar eventos sin nota (p. ej. un cambio de estado).
-    if data.note is not None:
+    # La nota de un evento es texto clínico: solo la escribe el médico tratante. Excepción:
+    # `admin_update`, la traza que deja el panel al cambiar estado/médico/especialidad ("Estado:
+    # Cerrada (Ana)"). Sin ella, el PATCH del admin entraba pero el evento daba 403 y el panel
+    # decía "No se pudo actualizar el caso" (regresión del 2026-09-23). La nota se sigue guardando
+    # cifrada y leyéndose como nota clínica.
+    if data.note is not None and data.event_type != ADMIN_UPDATE_EVENT:
         _ensure_can_write_clinical(consultation, created_by, actor_practices)
     # created_by SIEMPRE del JWT (no del body) — anti-IDOR.
     event = ConsultationEvent(
