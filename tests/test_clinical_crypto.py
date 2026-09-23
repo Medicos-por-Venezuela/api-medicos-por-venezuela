@@ -444,3 +444,134 @@ async def test_backfill_no_pisa_lo_que_la_api_escribe_durante_la_corrida(
     assert result.raced >= 1
     raw, _ = await _raw(db_session, patient.id)
     assert raw == nuevo  # lo de la API sobrevive
+
+
+# --- Auditoría de las corridas del script ---
+
+
+class _SinCerrar:
+    """La conexión del test para `run()`: misma transacción (todo se deshace) y `close()` no-op."""
+
+    def __init__(self, conn) -> None:
+        self._conn = conn
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    async def close(self) -> None:
+        return None
+
+
+def _args(**overrides):
+    import argparse
+
+    base = {
+        "dry_run": False,
+        "verify": False,
+        "vacuum": False,
+        "decrypt": False,
+        "yes": False,
+        "operator": None,
+        "expect_kid": None,
+        "batch_size": 200,
+    }
+    return argparse.Namespace(**{**base, **overrides})
+
+
+async def _corridas(session: AsyncSession) -> list:
+    """Filas de las corridas del script, en orden de escritura (el id no es secuencial, pero dentro
+    de una misma transacción `created_at` es igual: se desempata por la fase)."""
+    stmt = text(
+        "select action, actor_user_id, metadata, correlation_id from audit_log "
+        "where resource = 'clinical_data' "
+        "order by created_at, array_position(array['started','finished','failed'], "
+        "metadata->>'phase')"
+    )
+    return (await session.execute(stmt)).all()
+
+
+def test_escribir_sin_operador_no_corre(capsys) -> None:
+    """Cifrar o descifrar sin decir quién lo hace no toca la base (sale antes de conectar)."""
+    assert backfill.main([]) == 2
+    assert "--operator" in capsys.readouterr().err
+    assert backfill.main(["--decrypt", "--yes"]) == 2
+    assert "--operator" in capsys.readouterr().err
+
+
+async def test_corrida_queda_auditada_al_empezar_y_al_terminar(
+    db_session: AsyncSession, monkeypatch
+) -> None:
+    import asyncpg
+
+    operador = "operador.cifrado@example.org"
+    cuenta = Profile(
+        id=uuid.uuid4(), full_name="Operador", role="admin", role_chosen=True, email=operador
+    )
+    db_session.add(cuenta)
+    patient = await _patient(db_session)
+    await db_session.execute(
+        text("update patients set allergies = 'legado' where id = :id"), {"id": patient.id}
+    )
+    conn = await _asyncpg(db_session)
+
+    async def _connect(**_):
+        return _SinCerrar(conn)
+
+    monkeypatch.setattr(asyncpg, "connect", _connect)
+
+    assert await backfill.run(_args(operator=operador)) == 0
+
+    filas = await _corridas(db_session)
+    assert [f.metadata["phase"] for f in filas][-2:] == ["started", "finished"]
+    inicio, fin = filas[-2], filas[-1]
+    assert inicio.correlation_id == fin.correlation_id
+    assert inicio.action == fin.action == "clinical_data.bulk_encrypt"
+    assert inicio.actor_user_id == cuenta.id  # el correo se cruza con su cuenta
+    assert fin.metadata["operator"] == operador
+    assert fin.metadata["counts"]["patients.allergies"] >= 1
+    assert fin.metadata["kid"] == clinical_crypto.keyring().active_kid
+    raw = await db_session.scalar(
+        text("select allergies from patients where id = :id"), {"id": patient.id}
+    )
+    assert raw.startswith("enc:v1:")
+
+
+async def test_corrida_que_falla_deja_constancia(db_session: AsyncSession, monkeypatch) -> None:
+    import asyncpg
+
+    conn = await _asyncpg(db_session)
+
+    async def _connect(**_):
+        return _SinCerrar(conn)
+
+    async def _revienta(*_, **__):
+        raise RuntimeError("se cayó a mitad")
+
+    monkeypatch.setattr(asyncpg, "connect", _connect)
+    monkeypatch.setattr(backfill, "process", _revienta)
+
+    with pytest.raises(RuntimeError):
+        await backfill.run(_args(decrypt=True, yes=True, operator="alguien@example.org"))
+
+    filas = await _corridas(db_session)
+    assert [f.metadata["phase"] for f in filas][-2:] == ["started", "failed"]
+    assert filas[-1].action == "clinical_data.bulk_decrypt"
+    assert filas[-1].metadata["error"] == "RuntimeError"
+    assert filas[-1].actor_user_id is None  # correo sin cuenta: queda solo en metadata
+
+
+async def test_contar_o_verificar_no_escribe_audit(db_session: AsyncSession, monkeypatch) -> None:
+    import asyncpg
+
+    conn = await _asyncpg(db_session)
+
+    async def _connect(**_):
+        return _SinCerrar(conn)
+
+    monkeypatch.setattr(asyncpg, "connect", _connect)
+    antes = len(await _corridas(db_session))
+
+    await backfill.run(_args(dry_run=True))
+    await backfill.run(_args(decrypt=True, verify=True))
+
+    assert len(await _corridas(db_session)) == antes
