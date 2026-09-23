@@ -97,6 +97,21 @@ bloqueara. Desde la migración `20260914_111456`:
   que valide pertenencia. Cambiar el criterio de credencial = cambiar `_blocked_reason` Y
   `doctor_can_practice` en el mismo PR.
 
+## 🩻 Contenido clínico: cifrado en reposo y descifrado por objeto
+Desde 2026-09-23 el contenido clínico (motivo, notas, antecedentes, alergias, notas de eventos
+e interconsultas, récipes…) se guarda cifrado con AES-256-GCM (`src/core/clinical_crypto.py`,
+clave solo en `CLINICAL_DATA_ENCRYPTION_KEY`). Ver `docs/cifrado-datos-clinicos.md`.
+- **Columna clínica nueva = `EncryptedText("tabla.columna")`** en el modelo. Al leer, el ORM
+  devuelve `Sealed`, no `str`: `str()`/f-strings dan `[INFORMACIÓN MÉDICA CONFIDENCIAL]`.
+- **Esquema de salida = `ClinicalSummary` / `ClinicalNote`** + `ClinicalAccessMixin`. Sin
+  `context=clinical_context(grant)` salen en null (fail-closed). El grant lo decide
+  `src/services/clinical_access.py`; **ser admin nunca concede lectura clínica**.
+- Toda lectura concedida → `audit_clinical_read` (`READ_CLINICAL_DATA`); un 403 sobre un caso
+  concreto → `audit_clinical_denied`.
+- Escribir `chief_complaint`/`internal_note`/`clinical_notes` es solo del médico tratante.
+- Nada de `WHERE`/`ILIKE`/`ORDER BY` sobre columnas cifradas, ni texto clínico en correos,
+  `.ics`, reportes Excel o logs.
+
 ## 🚪 Cuentas de Auth sin registro
 Estar en Supabase Auth no da acceso. `GET /auth/me` expone `has_account_record` (ficha viva en
 `doctors` o paciente vivo en `patients`) y el login del frontend rechaza a quien no lo tiene, salvo
@@ -148,7 +163,7 @@ Se lee con `GET /audit-log` (permiso `audit.read`). Cuando escribas una acción 
   error de cara al cliente.
 - Los **backups** (`backups/`) contienen PII real: están en `.gitignore` y **jamás** se versionan
   ni se suben a servicios externos.
-- `internal_note` / `clinical_notes` son de staff: no exponerlas a pacientes.
+- `internal_note` / `clinical_notes` son del equipo tratante: ni pacientes ni admins.
 
 ## 🚫 Protección de Producción
 - **No** hagas INSERT/UPDATE/DELETE de prueba contra Supabase (producción). Verifica contra el

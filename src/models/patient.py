@@ -8,7 +8,9 @@ from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
+from src.core.clinical_crypto import Sealed
 from src.db.base import Base
+from src.db.encrypted import EncryptedText
 
 
 class Patient(Base):
@@ -29,7 +31,9 @@ class Patient(Base):
     needs_tags: Mapped[list[str]] = mapped_column(
         ARRAY(Text), nullable=False, server_default=text("'{}'")
     )
-    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    description: Mapped[Sealed | None] = mapped_column(
+        EncryptedText("patients.description"), nullable=True
+    )
     consent: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # En producción user_id referencia auth.users(id) (cuenta opcional del paciente).
@@ -37,7 +41,9 @@ class Patient(Base):
     age_range: Mapped[str | None] = mapped_column(String, nullable=True)
     cedula: Mapped[str | None] = mapped_column(String, nullable=True)
     email: Mapped[str | None] = mapped_column(String, nullable=True)
-    allergies: Mapped[str | None] = mapped_column(Text, nullable=True)
+    allergies: Mapped[Sealed | None] = mapped_column(
+        EncryptedText("patients.allergies"), nullable=True
+    )
     address_encrypted: Mapped[str | None] = mapped_column(
         Text, nullable=True
     )  # Cifrado E2E (v1:base64 sealed box). La API NUNCA la descifra.

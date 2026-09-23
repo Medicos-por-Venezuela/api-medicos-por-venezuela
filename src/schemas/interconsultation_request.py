@@ -4,6 +4,10 @@ Estos modelos **son** la frontera de datos del feature, no un envoltorio de ella
 especialista puede ver antes y después de tomar un caso está definido por qué campos declara
 cada clase. Un campo que no está acá no puede escaparse aunque el servicio lo traiga.
 Ver tasks/interconsulta-asincrona/spec.md.
+
+Además, el motivo y las notas están cifrados en la BD (`ClinicalSummary` / `ClinicalNote`): salen
+en null salvo que el router conceda acceso. El inbox (antes de tomar) ve el motivo pero no las
+notas; el médico tratante y el especialista que tomó el caso ven ambos; el admin, nada.
 """
 
 import uuid
@@ -11,6 +15,8 @@ from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from src.schemas.clinical import ClinicalAccessMixin, ClinicalNote, ClinicalSummary
 
 
 class DoctorContact(BaseModel):
@@ -65,7 +71,7 @@ class InterconsultationRequestCreate(BaseModel):
         return self
 
 
-class InterconsultationRequestInbox(BaseModel):
+class InterconsultationRequestInbox(ClinicalAccessMixin):
     """Lo que ve el ESPECIALISTA **antes** de tomar el caso. Anonimizado.
 
     Esta clase ES la frontera de datos, no un filtro sobre ella: los campos prohibidos no están
@@ -82,8 +88,10 @@ class InterconsultationRequestInbox(BaseModel):
     id: uuid.UUID
     specialty_id: uuid.UUID
     specialty_name: str | None = None
-    chief_complaint: str
-    clinical_notes: str | None = None
+    # Nivel SUMMARY (como la cola): el motivo sí, para decidir si lo toma. Las notas clínicas
+    # son del equipo tratante y salen en null hasta que lo tome.
+    chief_complaint: ClinicalSummary = None
+    clinical_notes: ClinicalNote = None
     # Solo el RANGO etario, nunca la fecha de nacimiento: alcanza para valorar el caso.
     patient_age_range: str | None = None
     # Si la solicitud venía dirigida a este especialista en concreto (modo 'doctor').
@@ -91,7 +99,7 @@ class InterconsultationRequestInbox(BaseModel):
     created_at: datetime
 
 
-class InterconsultationRequestTaken(BaseModel):
+class InterconsultationRequestTaken(ClinicalAccessMixin):
     """Lo que recibe el especialista **al tomar** el caso: el contacto del médico TRATANTE.
 
     Es el objetivo de todo el flujo — que los dos médicos se hablen fuera de la plataforma. Se
@@ -104,8 +112,8 @@ class InterconsultationRequestTaken(BaseModel):
     status: str
     taken_at: datetime
     specialty_name: str | None = None
-    chief_complaint: str
-    clinical_notes: str | None = None
+    chief_complaint: ClinicalSummary = None
+    clinical_notes: ClinicalNote = None
     patient_age_range: str | None = None
     requesting_doctor: DoctorContact
 
@@ -118,7 +126,7 @@ class InterconsultationRequestClose(BaseModel):
     closing_note: str | None = Field(default=None, max_length=2000)
 
 
-class InterconsultationRequestResponse(BaseModel):
+class InterconsultationRequestResponse(ClinicalAccessMixin):
     """Lo que ve el MÉDICO TRATANTE de su propia solicitud: todo lo suyo.
 
     Incluye el nombre de su paciente (es su paciente) y, si el caso fue tomado, la identidad y
@@ -133,8 +141,8 @@ class InterconsultationRequestResponse(BaseModel):
     mode: str
     specialty_id: uuid.UUID
     specialty_name: str | None = None
-    chief_complaint: str
-    clinical_notes: str | None = None
+    chief_complaint: ClinicalSummary = None
+    clinical_notes: ClinicalNote = None
     status: str
     # Cuántos especialistas elegibles fueron notificados. Alimenta el "se avisó a N colegas"
     # de la UI y, si alguien dice "no me llegó", distingue el fallo de envío del "no eras

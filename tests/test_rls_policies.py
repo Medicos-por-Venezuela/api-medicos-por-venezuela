@@ -217,3 +217,67 @@ async def _assert_permission_denied(
     with pytest.raises(DBAPIError, match="permission denied"):
         async with session.begin_nested():
             await session.execute(text(sql), params or {})
+
+
+_CLINICAL_TABLES = (
+    "prescriptions",
+    "referrals",
+    "rest_notes",
+    "treatment_plans",
+    "follow_ups",
+    "messages",
+    "interconsultations",
+    "interconsultation_requests",
+    "consultation_events",
+)
+
+
+async def test_tablas_clinicas_sin_policies_abiertas(db_session: AsyncSession) -> None:
+    """20260923_134911: `treatment_plans` y `messages` traían policies `USING (true)` para
+    `public` desde el esquema original. Ninguna tabla clínica puede tener una."""
+    abiertas = (
+        await db_session.execute(
+            text(
+                "select tablename, policyname from pg_policies "
+                "where schemaname = 'public' and tablename = any(:t)"
+            ),
+            {"t": list(_CLINICAL_TABLES)},
+        )
+    ).all()
+    assert abiertas == []
+
+
+async def test_navegador_no_lee_ni_escribe_tablas_clinicas(db_session: AsyncSession) -> None:
+    """Ni `anon` ni `authenticated` tienen privilegio alguno: ni SELECT, ni INSERT, ni
+    TRUNCATE (que ignora la RLS)."""
+    grants = (
+        await db_session.execute(
+            text(
+                "select table_name, grantee, privilege_type "
+                "from information_schema.role_table_grants "
+                "where table_schema = 'public' and grantee in ('anon', 'authenticated') "
+                "and table_name = any(:t)"
+            ),
+            {"t": [*_CLINICAL_TABLES, "consultations", "patients"]},
+        )
+    ).all()
+    assert grants == []
+
+
+async def test_realtime_conserva_solo_la_metadata_administrativa(
+    db_session: AsyncSession,
+) -> None:
+    """La señal de Realtime sigue viva: SELECT por columna en id/status/assigned_doctor_id y
+    nada del payload clínico."""
+    columnas = set(
+        (
+            await db_session.scalars(
+                text(
+                    "select column_name from information_schema.column_privileges "
+                    "where table_schema = 'public' and table_name = 'consultations' "
+                    "and grantee = 'authenticated' and privilege_type = 'SELECT'"
+                )
+            )
+        ).all()
+    )
+    assert columnas == {"id", "status", "assigned_doctor_id"}

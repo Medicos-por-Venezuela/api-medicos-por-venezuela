@@ -108,3 +108,9 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
                 "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
             )
         return response
+
+
+def client_ip(request: Request | None) -> str | None:
+    """IP del cliente para el audit_log. Detrás de Caddy es la del proxy salvo que uvicorn
+    confíe en sus cabeceras (`FORWARDED_ALLOW_IPS`, ver docs/cifrado-datos-clinicos.md)."""
+    return request.client.host if request is not None and request.client else None

@@ -217,6 +217,7 @@ async def test_la_cola_del_panel_expone_las_alergias(
     assert resp.status_code == 200, resp.text
     row = next(c for c in resp.json()["waiting"] if c["id"] == cid)
     assert row["patient"]["allergies"] == "Penicilina"
+    assert row["clinical_access"] == "summary"  # motivo y antecedentes, nunca notas
     # Sigue SIN nombre: las alergias se suman al card anónimo, no lo destapan.
     assert "full_name" not in row["patient"]
 
@@ -228,10 +229,13 @@ async def test_close_consultation_creates_event(client: AsyncClient) -> None:
     cid = await _consultation(client, ["Medicina general"])
     await client.post(f"{PREFIX}/queue/{cid}/take")
 
-    resp = await client.post(
+    # El client es admin: la nota de cierre es clínica y no la escribe (403); cierra sin ella.
+    con_nota = await client.post(
         f"{PREFIX}/consultations/{cid}/close",
         json={"outcome": "closed", "note": "Atendido"},
     )
+    assert con_nota.status_code == 403, con_nota.text
+    resp = await client.post(f"{PREFIX}/consultations/{cid}/close", json={"outcome": "closed"})
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "closed"
     assert resp.json()["closed_at"] is not None

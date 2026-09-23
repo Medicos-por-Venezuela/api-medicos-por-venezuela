@@ -152,8 +152,8 @@ PATIENT_COLUMNS: tuple[Column, ...] = (
     Column("email", "Email", 30),
     Column("affected_zone", "Zona afectada", 22),
     Column("needs_tags", "Necesidades", 34),
-    Column("description", "Descripción del caso", 50),
-    Column("allergies", "Alergias", 26),
+    # Sin `description` ni `allergies`: son datos clínicos cifrados y el super_admin no los lee
+    # (tasks/cifrado-datos-clinicos/spec.md). El Excel es PII de contacto, no historia clínica.
     Column("origin", "Origen", 16),
     Column("registered_by", "Registrado por (médico)", 26),
     Column("consent", "Consentimiento", 14),
@@ -172,11 +172,11 @@ PATIENT_COLUMNS: tuple[Column, ...] = (
 )
 
 
-# Las CINCO primeras columnas son, en orden, las del modal "Consultas en progreso" del
-# dashboard. Es deliberado: el informe tiene que ser reconocible como "esa tabla" para quien lo
-# pidió. Lo que viene después es lo que una tabla en pantalla no necesita y una hoja de cálculo
-# sí — el código para cruzar con otros informes, las fechas para ordenar, y el contacto para
-# actuar sin volver al panel.
+# Las primeras columnas son, en orden, las del modal "Consultas en progreso" del dashboard
+# (menos el motivo, que es clínico). Es deliberado: el informe tiene que ser reconocible como
+# "esa tabla" para quien lo pidió. Lo que viene después es lo que una tabla en pantalla no
+# necesita y una hoja de cálculo sí — el código para cruzar con otros informes, las fechas para
+# ordenar, y el contacto para actuar sin volver al panel.
 CONSULTATION_COLUMNS: tuple[Column, ...] = (
     Column("status", "Estado", 22),
     Column("doctor", "Médico asignado", 26),
@@ -186,7 +186,7 @@ CONSULTATION_COLUMNS: tuple[Column, ...] = (
     # "4 horas" y "40 min" no se comparan como texto, y lo primero que hace cualquiera con este
     # informe es buscar los casos que llevan más tiempo abiertos.
     Column("elapsed_hours", "Horas en progreso", 16),
-    Column("chief_complaint", "Motivo de consulta", 60),
+    # Sin "Motivo de consulta": es contenido clínico cifrado y el admin no lo lee.
     Column("code", "Código", 16),
     Column("priority", "Prioridad", 12),
     Column("specialty", "Especialidad solicitada", 24),
@@ -533,8 +533,6 @@ def _patient_row(r) -> dict:
         "email": p.email,
         "affected_zone": p.affected_zone,
         "needs_tags": ", ".join(p.needs_tags or []),
-        "description": p.description,
-        "allergies": p.allergies,
         "origin": "Consultorio" if p.created_by_doctor_id else "Cola pública",
         "registered_by": r.registered_by,
         "consent": _si_no(p.consent),
@@ -640,7 +638,6 @@ def consultations_query(filters: ConsultationFilters) -> Select:
             or_(
                 Patient.full_name.ilike(like),
                 Consultation.code.ilike(like),
-                Consultation.chief_complaint.ilike(like),
                 doctor.full_name.ilike(like),
             )
         )
@@ -667,7 +664,6 @@ def _consultation_row(r) -> dict:
         "patient": r.patient_name,
         "elapsed": _elapsed_label(delta),
         "elapsed_hours": round(delta.total_seconds() / 3600, 1) if delta else None,
-        "chief_complaint": c.chief_complaint,
         "code": c.code,
         "priority": c.priority,
         "specialty": r.specialty_name,
@@ -705,7 +701,7 @@ def describe_consultation_filters(
             ("Médico asignado", doctor_name),
             ("Sin médico asignado", _si_no(f.unassigned, unknown="")),
             ("Especialidad", specialty_name),
-            ("Búsqueda (paciente/código/motivo/médico)", f.search),
+            ("Búsqueda (paciente/código/médico)", f.search),
             ("Creadas desde", f.created_from),
             ("Creadas hasta", f.created_to),
         ]
@@ -1007,8 +1003,8 @@ async def export_consultations(
 ) -> bytes:
     """El `.xlsx` de consultas que cumplen el filtro (población completa) + su entrada de audit.
 
-    Incluye el motivo de consulta, que es contenido clínico escrito por el paciente. Misma
-    sensibilidad que el reporte de pacientes y el mismo gate."""
+    Sin motivo de consulta (contenido clínico cifrado): lleva PII de contacto del paciente, así
+    que tiene el mismo gate que el reporte de pacientes."""
     report = await consultations_report(session, filters, limit=MAX_EXPORT_ROWS + 1)
     guard_export_size(report.total)
     await log_export(

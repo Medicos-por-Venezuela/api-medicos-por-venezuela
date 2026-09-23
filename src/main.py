@@ -5,6 +5,7 @@ en la app Next.js conectada directamente a Supabase. Documentación interactiva 
 `/docs` (Swagger UI) y `/redoc` — deshabilitada en ENVIRONMENT=production.
 """
 
+import base64
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -15,6 +16,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
 
+from src.core import clinical_crypto
 from src.core.config import settings
 from src.core.exceptions import register_exception_handlers
 from src.core.observability import (
@@ -33,6 +35,8 @@ _IS_PROD = settings.ENVIRONMENT == "production"
 _INSECURE_JWT_DEFAULT = "dev-insecure-jwt-secret-change-me"
 _INSECURE_SERVICE_ROLE_DEFAULT = "dev-insecure-service-role-key-change-me"
 _INSECURE_CONSULTATION_TOKEN_DEFAULT = "dev-insecure-consultation-token-secret-change-me"
+_INSECURE_CLINICAL_KEY_DEFAULT = "ZGV2LWluc2VjdXJlLWNsaW5pY2FsLWtleS0zMmJ5dGU="
+_INSECURE_CLINICAL_KID = clinical_crypto.key_id(base64.b64decode(_INSECURE_CLINICAL_KEY_DEFAULT))
 
 
 @asynccontextmanager
@@ -55,6 +59,17 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
             "CONSULTATION_TOKEN_SECRET tiene el valor por defecto inseguro. Configúralo en "
             "producción: con él se firman los accesos a las salas de los pacientes anónimos."
         )
+    # Por kid y no por string: un espacio o salto de línea al final de la env pasaría una
+    # comparación de texto y luego `_decode_key` lo recortaría a la clave de desarrollo.
+    # Además valida formato y longitud de la clave (y de las anteriores) al arrancar.
+    clinical_ring = clinical_crypto.Keyring.from_config(
+        settings.CLINICAL_DATA_ENCRYPTION_KEY, settings.CLINICAL_DATA_ENCRYPTION_PREVIOUS_KEYS
+    )
+    if _IS_PROD and clinical_ring.active_kid == _INSECURE_CLINICAL_KID:
+        raise RuntimeError(
+            "CLINICAL_DATA_ENCRYPTION_KEY tiene el valor por defecto (público). Configura la "
+            "clave real de producción: con ella se cifran motivos y notas clínicas."
+        )
     # El default de BACKEND_CORS_ORIGINS es "*" y el middleware va con allow_credentials=True:
     # si la env no se setea en prod, se aceptarían credenciales desde cualquier origen.
     if _IS_PROD and "*" in settings.cors_origins:
@@ -63,6 +78,8 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
             "Define la lista explícita de orígenes del frontend, separados por comas."
         )
     logger.info("CORS origins efectivos: %s", settings.cors_origins)
+    # El kid no es secreto (8 hex del SHA-256): sirve para `encrypt_clinical_data.py --expect-kid`.
+    logger.info("Clave clínica activa: kid=%s", clinical_ring.active_kid)
     logger.info(
         "Mail (Mailtrap): %s",
         "habilitado" if settings.MAILTRAP_API_TOKEN else "deshabilitado (sin MAILTRAP_API_TOKEN)",

@@ -200,7 +200,9 @@ def consultation_filters(
         None, description="true = solo casos sin médico asignado · false = solo asignados."
     ),
     search: str | None = Query(
-        None, description="Paciente, código, motivo de consulta o médico (ILIKE)."
+        None,
+        description="Paciente, código o médico (ILIKE). El motivo de consulta está cifrado y "
+        "no se puede buscar.",
     ),
     created_from: date | None = Query(
         None, description="Creadas desde esta fecha (inclusive, hora de Venezuela)."
@@ -341,8 +343,9 @@ async def export_patients_report(
     """El `.xlsx` con **todos** los pacientes que cumplen el filtro: mismos filtros, mismas
     columnas, sin `limit`.
 
-    Incluye alergias, descripción del caso y teléfono: es la extracción de PII médica más
-    sensible de la API. Queda en `audit_log` como `report.exported`."""
+    Incluye cédula y teléfonos: es la extracción de PII más sensible de la API. No incluye la
+    descripción del caso ni las alergias (datos clínicos cifrados, fuera del alcance del admin).
+    Queda en `audit_log` como `report.exported`."""
     return xlsx_download(
         await reports_service.export_patients(db, filters, **export_actor(principal)),
         export_filename("pacientes"),
@@ -368,8 +371,9 @@ async def preview_consultations_report(
     """Una página del reporte de consultas, con las columnas que tendrá el Excel y el `total`
     exacto de filas que cumplen el filtro.
 
-    Las cinco primeras columnas son, en orden, las del modal **Consultas en progreso** del
-    dashboard (estado, médico asignado, paciente, tiempo en progreso y motivo); detrás vienen
+    Las primeras columnas son, en orden, las del modal **Consultas en progreso** del
+    dashboard (estado, médico asignado, paciente y tiempo en progreso), sin el motivo: es
+    contenido clínico cifrado y el admin no lo lee. Detrás vienen
     las que una hoja de cálculo necesita y una tabla en pantalla no: el código para cruzar con
     otros informes, las fechas para ordenar y el teléfono para actuar sin volver al panel.
 
@@ -402,8 +406,8 @@ async def export_consultations_report(
     """El `.xlsx` con **todas** las consultas que cumplen el filtro: mismos filtros, mismas
     columnas, sin `limit`.
 
-    Incluye el motivo de consulta, que es contenido clínico escrito por el paciente. Queda
-    registrado en `audit_log` como `report.exported`."""
+    No incluye el motivo de consulta (contenido clínico cifrado). Lleva teléfonos del paciente
+    y queda registrado en `audit_log` como `report.exported`."""
     return xlsx_download(
         await reports_service.export_consultations(db, filters, **export_actor(principal)),
         export_filename("consultas"),

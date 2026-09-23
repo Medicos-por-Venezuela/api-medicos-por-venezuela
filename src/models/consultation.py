@@ -8,7 +8,9 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
+from src.core.clinical_crypto import Sealed
 from src.db.base import Base
+from src.db.encrypted import EncryptedText
 
 # Estados permitidos según consultations_status_check.
 CONSULTATION_STATUSES = {
@@ -54,9 +56,15 @@ class Consultation(Base):
     derived_from_specialty_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("specialties.id"), nullable=True
     )
-    chief_complaint: Mapped[str | None] = mapped_column(Text, nullable=True)
-    clinical_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
-    internal_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    chief_complaint: Mapped[Sealed | None] = mapped_column(
+        EncryptedText("consultations.chief_complaint"), nullable=True
+    )
+    clinical_notes: Mapped[Sealed | None] = mapped_column(
+        EncryptedText("consultations.clinical_notes"), nullable=True
+    )
+    internal_note: Mapped[Sealed | None] = mapped_column(
+        EncryptedText("consultations.internal_note"), nullable=True
+    )
     referred_specialty: Mapped[str | None] = mapped_column(String, nullable=True)
     platform_used: Mapped[str | None] = mapped_column(String, nullable=True)
     meeting_link: Mapped[str | None] = mapped_column(String, nullable=True)
