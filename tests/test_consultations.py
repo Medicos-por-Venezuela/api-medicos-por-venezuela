@@ -10,6 +10,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
+from src.models.audit_log import AuditLog
 from src.models.consultation import Consultation
 from src.models.patient import Patient
 from src.models.profile import Profile
@@ -19,7 +20,9 @@ from tests._helpers import (
     add_doctor,
     any_specialty_id,
     auth_headers,
+    grant_roles,
     make_profile,
+    specialty_id_by_name,
     valid_patient_payload,
 )
 
@@ -60,10 +63,8 @@ async def test_consultation_crud_and_code_autogeneration(client: AsyncClient) ->
     assert listed.status_code == 200
     assert any(c["id"] == cid for c in listed.json())
 
-    # Patch estado
-    patched = await client.patch(
-        f"{PREFIX}/consultations/{cid}", json={"status": "closed", "internal_note": "ok"}
-    )
+    # Patch estado (el client es admin: gestiona el estado, no las notas clínicas).
+    patched = await client.patch(f"{PREFIX}/consultations/{cid}", json={"status": "closed"})
     assert patched.status_code == 200
     assert patched.json()["status"] == "closed"
 
@@ -254,10 +255,11 @@ async def test_consultation_events(client: AsyncClient) -> None:
         )
     ).json()["id"]
 
-    # Crear evento (consultation_id coincide)
+    # Crear evento (consultation_id coincide). El client es admin: registra eventos SIN nota
+    # (la nota es clínica y solo la escribe el médico tratante).
     ok = await client.post(
         f"{PREFIX}/consultations/{cid}/events",
-        json={"consultation_id": cid, "event_type": "status_change", "note": "abierta"},
+        json={"consultation_id": cid, "event_type": "status_change"},
     )
     assert ok.status_code == 201, ok.text
 
@@ -781,7 +783,7 @@ async def test_doctor_no_puede_inyectar_eventos_en_consulta_ajena(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     """Anti-IDOR en eventos: el historial del caso solo lo escribe el médico asignado
-    (o un admin) — sin esto, cualquier doctor podía fabricar un evento 'closed' falso."""
+    (o un admin, sin nota) — sin esto, cualquier doctor podía fabricar un evento 'closed' falso."""
     dr_a = await add_doctor(db_session, specialty=GENERAL)
     dr_b = await add_doctor(db_session, specialty=GENERAL)
     cid = await _consultation_assigned_to(client, db_session, str(dr_b.id))
@@ -798,12 +800,21 @@ async def test_doctor_no_puede_inyectar_eventos_en_consulta_ajena(
         headers=auth_headers(dr_b.id),
     )
     assert owner.status_code == 201, owner.text
+    assert owner.json()["note"] == "del asignado"
+    assert owner.json()["clinical_access"] == "full"
 
-    admin = await client.post(  # el client del fixture es admin
+    # El client del fixture es admin: registra eventos del caso, pero la nota es clínica.
+    admin_note = await client.post(
         f"{PREFIX}/consultations/{cid}/events",
         json={"consultation_id": cid, "event_type": "note", "note": "del admin"},
     )
+    assert admin_note.status_code == 403, admin_note.text
+    admin = await client.post(
+        f"{PREFIX}/consultations/{cid}/events",
+        json={"consultation_id": cid, "event_type": "admin_update"},
+    )
     assert admin.status_code == 201, admin.text
+    assert admin.json()["clinical_access"] == "none"
 
 
 async def test_admin_puede_gestionar_consulta_ajena(
@@ -812,11 +823,22 @@ async def test_admin_puede_gestionar_consulta_ajena(
     dr_b = await add_doctor(db_session, specialty=GENERAL)
     cid = await _consultation_assigned_to(client, db_session, str(dr_b.id))
 
-    # El client del fixture es admin: puede editar y cerrar consultas de otros.
-    patched = await client.patch(f"{PREFIX}/consultations/{cid}", json={"internal_note": "admin"})
-    assert patched.status_code == 200
+    # El client del fixture es admin: gestiona estado/prioridad/nota_admin de casos ajenos...
+    patched = await client.patch(
+        f"{PREFIX}/consultations/{cid}", json={"priority": "review", "nota_admin": "revisar"}
+    )
+    assert patched.status_code == 200, patched.text
+    # ...pero NO escribe (ni pisa) las notas del médico, ni con nota de cierre.
+    for field in ("internal_note", "clinical_notes", "chief_complaint"):
+        denied = await client.patch(f"{PREFIX}/consultations/{cid}", json={field: "admin"})
+        assert denied.status_code == 403, (field, denied.text)
+    with_note = await client.post(
+        f"{PREFIX}/consultations/{cid}/close", json={"outcome": "closed", "note": "admin"}
+    )
+    assert with_note.status_code == 403, with_note.text
     closed = await client.post(f"{PREFIX}/consultations/{cid}/close", json={"outcome": "closed"})
     assert closed.status_code == 200
+    assert closed.json()["clinical_access"] == "none"
 
 
 # --- entered_call_at (paridad con el dashboard legacy: "en espera" = waiting +
@@ -952,8 +974,14 @@ async def test_consultation_list_hides_pii_from_patient_viewer(
 async def test_list_consultations_serializes_chief_complaint_longer_than_500(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
+    """El listado del admin ya no trae el motivo (va en null), así que la regresión se mira
+    donde el motivo sí se descifra: el listado del paciente dueño."""
     patient_id = await _create_patient(client)
     long_complaint = "a" * 600  # excede el max_length=500 que tenían los esquemas de entrada.
+    owner = make_profile(role="patient")
+    db_session.add(owner)
+    await db_session.flush()
+    (await db_session.get(Patient, uuid.UUID(patient_id))).user_id = owner.id
 
     consultation = Consultation(
         patient_id=uuid.UUID(patient_id),
@@ -964,7 +992,9 @@ async def test_list_consultations_serializes_chief_complaint_longer_than_500(
     await db_session.flush()
 
     listed = await client.get(
-        f"{PREFIX}/consultations", params={"status": "in_progress", "limit": 100}
+        f"{PREFIX}/consultations",
+        params={"status": "in_progress", "limit": 100},
+        headers=auth_headers(owner.id),
     )
     assert listed.status_code == 200, listed.text
     row = next(c for c in listed.json() if c["id"] == str(consultation.id))
@@ -1115,3 +1145,482 @@ async def test_el_code_no_se_trunca_al_pasar_los_10000(db_session: AsyncSession)
     assert first.code != second.code
     assert first.code.split("-")[-1] == str(max_seq + 1)
     assert second.code.split("-")[-1] == str(max_seq + 2)
+
+
+# --- Cifrado y acceso clínico por necesidad de saber (tasks/cifrado-datos-clinicos) ---------
+#
+# El admin gestiona el caso (estado, asignación, nota_admin) pero NUNCA recibe el texto
+# clínico; el médico tratante lo ve completo; el paciente dueño ve su motivo; el médico cuya
+# cola incluye un caso sin asignar ve el motivo para decidir si lo toma. Cada lectura concedida
+# (y cada intento denegado sobre un caso concreto) queda en audit_log.
+
+_READ = "READ_CLINICAL_DATA"
+_TRAUMA = "Traumatología y ortopedia"
+
+
+async def _caso_clinico(
+    client: AsyncClient, db_session: AsyncSession, *, specialty: str = GENERAL
+) -> tuple[str, Profile]:
+    """Caso EN ESPERA de un paciente con cuenta, antecedentes y alergias, con motivo. Devuelve
+    (id del caso, cuenta del paciente)."""
+    owner = make_profile(role="patient")
+    db_session.add(owner)
+    await db_session.flush()
+    patient = Patient(
+        full_name="Paciente Clínico",
+        phone_whatsapp="+58412000700",
+        affected_zone="Caracas",
+        consent=True,
+        user_id=owner.id,
+        description="Asma desde la infancia",
+        allergies="Penicilina",
+    )
+    db_session.add(patient)
+    await db_session.flush()
+    resp = await client.post(
+        f"{PREFIX}/consultations",
+        json={
+            "patient_id": str(patient.id),
+            "chief_complaint": "Dolor torácico",
+            "specialty_id": str(await specialty_id_by_name(db_session, specialty)),
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"], owner
+
+
+async def _caso_atendido(client: AsyncClient, db_session: AsyncSession) -> tuple[str, Profile]:
+    """Caso tomado por su médico, con nota interna, nota clínica y un evento con nota escritos
+    por él. Devuelve (id, médico tratante)."""
+    cid, _ = await _caso_clinico(client, db_session)
+    doc = await add_doctor(db_session, specialty=GENERAL)
+    suyo = auth_headers(doc.id)
+    took = await client.post(f"{PREFIX}/consultations/{cid}/claim", headers=suyo)
+    assert took.status_code == 200, took.text
+    notas = await client.patch(
+        f"{PREFIX}/consultations/{cid}",
+        json={"internal_note": "Sospecha de angina", "clinical_notes": "TA 150/95"},
+        headers=suyo,
+    )
+    assert notas.status_code == 200, notas.text
+    evento = await client.post(
+        f"{PREFIX}/consultations/{cid}/events",
+        json={"consultation_id": cid, "event_type": "note", "note": "Pide ECG"},
+        headers=suyo,
+    )
+    assert evento.status_code == 201, evento.text
+    return cid, doc
+
+
+async def _lecturas(
+    db_session: AsyncSession, actor_id: uuid.UUID, *, outcome: str = "granted"
+) -> list[AuditLog]:
+    rows = (
+        await db_session.scalars(
+            select(AuditLog).where(AuditLog.action == _READ, AuditLog.actor_user_id == actor_id)
+        )
+    ).all()
+    return [r for r in rows if r.metadata_["outcome"] == outcome]
+
+
+def _sin_texto_clinico(body: dict) -> None:
+    assert body["clinical_access"] == "none"
+    for field in ("chief_complaint", "internal_note", "clinical_notes"):
+        assert body[field] is None, field
+
+
+async def test_el_admin_gestiona_el_caso_sin_ver_su_contenido_clinico(
+    client: AsyncClient, db_session: AsyncSession, admin_identity: Profile
+) -> None:
+    cid, _ = await _caso_atendido(client, db_session)
+
+    listado = await client.get(f"{PREFIX}/consultations", params={"status": "in_progress"})
+    assert listado.status_code == 200, listado.text
+    fila = next(c for c in listado.json() if c["id"] == cid)
+    _sin_texto_clinico(fila)
+    # Sigue viendo lo operativo: a quién está asignado, el paciente, el estado.
+    assert fila["status"] == "in_progress" and fila["assigned_doctor_id"] is not None
+    assert fila["patient"]["full_name"] == "Paciente Clínico"
+    assert fila["patient"]["description"] is None
+
+    detalle = await client.get(f"{PREFIX}/consultations/{cid}")
+    assert detalle.status_code == 200, detalle.text
+    _sin_texto_clinico(detalle.json())
+    assert detalle.json()["patient"]["description"] is None
+
+    # Cambia estado y nota_admin; la respuesta tampoco trae lo clínico.
+    patched = await client.patch(
+        f"{PREFIX}/consultations/{cid}", json={"status": "contacted_whatsapp", "nota_admin": "ok"}
+    )
+    assert patched.status_code == 200, patched.text
+    _sin_texto_clinico(patched.json())
+    assert patched.json()["nota_admin"] == "ok"
+
+    # Cadena e historial: 200 (gestiona el caso) pero con el contenido en null.
+    cadena = await client.get(f"{PREFIX}/consultations/{cid}/chain")
+    assert cadena.status_code == 200, cadena.text
+    assert all(c["chief_complaint"] is None and c["internal_note"] is None for c in cadena.json())
+    assert all(c["clinical_access"] == "none" for c in cadena.json())
+    eventos = await client.get(f"{PREFIX}/consultations/{cid}/events")
+    assert eventos.status_code == 200, eventos.text
+    assert eventos.json() and all(e["note"] is None for e in eventos.json())
+
+    # No leyó nada clínico: no hay lectura que auditar.
+    assert await _lecturas(db_session, admin_identity.id) == []
+
+
+async def test_el_admin_no_escribe_notas_clinicas_pero_si_el_estado(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    cid, doc = await _caso_atendido(client, db_session)
+
+    denied = await client.patch(f"{PREFIX}/consultations/{cid}", json={"internal_note": "admin"})
+    assert denied.status_code == 403, denied.text
+    ok = await client.patch(f"{PREFIX}/consultations/{cid}", json={"status": "contacted_whatsapp"})
+    assert ok.status_code == 200, ok.text
+
+    # La nota del médico sigue intacta.
+    detalle = await client.get(f"{PREFIX}/consultations/{cid}", headers=auth_headers(doc.id))
+    assert detalle.json()["internal_note"] == "Sospecha de angina"
+
+
+async def test_el_medico_tratante_ve_el_caso_completo_y_queda_auditado(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    cid, doc = await _caso_atendido(client, db_session)
+
+    detalle = await client.get(f"{PREFIX}/consultations/{cid}", headers=auth_headers(doc.id))
+    assert detalle.status_code == 200, detalle.text
+    body = detalle.json()
+    assert body["clinical_access"] == "full"
+    assert body["chief_complaint"] == "Dolor torácico"
+    assert body["internal_note"] == "Sospecha de angina"
+    assert body["clinical_notes"] == "TA 150/95"
+    assert body["patient"]["description"] == "Asma desde la infancia"
+
+    eventos = await client.get(
+        f"{PREFIX}/consultations/{cid}/events", headers=auth_headers(doc.id)
+    )
+    assert "Pide ECG" in {e["note"] for e in eventos.json()}
+    assert all(e["clinical_access"] == "full" for e in eventos.json())
+
+    lecturas = [r for r in await _lecturas(db_session, doc.id) if cid in r.metadata_["ids"]]
+    assert lecturas, "la lectura del tratante debe quedar en audit_log"
+    del_detalle = next(r for r in lecturas if r.resource_id == cid)
+    assert del_detalle.resource == "consultations"
+    assert del_detalle.metadata_["via"] == "assigned_doctor"
+    assert del_detalle.metadata_["tiers"] == ["notes", "summary"]
+    assert del_detalle.ip  # la IP del cliente (en pruebas, la del transporte ASGI)
+
+
+async def test_el_paciente_ve_su_motivo_y_nunca_las_notas(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    cid, owner = await _caso_clinico(client, db_session)
+    doc = await add_doctor(db_session, specialty=GENERAL)
+    await client.post(f"{PREFIX}/consultations/{cid}/claim", headers=auth_headers(doc.id))
+    await client.patch(
+        f"{PREFIX}/consultations/{cid}",
+        json={"internal_note": "Nota del médico"},
+        headers=auth_headers(doc.id),
+    )
+    suyo = auth_headers(owner.id)
+
+    listado = await client.get(f"{PREFIX}/consultations", headers=suyo)
+    fila = next(c for c in listado.json() if c["id"] == cid)
+    detalle = (await client.get(f"{PREFIX}/consultations/{cid}", headers=suyo)).json()
+    for body in (fila, detalle):
+        assert body["clinical_access"] == "summary"
+        assert body["chief_complaint"] == "Dolor torácico"
+        assert "internal_note" not in body and "clinical_notes" not in body
+        assert "Nota del médico" not in str(body)
+
+    lecturas = await _lecturas(db_session, owner.id)
+    assert {r.metadata_["via"] for r in lecturas} == {"patient_owner"}
+    assert all(r.metadata_["tiers"] == ["summary"] for r in lecturas)
+
+
+async def test_la_cola_da_el_motivo_solo_a_quien_la_atiende(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Decisión 1 del spec: el médico cuya cola incluye el caso ve motivo, antecedentes y
+    alergias para decidir si lo toma (SUMMARY). Fuera de su cola, o siendo admin sin ejercer,
+    null."""
+    cid, _ = await _caso_clinico(client, db_session)
+    ajeno, _ = await _caso_clinico(client, db_session, specialty=_TRAUMA)
+    doc = await add_doctor(db_session, specialty=GENERAL)
+
+    panel = (
+        await client.get(f"{PREFIX}/consultations/panel", headers=auth_headers(doc.id))
+    ).json()
+    fila = next(c for c in panel["waiting"] if c["id"] == cid)
+    assert fila["clinical_access"] == "summary"
+    assert fila["chief_complaint"] == "Dolor torácico"
+    assert fila["patient"]["allergies"] == "Penicilina"
+    assert fila["patient"]["description"] == "Asma desde la infancia"
+    via_cola = [r for r in await _lecturas(db_session, doc.id) if cid in r.metadata_["ids"]]
+    assert [r.metadata_["via"] for r in via_cola] == ["queue_scope"]
+
+    # GET /queue (Board): mismo criterio.
+    board = (await client.get(f"{PREFIX}/queue", headers=auth_headers(doc.id))).json()
+    en_board = next(c for c in board if c["id"] == cid)
+    assert en_board["clinical_access"] == "summary"
+    assert en_board["chief_complaint"] == "Dolor torácico"
+    assert en_board["internal_note"] is None
+
+    # El admin que no ejerce ve toda la cola, sin contenido clínico.
+    admin_panel = (await client.get(f"{PREFIX}/consultations/panel")).json()
+    for c in admin_panel["waiting"]:
+        if c["id"] in (cid, ajeno):
+            assert c["clinical_access"] == "none"
+            assert c["chief_complaint"] is None
+            assert c["patient"]["allergies"] is None
+
+    # Un admin que además ejerce Medicina general: SUMMARY en su cola, nada fuera de ella.
+    dual = await add_doctor(db_session, role="admin", specialty=GENERAL)
+    await grant_roles(db_session, dual.id, ["doctor"])
+    dual_panel = (
+        await client.get(f"{PREFIX}/consultations/panel", headers=auth_headers(dual.id))
+    ).json()
+    por_id = {c["id"]: c for c in dual_panel["waiting"]}
+    assert por_id[cid]["clinical_access"] == "summary"
+    assert por_id[cid]["chief_complaint"] == "Dolor torácico"
+    assert por_id[ajeno]["clinical_access"] == "none"
+    assert por_id[ajeno]["chief_complaint"] is None
+
+
+async def test_tomar_de_la_cola_da_acceso_de_tratante(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    cid, _ = await _caso_clinico(client, db_session)
+    doc = await add_doctor(db_session, specialty=GENERAL)
+
+    took = await client.post(f"{PREFIX}/queue/{cid}/take", headers=auth_headers(doc.id))
+    assert took.status_code == 200, took.text
+    assert took.json()["clinical_access"] == "full"
+    assert took.json()["chief_complaint"] == "Dolor torácico"
+
+    panel = (
+        await client.get(f"{PREFIX}/consultations/panel", headers=auth_headers(doc.id))
+    ).json()
+    mio = next(c for c in panel["mine"] if c["id"] == cid)
+    assert mio["clinical_access"] == "full"
+    assert mio["patient"]["full_name"] == "Paciente Clínico"
+
+
+async def test_cadena_y_eventos_de_un_caso_ajeno_son_403_y_quedan_auditados(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Brecha previa: /chain y /events no comprobaban pertenencia; cualquier médico leía las
+    notas de cualquier caso por id."""
+    cid, _ = await _caso_atendido(client, db_session)
+    otro = await add_doctor(db_session, specialty=GENERAL)
+    ajeno = auth_headers(otro.id)
+
+    assert (
+        await client.get(f"{PREFIX}/consultations/{cid}/chain", headers=ajeno)
+    ).status_code == 403
+    assert (
+        await client.get(f"{PREFIX}/consultations/{cid}/events", headers=ajeno)
+    ).status_code == 403
+
+    denegadas = await _lecturas(db_session, otro.id, outcome="denied")
+    assert len(denegadas) == 2
+    assert {r.resource_id for r in denegadas} == {cid}
+    assert all(r.resource == "consultations" and r.ip for r in denegadas)
+    assert await _lecturas(db_session, otro.id) == []
+
+
+async def test_solo_el_tratante_escribe_texto_clinico(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Un médico que puede gestionar un caso sin asignar (p. ej. liberarlo) no por eso escribe
+    su motivo o sus notas: eso es del médico que lo atiende."""
+    cid, _ = await _caso_clinico(client, db_session)
+    doc = await add_doctor(db_session, specialty=GENERAL)
+    headers = auth_headers(doc.id)
+
+    for field in ("chief_complaint", "clinical_notes", "internal_note"):
+        resp = await client.patch(
+            f"{PREFIX}/consultations/{cid}", json={field: "x"}, headers=headers
+        )
+        assert resp.status_code == 403, (field, resp.text)
+    evento = await client.post(
+        f"{PREFIX}/consultations/{cid}/events",
+        json={"consultation_id": cid, "event_type": "note", "note": "x"},
+        headers=headers,
+    )
+    assert evento.status_code == 403, evento.text
+
+
+async def test_en_la_base_el_texto_clinico_queda_cifrado(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    cid, _ = await _caso_atendido(client, db_session)
+
+    row = (
+        await db_session.execute(
+            text(
+                "select chief_complaint, internal_note, clinical_notes "
+                "from public.consultations where id = :id"
+            ),
+            {"id": cid},
+        )
+    ).one()
+    for value in row:
+        assert value.startswith("enc:v1:"), value
+    assert "Dolor" not in row.chief_complaint and "angina" not in row.internal_note
+
+    notas = (
+        await db_session.scalars(
+            text(
+                "select note from public.consultation_events "
+                "where consultation_id = :id and note is not null"
+            ),
+            {"id": cid},
+        )
+    ).all()
+    assert notas and all(n.startswith("enc:v1:") for n in notas)
+
+
+async def test_crear_y_la_sala_no_devuelven_texto_clinico(
+    anon_client: AsyncClient, client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El alta es anónima y el `patient_id` del cuerpo no prueba que la ficha sea suya (el motivo
+    puede salir de sus antecedentes); el token de sala tampoco da acceso al contenido clínico."""
+    patient = Patient(
+        full_name="Paciente Anónimo",
+        phone_whatsapp="+58412000701",
+        affected_zone="Caracas",
+        consent=True,
+        description="Diabetes tipo 2",
+    )
+    db_session.add(patient)
+    await db_session.flush()
+    created = await anon_client.post(
+        f"{PREFIX}/consultations",
+        json={"patient_id": str(patient.id), "specialty_id": await any_specialty_id(client)},
+    )
+    assert created.status_code == 201, created.text
+    _sin_texto_clinico(created.json())
+    cid = created.json()["id"]
+    sala = {"X-Consultation-Token": created.json()["access_token"]}
+
+    for path in ("entered-call", "video-room"):
+        resp = await anon_client.post(f"{PREFIX}/consultations/{cid}/{path}", headers=sala)
+        assert resp.status_code == 200, (path, resp.text)
+        _sin_texto_clinico(resp.json())
+
+
+async def test_admin_medico_sin_ficha_habilitada_no_lee_como_tratante(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El gate de credencial no frena a un admin para OPERAR, pero ser admin con rol de médico
+    no basta para leer como tratante: hace falta la ficha habilitada. Con ella, sí."""
+    cid, _ = await _caso_atendido(client, db_session)
+    sin_ficha = make_profile(role="admin")
+    db_session.add(sin_ficha)
+    await db_session.flush()
+    await grant_roles(db_session, sin_ficha.id, ["doctor"])
+    con_ficha = await add_doctor(db_session, specialty=GENERAL)
+    await grant_roles(db_session, con_ficha.id, ["admin"])
+
+    for quien, esperado in ((sin_ficha, "none"), (con_ficha, "full")):
+        await db_session.execute(
+            text("update consultations set assigned_doctor_id = :d where id = :id"),
+            {"d": quien.id, "id": cid},
+        )
+        body = (
+            await client.get(f"{PREFIX}/consultations/{cid}", headers=auth_headers(quien.id))
+        ).json()
+        assert body["clinical_access"] == esperado
+        assert (body["internal_note"] is None) == (esperado == "none")
+
+
+async def test_el_admin_que_ejerce_no_se_asigna_casos_por_patch(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Asignarse un caso por PATCH convertía a un admin que además ejerce en médico tratante
+    (acceso clínico completo) de cualquier caso, incluso de uno que atendía otro médico. Tomar un
+    caso para sí es solo por el claim atómico; asignar a OTRO médico sigue siendo gestión admin."""
+    dual = await add_doctor(db_session, role="admin", specialty=GENERAL)
+    await grant_roles(db_session, dual.id, ["doctor"])
+    suyo = auth_headers(dual.id)
+
+    # Un caso que ya atiende otro médico: 403, la asignación no cambia y no lee sus notas.
+    ajeno, doc = await _caso_atendido(client, db_session)
+    robo = await client.patch(
+        f"{PREFIX}/consultations/{ajeno}", json={"assigned_doctor_id": str(dual.id)}, headers=suyo
+    )
+    assert robo.status_code == 403, robo.text
+    fila = await db_session.get(Consultation, uuid.UUID(ajeno))
+    await db_session.refresh(fila)
+    assert fila.assigned_doctor_id == doc.id
+    detalle = (await client.get(f"{PREFIX}/consultations/{ajeno}", headers=suyo)).json()
+    _sin_texto_clinico(detalle)
+
+    # Un caso sin asignar: tampoco por PATCH...
+    libre, _ = await _caso_clinico(client, db_session)
+    por_patch = await client.patch(
+        f"{PREFIX}/consultations/{libre}",
+        json={"assigned_doctor_id": str(dual.id), "status": "in_progress"},
+        headers=suyo,
+    )
+    assert por_patch.status_code == 403, por_patch.text
+
+    # ...sí por el claim atómico, que lo deja como tratante.
+    took = await client.post(f"{PREFIX}/consultations/{libre}/claim", headers=suyo)
+    assert took.status_code == 200, took.text
+    assert took.json()["clinical_access"] == "full"
+
+    # Asignar a OTRO médico sigue siendo gestión admin.
+    otro = await add_doctor(db_session, specialty=GENERAL)
+    para_otro, _ = await _caso_clinico(client, db_session)
+    asignado = await client.patch(
+        f"{PREFIX}/consultations/{para_otro}",
+        json={"assigned_doctor_id": str(otro.id), "status": "in_progress"},
+        headers=suyo,
+    )
+    assert asignado.status_code == 200, asignado.text
+    assert asignado.json()["assigned_doctor_id"] == str(otro.id)
+    _sin_texto_clinico(asignado.json())
+
+
+async def test_un_caso_cancelado_o_cerrado_sin_medico_no_da_motivo_por_cola(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El SUMMARY de la cola es para decidir si tomar un caso EN ESPERA. Uno cancelado o cerrado
+    que quedó sin médico no está en la cola de nadie: al admin que ejerce esa especialidad le
+    sale en null en el listado, aunque siga sin asignar."""
+    dual = await add_doctor(db_session, role="admin", specialty=GENERAL)
+    await grant_roles(db_session, dual.id, ["doctor"])
+
+    casos: dict[str, str] = {}
+    for estado in ("waiting", "cancelled", "closed"):
+        cid, _ = await _caso_clinico(client, db_session)
+        if estado != "waiting":
+            cambio = await client.patch(f"{PREFIX}/consultations/{cid}", json={"status": estado})
+            assert cambio.status_code == 200, cambio.text
+        casos[estado] = cid
+
+    for estado, cid in casos.items():
+        fila_orm = await db_session.get(Consultation, uuid.UUID(cid))
+        listado = await client.get(
+            f"{PREFIX}/consultations",
+            params={"patient_id": str(fila_orm.patient_id)},
+            headers=auth_headers(dual.id),
+        )
+        assert listado.status_code == 200, listado.text
+        (fila,) = listado.json()
+        assert fila["status"] == estado and fila["assigned_doctor_id"] is None
+        if estado == "waiting":
+            assert fila["clinical_access"] == "summary"
+            assert fila["chief_complaint"] == "Dolor torácico"
+        else:
+            assert fila["clinical_access"] == "none", estado
+            assert fila["chief_complaint"] is None
+
+    # Solo el caso en espera quedó como lectura concedida.
+    leidos = {i for r in await _lecturas(db_session, dual.id) for i in r.metadata_["ids"]}
+    assert casos["waiting"] in leidos
+    assert casos["cancelled"] not in leidos and casos["closed"] not in leidos

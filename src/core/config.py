@@ -94,6 +94,17 @@ class Settings(BaseSettings):
     # Borrar esta bandera y el `if` de require_consultation_token una vez hecho el cutover.
     CONSULTATION_TOKEN_REQUIRED: bool = True
 
+    # --- Cifrado de datos clínicos (ver src/core/clinical_crypto.py) ---
+    # AES-256-GCM, 32 bytes en base64. Vive SOLO aquí: ni en Supabase ni en el frontend. Sin
+    # ella no hay forma de leer motivos ni notas de la base, así que se custodia como el
+    # service_role y su pérdida es pérdida de datos (ver docs/cifrado-datos-clinicos.md).
+    # El default es público (está en el repo) y solo sirve en local: el arranque en producción
+    # lo rechaza. Generar una: `uv run python scripts/encrypt_clinical_data.py --generate-key`.
+    CLINICAL_DATA_ENCRYPTION_KEY: str = "ZGV2LWluc2VjdXJlLWNsaW5pY2FsLWtleS0zMmJ5dGU="
+    # Claves anteriores (coma-separadas), solo para DESCIFRAR durante una rotación. Se vacía
+    # cuando el script de backfill ya re-cifró todo con la activa.
+    CLINICAL_DATA_ENCRYPTION_PREVIOUS_KEYS: str = ""
+
     # --- Resiliencia de la cola ---
     # Minutos tras los cuales una consulta 'in_progress' sin cerrar se considera
     # estancada y se devuelve a 'waiting' (la libera para otro médico).
@@ -203,7 +214,8 @@ class Settings(BaseSettings):
     # poco en comparación —no llega a ningún médico ni entra a la cola; como mucho, filas basura
     # en un listado—, así que el tope solo tiene que frenar un script, no a una campaña.
     # Ojo: si detrás del proxy la API no ve la IP real del cliente, este tope lo comparten TODOS
-    # los que responden a la vez; por eso no se ajusta al volumen de una sola persona.
+    # los que respondían a la vez; ahora es por IP, pero una oficina o un NAT móvil siguen
+    # compartiendo IP, así que no se ajusta al volumen de una sola persona.
     SURVEY_RESPONSE_RATE_LIMIT: str = "60/minute"
 
     def _normalize_async_scheme(self, url: str) -> str:

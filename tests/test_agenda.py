@@ -155,7 +155,16 @@ async def test_refer_hands_off_parent_and_schedules_for_specialist(
     assert child["status"] == "scheduled"
     assert child["parent_consultation_id"] == parent_cid
     assert child["assigned_doctor_id"] == str(specialist.id)
-    assert child["internal_note"] == "Requiere cardiología"
+    # La hija ya es del especialista: quien refiere la recibe sin contenido clínico...
+    assert child["internal_note"] is None
+    assert child["clinical_access"] == "none"
+    # ...y el especialista, como médico tratante, ve el motivo de la referencia.
+    detalle = await client.get(
+        f"{PREFIX}/consultations/{child['id']}", headers=auth_headers(specialist.id)
+    )
+    assert detalle.status_code == 200, detalle.text
+    assert detalle.json()["internal_note"] == "Requiere cardiología"
+    assert detalle.json()["chief_complaint"] == "Dolor"  # el motivo del padre, copiado cifrado
 
     # El padre queda derivado (ya no lo atiende el médico actual).
     parent = await client.get(f"{PREFIX}/consultations/{parent_cid}", headers=auth_headers(doc.id))
@@ -170,6 +179,35 @@ async def test_refer_hands_off_parent_and_schedules_for_specialist(
         f"{PREFIX}/consultations/{child['id']}/chain", headers=auth_headers(specialist.id)
     )
     assert parent_cid in {c["id"] for c in chain.json()}
+    assert all(c["clinical_access"] == "full" for c in chain.json())
+
+
+async def test_el_correo_de_referencia_no_lleva_el_motivo(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Decisión 2026-09-23: los correos no llevan texto clínico (solo fecha, código y enlace).
+    El motivo de la referencia es nota del médico y un correo sale del sistema sin control."""
+    doc = await add_doctor(db_session, specialty=GENERAL)
+    specialist = await add_doctor(db_session, role="specialist")
+    parent_cid = await _open_consultation(client, doc.id)
+    capturado = AsyncMock(return_value=None)
+
+    with patch("src.services.notifications.doctor_event_email_args", capturado):
+        resp = await client.post(
+            f"{PREFIX}/consultations/{parent_cid}/refer",
+            json={
+                "invited_doctor_id": str(specialist.id),
+                "scheduled_at": (datetime.now(UTC) + timedelta(days=2)).isoformat(),
+                "reason": "Sospecha de soplo cardíaco",
+            },
+            headers=auth_headers(doc.id),
+        )
+
+    assert resp.status_code == 201, resp.text
+    texto = capturado.await_args.kwargs["text"]
+    assert "soplo" not in texto
+    assert "Motivo" not in texto
+    assert resp.json()["code"] in texto
 
 
 async def test_refer_rejects_self(client: AsyncClient, db_session: AsyncSession) -> None:

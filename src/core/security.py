@@ -67,6 +67,10 @@ class Principal(BaseModel):
     # a la espera de que el SACS/FPV valide su cédula o de que un admin lo apruebe.
     # Para roles que no ejercen como médico (paciente, admin) es siempre True: no aplica.
     credential_verified: bool = True
+    # Ejerce como médico CON credencial válida, sea o no admin. Es lo que habilita a leer
+    # contenido clínico como tratante (services/clinical_access.py): a un admin+médico el gate de
+    # arriba no le exige ficha para OPERAR, pero sin ficha habilitada no es médico de nadie.
+    practices_medicine: bool = False
 
     @property
     def is_staff(self) -> bool:
@@ -175,11 +179,14 @@ async def get_current_principal(
     # sepa qué es y pueda mandarlo a completar su cédula) pero se queda SIN permisos —
     # mismo efecto que una cuenta revocada. Un admin no depende de tener ficha.
     credential_verified = True
-    if roles & DOCTOR_ROLES and not roles & ADMIN_ROLES:
-        credential_verified = await doctors_service.has_valid_credential(db, profile.id)
-        if not credential_verified:
-            logger.warning("SEC:doctor_unverified user_id=%s", profile.id)
-            permissions = frozenset()
+    practices_medicine = False
+    if roles & DOCTOR_ROLES:
+        practices_medicine = await doctors_service.has_valid_credential(db, profile.id)
+        if not roles & ADMIN_ROLES:
+            credential_verified = practices_medicine
+            if not credential_verified:
+                logger.warning("SEC:doctor_unverified user_id=%s", profile.id)
+                permissions = frozenset()
     return Principal(
         id=profile.id,
         email=profile.email,
@@ -191,6 +198,7 @@ async def get_current_principal(
         roles=roles,
         permissions=permissions,
         credential_verified=credential_verified,
+        practices_medicine=practices_medicine,
     )
 
 

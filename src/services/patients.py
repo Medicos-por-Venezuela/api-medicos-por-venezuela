@@ -3,6 +3,7 @@
 import re
 import uuid
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING, NoReturn
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,7 +15,9 @@ from src.core.errors import (
     NotFoundError,
     UnprocessableError,
 )
+from src.models.consultation import Consultation
 from src.models.patient import Patient
+from src.schemas.clinical import ClinicalGrant, treating_grant
 from src.schemas.patient import (
     DoctorPatientCreate,
     DoctorPatientUpdate,
@@ -22,6 +25,29 @@ from src.schemas.patient import (
     PatientUpdate,
 )
 from src.services import audit
+
+if TYPE_CHECKING:  # security -> services/__init__ -> patients: import circular en runtime
+    from src.core.security import Principal
+
+# Campos clínicos de la ficha (cifrados): los escribe solo el médico que trata al paciente.
+_CLINICAL_UPDATE_FIELDS = frozenset({"description", "allergies"})
+
+
+async def _deny(
+    session: AsyncSession,
+    principal: "Principal",
+    ip: str | None,
+    patient_id: uuid.UUID,
+    message: str,
+) -> NoReturn:
+    """403 sobre UN paciente concreto, con su traza `READ_CLINICAL_DATA` (outcome "denied")
+    commiteada antes de lanzar: si no, el rollback del error se la llevaría."""
+    from src.services import clinical_access  # diferido: mismo ciclo que `Principal`
+
+    await clinical_access.audit_clinical_denied(
+        session, principal=principal, ip=ip, resource="patients", resource_id=patient_id
+    )
+    raise ForbiddenError(message)
 
 
 def _ensure_emergency_phone_differs(emergency: str | None, whatsapp: str | None) -> None:
@@ -74,15 +100,24 @@ async def list_patients(
 
 
 async def get_patient_as_staff(
-    session: AsyncSession, patient_id: uuid.UUID, *, may_see_doctor_patients: bool
+    session: AsyncSession,
+    patient_id: uuid.UUID,
+    *,
+    principal: "Principal",
+    may_see_doctor_patients: bool,
+    ip: str | None = None,
 ) -> Patient:
     """Lectura staff de un paciente. Misma frontera que `list_patients`, aplicada al detalle:
     un guard que cubre el listado pero no el `GET /{id}` no es un guard (lección del sub-recurso
-    `/events` en @.claude/rules/security.md)."""
+    `/events` en @.claude/rules/security.md). El 403 queda auditado como intento denegado."""
     patient = await get_patient(session, patient_id)
     if patient.created_by_doctor_id is not None and not may_see_doctor_patients:
-        raise ForbiddenError(
-            "Este paciente es de consultorio: solo lo ve el médico que lo registró."
+        await _deny(
+            session,
+            principal,
+            ip,
+            patient.id,
+            "Este paciente es de consultorio: solo lo ve el médico que lo registró.",
         )
     return patient
 
@@ -98,6 +133,36 @@ async def list_patients_for_user(session: AsyncSession, user_id: uuid.UUID) -> l
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+async def clinical_grants(
+    session: AsyncSession, principal: "Principal", patients: list[Patient]
+) -> dict[uuid.UUID, ClinicalGrant | None]:
+    """Quién lee `description`/`allergies` de cada paciente: el médico habilitado que lo trata.
+
+    "Lo trata" = es su paciente de consultorio (`created_by_doctor_id`) o tiene alguna consulta
+    de ese paciente asignada (mismo criterio que la dirección, `patient_address_for_viewer`).
+    Ser admin no concede nada; el paciente dueño va por `/patients/me` con su propio permiso.
+    Una sola query para todo el listado, no una por fila."""
+    from src.services import clinical_access  # diferido: mismo ciclo que `Principal`
+
+    grants: dict[uuid.UUID, ClinicalGrant | None] = {p.id: None for p in patients}
+    if not patients or not clinical_access.practices_medicine(principal):
+        return grants
+    asignados = set(
+        await session.scalars(
+            select(Consultation.patient_id)
+            .where(
+                Consultation.patient_id.in_(list(grants)),
+                Consultation.assigned_doctor_id == principal.id,
+            )
+            .distinct()
+        )
+    )
+    for p in patients:
+        if p.created_by_doctor_id == principal.id or p.id in asignados:
+            grants[p.id] = treating_grant("assigned_doctor")
+    return grants
 
 
 async def get_patient(session: AsyncSession, patient_id: uuid.UUID) -> Patient:
@@ -127,10 +192,20 @@ async def update_patient(
     session: AsyncSession,
     patient_id: uuid.UUID,
     data: PatientUpdate,
-    actor_user_id: uuid.UUID | None = None,
+    principal: "Principal",
 ) -> Patient:
+    """PATCH de la ficha (admin). `description`/`allergies` son la historia clínica del
+    paciente: solo los escribe el médico habilitado que lo trata (mismo criterio que la lectura,
+    `clinical_grants`). El admin edita el resto de la ficha; con uno de esos campos, 403, igual
+    que el motivo y las notas en el PATCH de la consulta."""
     patient = await get_patient(session, patient_id)
     changes = data.model_dump(exclude_unset=True)
+    if changes.keys() & _CLINICAL_UPDATE_FIELDS:
+        grants = await clinical_grants(session, principal, [patient])
+        if grants[patient.id] is None:
+            raise ForbiddenError(
+                "Solo el médico que trata al paciente escribe sus antecedentes y alergias."
+            )
     if "emergency_phone" in changes:
         _ensure_emergency_phone_differs(
             changes["emergency_phone"], changes.get("phone_whatsapp", patient.phone_whatsapp)
@@ -140,7 +215,7 @@ async def update_patient(
     await audit.log_action(
         session,
         action="patient.updated",
-        actor_user_id=actor_user_id,
+        actor_user_id=principal.id,
         resource="patients",
         resource_id=patient.id,
         metadata={"fields": sorted(changes)},
@@ -159,13 +234,13 @@ async def update_patient(
 
 
 async def _own_patient(
-    session: AsyncSession, patient_id: uuid.UUID, doctor_id: uuid.UUID
+    session: AsyncSession, patient_id: uuid.UUID, principal: "Principal", ip: str | None
 ) -> Patient:
     """El paciente de consultorio del médico que llama. 404 si no existe o está archivado;
-    403 si existe pero es de otro médico (o es un alta pública, que no tiene dueño médico)."""
+    403 (auditado) si existe pero es de otro médico (o es un alta pública, sin dueño médico)."""
     patient = await get_patient(session, patient_id)  # 404 incluye el archivado
-    if patient.created_by_doctor_id != doctor_id:
-        raise ForbiddenError("Este paciente no fue registrado por vos.")
+    if patient.created_by_doctor_id != principal.id:
+        await _deny(session, principal, ip, patient.id, "Este paciente no fue registrado por vos.")
     return patient
 
 
@@ -214,18 +289,21 @@ async def list_doctor_patients(
 
 
 async def get_doctor_patient(
-    session: AsyncSession, patient_id: uuid.UUID, doctor_id: uuid.UUID
+    session: AsyncSession, patient_id: uuid.UUID, *, principal: "Principal", ip: str | None = None
 ) -> Patient:
-    return await _own_patient(session, patient_id, doctor_id)
+    return await _own_patient(session, patient_id, principal, ip)
 
 
 async def update_doctor_patient(
     session: AsyncSession,
     patient_id: uuid.UUID,
     data: DoctorPatientUpdate,
-    doctor_id: uuid.UUID,
+    *,
+    principal: "Principal",
+    ip: str | None = None,
 ) -> Patient:
-    patient = await _own_patient(session, patient_id, doctor_id)
+    doctor_id = principal.id
+    patient = await _own_patient(session, patient_id, principal, ip)
     changes = data.model_dump(exclude_unset=True)
     if "emergency_phone" in changes:
         _ensure_emergency_phone_differs(
@@ -247,10 +325,11 @@ async def update_doctor_patient(
 
 
 async def delete_doctor_patient(
-    session: AsyncSession, patient_id: uuid.UUID, doctor_id: uuid.UUID
+    session: AsyncSession, patient_id: uuid.UUID, *, principal: "Principal", ip: str | None = None
 ) -> None:
     """Baja lógica del paciente propio. Nunca hard delete (igual que el resto de la tabla)."""
-    patient = await _own_patient(session, patient_id, doctor_id)
+    doctor_id = principal.id
+    patient = await _own_patient(session, patient_id, principal, ip)
     patient.deleted_at = func.now()
     await audit.log_action(
         session,
@@ -318,8 +397,6 @@ async def patient_address_for_viewer(
 
     # 2) Médico tratante: alguna consulta asignada a este viewer.
     if via is None:
-        from src.models.consultation import Consultation
-
         existe = await session.scalar(
             select(1)
             .where(

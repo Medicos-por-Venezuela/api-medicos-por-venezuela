@@ -3,12 +3,14 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, text
+from sqlalchemy import DateTime, ForeignKey, String, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
+from src.core.clinical_crypto import Sealed
 from src.db.base import Base
+from src.db.encrypted import EncryptedText
 
 
 class ConsultationEvent(Base):
@@ -26,7 +28,9 @@ class ConsultationEvent(Base):
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
-    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    note: Mapped[Sealed | None] = mapped_column(
+        EncryptedText("consultation_events.note"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

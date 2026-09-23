@@ -1,4 +1,8 @@
-"""Esquemas Pydantic para consultations (Create / Update / Response)."""
+"""Esquemas Pydantic para consultations (Create / Update / Response).
+
+Los campos clínicos de SALIDA son `ClinicalSummary`/`ClinicalNote` (`src/schemas/clinical.py`):
+valen null salvo que el router valide con `context=clinical_context(grant)`. Las entradas
+(`*Create`/`*Update`/requests) siguen siendo `str`."""
 
 import uuid
 from datetime import datetime
@@ -8,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # Re-exportado desde el modelo para tener una única fuente de verdad.
 from src.models.consultation import CONSULTATION_STATUSES
+from src.schemas.clinical import ClinicalAccessMixin, ClinicalNote, ClinicalSummary
 
 __all__ = [
     "CONSULTATION_STATUSES",
@@ -40,7 +45,7 @@ __all__ = [
 ]
 
 
-class ConsultationBase(BaseModel):
+class ConsultationBase(ClinicalAccessMixin):
     """Base usada SOLO por `ConsultationResponse` (esquema de salida).
 
     Sin `max_length`: son datos ya persistidos en la base y una validación de
@@ -54,7 +59,7 @@ class ConsultationBase(BaseModel):
     # Especialidad solicitada por el paciente (catálogo specialties). Reemplaza a
     # needs_tags para el registro nuevo; el filtro del panel se actualiza aparte.
     specialty_id: uuid.UUID | None = None
-    chief_complaint: str | None = None
+    chief_complaint: ClinicalSummary = None
     referred_specialty: str | None = None
     doctor_id: uuid.UUID | None = None
     assigned_doctor_id: uuid.UUID | None = None
@@ -212,26 +217,28 @@ class QueueGroupResponse(BaseModel):
 
 class DerivationInfo(BaseModel):
     """De dónde viene un caso derivado: especialidad de origen, quién lo derivó y por qué. El
-    motivo es nota de staff: no va en la vista del paciente."""
+    motivo es nota del médico (`ClinicalNote`): solo lo ve el equipo tratante."""
 
     model_config = ConfigDict(from_attributes=True)
 
     from_specialty: str | None = None
     by_name: str | None = None
-    reason: str | None = None
+    reason: ClinicalNote = None
     at: datetime
 
 
-class ChainItem(BaseModel):
-    """Un eslabón de la cadena de seguimiento (historial cross-consulta padre→hijas)."""
+class ChainItem(ClinicalAccessMixin):
+    """Un eslabón de la cadena de seguimiento (historial cross-consulta padre→hijas). Motivo y
+    nota solo para el equipo tratante del caso pedido (ese eslabón y sus ancestros) o de ese
+    eslabón; el admin los recibe en null."""
 
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     code: str
     status: str
-    chief_complaint: str | None = None
-    internal_note: str | None = None
+    chief_complaint: ClinicalSummary = None
+    internal_note: ClinicalNote = None
     scheduled_at: datetime | None = None
     closed_at: datetime | None = None
     created_at: datetime
@@ -267,21 +274,22 @@ class ConsultationDetailPatient(BaseModel):
     affected_zone: str | None = None
     age_range: str | None = None
     needs_tags: list[str] | None = None
-    description: str | None = None
+    description: ClinicalSummary = None
     # Teléfono de emergencia visible en el detalle del caso.
     emergency_phone: str | None = None
 
 
 class ConsultationResponse(ConsultationBase):
-    """Vista completa para staff (incluye notas clínicas e internas)."""
+    """Vista de staff. Los campos clínicos (motivo, notas) solo van en claro para quien tiene
+    permiso sobre ESTE caso (`clinical_access`); el admin los recibe en null."""
 
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     code: str
     status: str
-    clinical_notes: str | None = None
-    internal_note: str | None = None
+    clinical_notes: ClinicalNote = None
+    internal_note: ClinicalNote = None
     doctor_license_snapshot: dict | None = None
     has_prescription: bool
     has_referral: bool
@@ -340,12 +348,13 @@ class ConsultationCreatedResponse(ConsultationResponse):
     access_token: str
 
 
-class ConsultationPatientResponse(BaseModel):
+class ConsultationPatientResponse(ClinicalAccessMixin):
     """Vista reducida para pacientes autenticados.
 
     Excluye deliberadamente `internal_note`, `clinical_notes` y
     `doctor_license_snapshot`: son campos de uso interno del staff
-    que no deben ser visibles al paciente (equivalente a la RLS de Supabase).
+    que no deben ser visibles al paciente (equivalente a la RLS de Supabase). Su propio motivo
+    (`chief_complaint`) sí lo ve, con `clinical_access = "summary"`.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -357,7 +366,7 @@ class ConsultationPatientResponse(BaseModel):
     priority: str
     category: str | None = None
     specialty_id: uuid.UUID | None = None
-    chief_complaint: str | None = None
+    chief_complaint: ClinicalSummary = None
     referred_specialty: str | None = None
     platform_used: str | None = None
     video_room_url: str | None = None
@@ -416,10 +425,11 @@ class PanelWaitingPatient(BaseModel):
     affected_zone: str | None = None
     age_range: str | None = None
     needs_tags: list[str] | None = None
-    description: str | None = None
+    description: ClinicalSummary = None
     # Las alergias se piden en el registro y son dato clínico de decisión: el médico las
     # necesita ANTES de tomar el caso, no después. Van sin nombre, como el resto de la fila.
-    allergies: str | None = None
+    # En claro solo para el médico cuya cola incluye el caso (SUMMARY) o que ya lo atiende.
+    allergies: ClinicalSummary = None
 
 
 class PanelPatient(PanelWaitingPatient):
@@ -431,9 +441,11 @@ class PanelPatient(PanelWaitingPatient):
     phone_whatsapp: str | None = None
 
 
-class PanelConsultationItem(BaseModel):
+class PanelConsultationItem(ClinicalAccessMixin):
     """Fila de consulta para las listas del panel médico (cola de espera y las propias),
-    con el paciente anidado. Excluye notas clínicas/internas (no se muestran en la cola)."""
+    con el paciente anidado. Excluye notas clínicas/internas (no se muestran en la cola). El
+    motivo y los antecedentes van por fila según `clinical_access`: `summary` en la cola del
+    médico, `full` en las suyas, `none` (null) para quien no ejerce (admin)."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -444,7 +456,7 @@ class PanelConsultationItem(BaseModel):
     category: str | None = None
     # Nombre de la especialidad solicitada (specialty_id resuelta): con esto matchea el médico.
     specialty: str | None = None
-    chief_complaint: str | None = None
+    chief_complaint: ClinicalSummary = None
     referred_specialty: str | None = None
     video_room_url: str | None = None
     assigned_doctor_id: uuid.UUID | None = None

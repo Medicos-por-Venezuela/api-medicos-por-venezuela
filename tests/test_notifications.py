@@ -5,6 +5,7 @@ prueban sin sesión y sin IO. Lo que se fija aquí es la frontera de SEGURIDAD: 
 teclea una persona puede salir como marcado vivo en el HTML.
 """
 
+import inspect
 import uuid
 from datetime import UTC, datetime
 
@@ -48,11 +49,12 @@ def test_correo_de_cita_escapa_al_paciente_y_al_medico() -> None:
     _sin_enlace_vivo(html_medico)
 
 
-def test_difusion_de_interconsulta_escapa_el_motivo() -> None:
-    """SEGURIDAD. El motivo lo escribe un médico y esta difusión sale a TODOS los especialistas
-    de una especialidad: un solo caso mal intencionado alcanza cientos de bandejas."""
+def test_difusion_de_interconsulta_escapa_la_edad() -> None:
+    """SEGURIDAD. El rango etario lo teclea un médico en el alta de su paciente y esta difusión
+    sale a TODOS los especialistas de una especialidad: un solo caso mal intencionado alcanza
+    cientos de bandejas."""
     _, text, html = notifications.interconsultation_broadcast_email(
-        specialty_name="Cardiología", chief_complaint=VENENO, age_range="30-39"
+        specialty_name="Cardiología", age_range=VENENO
     )
     _sin_enlace_vivo(html)
     assert VENENO in text
@@ -60,25 +62,39 @@ def test_difusion_de_interconsulta_escapa_el_motivo() -> None:
     assert f'<a href="{notifications.panel_url()}">' in html
 
 
+def test_correos_de_interconsulta_no_aceptan_texto_clinico() -> None:
+    """Decisión 2026-09-23: nada de texto clínico fuera de la API. Un correo queda en buzones,
+    reenvíos y backups ajenos; el motivo se lee en el panel, con permiso y audit. Que la firma
+    ni siquiera acepte el motivo impide que alguien lo vuelva a pasar "solo un extracto"."""
+    for fn in (
+        notifications.interconsultation_broadcast_email,
+        notifications.interconsultation_taken_email,
+    ):
+        assert "chief_complaint" not in inspect.signature(fn).parameters
+
+    subject, text, html = notifications.interconsultation_broadcast_email("Cardiología", "30-39")
+    assert "Motivo" not in text + html + subject
+    assert "Cardiología" in text and notifications.panel_url() in text
+
+    subject, text, html = notifications.interconsultation_taken_email("Dra. Rivas", "Cardiología")
+    assert "Motivo" not in text + html + subject
+    assert "Cardiología" in text and notifications.panel_url() in text
+
+
 def test_aviso_de_caso_tomado_escapa_al_especialista() -> None:
-    """SEGURIDAD. El nombre del especialista viene de su propio perfil y el motivo del caso lo
-    escribió el médico tratante; los dos acaban en el HTML del aviso."""
+    """SEGURIDAD. El nombre del especialista viene de su propio perfil y acaba en el HTML del
+    aviso."""
     _, _, html = notifications.interconsultation_taken_email(
-        specialist_name=VENENO, specialty_name="Cardiología", chief_complaint="dolor torácico"
+        specialist_name=VENENO, specialty_name="Cardiología"
     )
     _sin_enlace_vivo(html)
-
-    _, _, html_motivo = notifications.interconsultation_taken_email(
-        specialist_name="Dra. Rivas", specialty_name="Cardiología", chief_complaint=VENENO
-    )
-    _sin_enlace_vivo(html_motivo)
 
 
 def test_sin_nombre_de_especialista_cae_a_la_especialidad() -> None:
     """El fallback también pasa por el HTML: si el perfil no tiene nombre, el correo dice la
     especialidad en su lugar y no un `None`."""
     subject, text, html = notifications.interconsultation_taken_email(
-        specialist_name=None, specialty_name="Cardiología", chief_complaint="dolor torácico"
+        specialist_name=None, specialty_name="Cardiología"
     )
     assert "Un especialista en Cardiología" in text
     assert "<strong>Un especialista en Cardiología</strong>" in html

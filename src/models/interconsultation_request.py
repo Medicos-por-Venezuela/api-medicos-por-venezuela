@@ -21,12 +21,14 @@ Máquina de estados:
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, text
+from sqlalchemy import DateTime, ForeignKey, Integer, String, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
+from src.core.clinical_crypto import Sealed
 from src.db.base import Base
+from src.db.encrypted import EncryptedText
 
 # Estados válidos (espejo de ck_interconsultation_requests_status).
 REQUEST_STATUSES = {"open", "taken", "closed", "cancelled"}
@@ -63,8 +65,12 @@ class InterconsultationRequest(Base):
     )
     # Lo único que ve el especialista antes de tomar (junto con la edad del paciente).
     # Que no lleve PII lo garantiza el schema de salida, no esta columna.
-    chief_complaint: Mapped[str] = mapped_column(Text, nullable=False)
-    clinical_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    chief_complaint: Mapped[Sealed] = mapped_column(
+        EncryptedText("interconsultation_requests.chief_complaint"), nullable=False
+    )
+    clinical_notes: Mapped[Sealed | None] = mapped_column(
+        EncryptedText("interconsultation_requests.clinical_notes"), nullable=True
+    )
     status: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'open'"))
     # Un solo especialista por caso: de ahí la carrera con with_for_update(nowait=True).
     taken_by_doctor_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -73,7 +79,9 @@ class InterconsultationRequest(Base):
     taken_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Todavía no se muestra en ningún lado: se guarda para el historial de la próxima iteración.
-    closing_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    closing_note: Mapped[Sealed | None] = mapped_column(
+        EncryptedText("interconsultation_requests.closing_note"), nullable=True
+    )
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Cuántos correos salieron en el fan-out: distingue "no le llegó" de "no era destinatario".
     notified_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))

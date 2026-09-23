@@ -8,9 +8,11 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from src.core.clinical_crypto import Sealed
 from src.core.errors import (
     BadRequestError,
     ConflictError,
+    ForbiddenError,
     NotFoundError,
     UnprocessableError,
 )
@@ -39,6 +41,8 @@ _OPEN_ASSIGNED_STATUSES = ("in_progress", "contacted_whatsapp")
 _ROOM_STATUSES = ("waiting", *_OPEN_ASSIGNED_STATUSES)
 # Evento que deja escrito quién derivó un caso a otra cola y por qué.
 DERIVED_EVENT = "derived"
+# Campos clínicos que se escriben por PATCH: solo los toca el médico tratante (ni el admin).
+_CLINICAL_UPDATE_FIELDS = frozenset({"chief_complaint", "clinical_notes", "internal_note"})
 
 
 def _validate_status(value: str | None) -> None:
@@ -171,6 +175,8 @@ async def create_consultation(session: AsyncSession, data: ConsultationCreate) -
     if consultation.category is None and needs:
         consultation.category = needs[0]
     if consultation.chief_complaint is None:
+        # `patient.description` es un `Sealed` de otra columna: se asigna tal cual y el tipo lo
+        # re-cifra para `consultations.chief_complaint` (el AAD ata cada texto a su columna).
         consultation.chief_complaint = patient.description or (", ".join(needs) or None)
     if data.priority == "normal":
         consultation.priority = compute_priority(needs)
@@ -193,6 +199,17 @@ def _ensure_can_manage(
         raise ConflictError("La consulta está asignada a otro médico.")
 
 
+def _ensure_can_write_clinical(
+    consultation: Consultation, actor_user_id: uuid.UUID | None, actor_practices: bool
+) -> None:
+    """Escribir texto clínico (motivo, notas, nota de cierre, motivo de derivación, eventos con
+    nota) es del médico tratante: habilitado (`actor_practices`) y asignado a ESTE caso. El admin
+    gestiona estado/asignación/`nota_admin`, pero no escribe (ni pisa) la nota del médico.
+    Va después de `_ensure_can_manage`: un médico sobre un caso ajeno sigue recibiendo 409."""
+    if not actor_practices or consultation.assigned_doctor_id != actor_user_id:
+        raise ForbiddenError("Solo el médico que atiende el caso escribe sus notas clínicas.")
+
+
 async def close_consultation(
     session: AsyncSession,
     consultation_id: uuid.UUID,
@@ -201,13 +218,17 @@ async def close_consultation(
     note: str | None = None,
     signature: str | None = None,
     actor_is_admin: bool = False,
+    actor_practices: bool = False,
 ) -> Consultation:
     """Cierra una consulta (`closed`) o la marca como ausencia (`patient_no_show`), guardando la
-    nota, la firma del médico (acto firmado, base para récipes) y el evento de auditoría."""
+    nota, la firma del médico (acto firmado, base para récipes) y el evento de auditoría. La
+    nota es clínica: solo con el médico tratante (un admin cierra sin nota)."""
     if outcome not in _CLOSE_OUTCOMES:
         raise UnprocessableError(f"Resultado inválido. Permitidos: {sorted(_CLOSE_OUTCOMES)}")
     consultation = await get_consultation(session, consultation_id)
     _ensure_can_manage(consultation, closed_by, actor_is_admin)
+    if note is not None:
+        _ensure_can_write_clinical(consultation, closed_by, actor_practices)
     consultation.status = outcome
     consultation.closed_at = datetime.now(UTC)
     if note is not None:
@@ -259,6 +280,7 @@ async def _add_scheduled_child(
         patient_id=parent.patient_id,
         assigned_doctor_id=assigned_doctor_id,
         specialty_id=parent.specialty_id,
+        # `Sealed` tal cual: misma columna, se guarda el mismo texto cifrado sin descifrarlo.
         chief_complaint=parent.chief_complaint,
         category=parent.category,
         priority=parent.priority,
@@ -289,11 +311,15 @@ async def schedule_follow_up(
     signature: str | None,
     actor_user_id: uuid.UUID | None,
     actor_is_admin: bool = False,
+    actor_practices: bool = False,
 ) -> Consultation:
     """Cierra la consulta padre (firmada) y crea una HIJA agendada para `scheduled_at`, continuando
-    la cadena (mismo paciente, mismo médico). Todo en una transacción. Ver el módulo Agenda."""
+    la cadena (mismo paciente, mismo médico). Todo en una transacción. Ver el módulo Agenda.
+    La nota de cierre es clínica: solo con el médico tratante."""
     parent = await get_consultation(session, parent_id)
     _ensure_can_manage(parent, actor_user_id, actor_is_admin)
+    if closing_note is not None:
+        _ensure_can_write_clinical(parent, actor_user_id, actor_practices)
     _ensure_future(scheduled_at)
 
     # 1) Cerrar el padre (firmado).
@@ -345,13 +371,16 @@ async def schedule_referral(
     signature: str | None,
     actor_user_id: uuid.UUID | None,
     actor_is_admin: bool = False,
+    actor_practices: bool = False,
 ) -> Consultation:
     """Agendar con especialista (REFERENCIA): entrega la consulta a OTRO médico. El padre queda
     'referred_to_specialist' (ya no lo atiende el médico actual) y se crea una HIJA agendada
     asignada al médico invitado, con el motivo firmado. El referido ve las notas previas (chain).
-    Distinto de 'Agendar seguimiento' (mismo médico) y de una Interconsulta (en vivo, limitada)."""
+    Distinto de 'Agendar seguimiento' (mismo médico) y de una Interconsulta (en vivo, limitada).
+    El motivo es clínico: solo refiere el médico tratante."""
     parent = await get_consultation(session, parent_id)
     _ensure_can_manage(parent, actor_user_id, actor_is_admin)
+    _ensure_can_write_clinical(parent, actor_user_id, actor_practices)
     _ensure_future(scheduled_at)
     if invited_doctor_id == parent.assigned_doctor_id:
         raise ConflictError("El especialista debe ser otro médico (usa 'Agendar seguimiento').")
@@ -466,6 +495,22 @@ async def get_chain(session: AsyncSession, consultation_id: uuid.UUID) -> list[C
         )
         queue.extend((await session.scalars(children_stmt)).all())
     return chain
+
+
+def lineage_ids(chain: list[Consultation], consultation_id: uuid.UUID) -> set[uuid.UUID]:
+    """El caso pedido y sus ANCESTROS dentro de la cadena (sube por `parent_consultation_id`).
+
+    Es lo que hereda el médico que trata el caso pedido: las notas previas que llevaron a él. Las
+    hijas y las ramas hermanas (p. ej. la derivación que tomó otro especialista) no: esas son de
+    su propio equipo tratante."""
+    by_id = {c.id: c for c in chain}
+    lineage: set[uuid.UUID] = set()
+    current = by_id.get(consultation_id)
+    while current is not None and current.id not in lineage:
+        lineage.add(current.id)
+        parent_id = current.parent_consultation_id
+        current = by_id.get(parent_id) if parent_id is not None else None
+    return lineage
 
 
 async def claim_consultation(
@@ -771,6 +816,7 @@ async def refer_to_queue(
     signature: str | None,
     actor_user_id: uuid.UUID,
     actor_is_admin: bool,
+    actor_practices: bool = False,
 ) -> Consultation:
     """Derivar con especialista desde un caso YA atendido: el médico cierra su parte (firmada) y
     el paciente entra a la cola de la especialidad destino, sin cita.
@@ -782,11 +828,13 @@ async def refer_to_queue(
       Evento `derived` con el motivo: es lo que ve el especialista.
 
     El cierre del padre es condicional (sigue abierto y con el mismo médico): si en el medio un
-    admin lo cerró o lo reasignó, 409 en vez de derivar un caso que ya no es de quien deriva."""
+    admin lo cerró o lo reasignó, 409 en vez de derivar un caso que ya no es de quien deriva.
+    El motivo es clínico: solo deriva el médico tratante."""
     parent = await get_consultation(session, parent_id)
     if parent.assigned_doctor_id is None or parent.status not in _OPEN_ASSIGNED_STATUSES:
         raise ConflictError("Solo se deriva con especialista un caso que se está atendiendo.")
     _ensure_can_manage(parent, actor_user_id, actor_is_admin)
+    _ensure_can_write_clinical(parent, actor_user_id, actor_practices)
     target = await _derivation_target(session, target_specialty_id, parent.specialty_id)
 
     now = datetime.now(UTC)
@@ -817,7 +865,7 @@ async def refer_to_queue(
         patient_id=parent.patient_id,
         specialty_id=target.id,
         derived_from_specialty_id=parent.specialty_id,
-        chief_complaint=parent.chief_complaint,
+        chief_complaint=parent.chief_complaint,  # `Sealed` tal cual (misma columna)
         category=parent.category,
         priority=parent.priority,
         status="waiting",
@@ -857,7 +905,7 @@ class Derivation:
 
     from_specialty: str | None
     by_name: str | None
-    reason: str | None
+    reason: Sealed | str | None  # nota clínica: se revela solo en el esquema, con permiso
     at: datetime
 
 
@@ -945,11 +993,18 @@ async def update_consultation(
     data: ConsultationUpdate,
     actor_user_id: uuid.UUID | None = None,
     actor_is_admin: bool = False,
+    actor_practices: bool = False,
 ) -> Consultation:
+    """PATCH de la consulta. `actor_practices` = el actor ejerce como médico habilitado; con
+    eso y la asignación se decide si puede escribir motivo/notas (`_ensure_can_write_clinical`):
+    el admin cambia estado, prioridad, asignación, `nota_admin` y `admin_seguimiento`, pero un
+    campo clínico en su PATCH es 403, y asignarse el caso a sí mismo también."""
     _validate_status(data.status)
     consultation = await get_consultation(session, consultation_id)
     _ensure_can_manage(consultation, actor_user_id, actor_is_admin)
     changes = data.model_dump(exclude_unset=True)
+    if changes.keys() & _CLINICAL_UPDATE_FIELDS:
+        _ensure_can_write_clinical(consultation, actor_user_id, actor_practices)
     # Un no-admin NO asigna consultas por PATCH: puede liberar la suya (None) o dejarla igual.
     # Tomar una consulta es SOLO vía el claim atómico (POST /{id}/claim o /queue/{id}/take):
     # un PATCH read-then-write reabriría la carrera que el claim resuelve en la base (dos
@@ -967,6 +1022,19 @@ async def update_consultation(
             raise ConflictError(
                 "Tomar una consulta es vía el claim atómico (POST /consultations/{id}/claim)."
             )
+    # Nadie se asigna un caso a sí mismo por PATCH, tampoco el admin: un admin que además ejerce
+    # quedaría como médico tratante (acceso clínico completo) de cualquier caso, incluso de uno
+    # que atiende otro médico. Asignar a OTRO médico sí es gestión admin; tomarlo para sí, solo
+    # por el claim atómico (POST /{id}/claim o /queue/{id}/take).
+    if (
+        "assigned_doctor_id" in changes
+        and changes["assigned_doctor_id"] is not None
+        and changes["assigned_doctor_id"] == actor_user_id
+        and consultation.assigned_doctor_id != actor_user_id
+    ):
+        raise ForbiddenError(
+            "No puedes asignarte un caso a ti mismo: tómalo desde la cola (claim atómico)."
+        )
     for field, value in changes.items():
         setattr(consultation, field, value)
     await audit.log_action(
@@ -1033,6 +1101,7 @@ async def create_event(
     data: ConsultationEventCreate,
     created_by: uuid.UUID | None = None,
     actor_is_admin: bool = False,
+    actor_practices: bool = False,
 ) -> ConsultationEvent:
     consultation = await get_consultation(session, consultation_id)  # 404 si no existe
     # Mismo anti-IDOR que update/close: los eventos son el historial/auditoría del caso;
@@ -1041,6 +1110,10 @@ async def create_event(
     _ensure_can_manage(consultation, created_by, actor_is_admin)
     if data.consultation_id != consultation_id:
         raise BadRequestError("El consultation_id del cuerpo no coincide con el de la ruta.")
+    # La nota de un evento es texto clínico: solo la escribe el médico tratante. El admin puede
+    # registrar eventos sin nota (p. ej. un cambio de estado).
+    if data.note is not None:
+        _ensure_can_write_clinical(consultation, created_by, actor_practices)
     # created_by SIEMPRE del JWT (no del body) — anti-IDOR.
     event = ConsultationEvent(
         consultation_id=data.consultation_id,

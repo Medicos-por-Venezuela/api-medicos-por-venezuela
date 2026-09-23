@@ -12,6 +12,7 @@ from src.core.config import settings
 from src.models.doctor import Doctor
 from src.models.doctor_specialty import DoctorSpecialty
 from src.models.profile import Profile
+from src.models.rbac import Role, UserRole
 from src.models.specialty import Specialty
 
 # La cola es por especialidad exacta: un médico sin especialidad no ve ni toma ningún caso. Las
@@ -124,6 +125,16 @@ async def set_specialties(session: AsyncSession, user_id: uuid.UUID, names: list
     profile.specialty = names[0] if names else None
     for specialty_id in ids:
         session.add(DoctorSpecialty(user_id=user_id, specialty_id=specialty_id))
+    await session.flush()
+
+
+async def grant_roles(session: AsyncSession, user_id: uuid.UUID, codes: list[str]) -> None:
+    """Roles EXTRA en `user_roles` (RBAC multi-rol), p. ej. `["doctor"]` para un admin que además
+    ejerce. El del `users.role` ya lo pone un trigger al crear el perfil: repetirlo choca con
+    `uq_user_roles_active`."""
+    for code in codes:
+        role_id = (await session.execute(select(Role.id).where(Role.code == code))).scalar_one()
+        session.add(UserRole(user_id=user_id, role_id=role_id))
     await session.flush()
 
 

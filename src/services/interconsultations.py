@@ -3,6 +3,11 @@
 Ver .knowledge/interconsultas.md. La consulta sigue ABIERTA. El médico que atiende invita a UN
 médico del pool; ambos comparten el video. El invitado ve datos LIMITADOS (motivo, notas, edad).
 No confundir con "Agendar con Especialista" (que cierra la consulta y agenda para otro día).
+
+Contenido clínico (motivo, notas, nota de la invitación): cifrado en la BD y descifrado solo para
+el equipo tratante de ESE caso — el médico asignado y el invitado (decisión 2026-09-23). El admin
+ve la interconsulta con esos campos en null. Cada lectura concedida va al audit_log con
+`resource = "consultations"` y el id de la consulta.
 """
 
 import uuid
@@ -11,12 +16,16 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import ConflictError, ForbiddenError, NotFoundError
+from src.core.security import Principal
 from src.models.consultation import Consultation
 from src.models.interconsultation import Interconsultation
 from src.models.patient import Patient
 from src.models.profile import Profile
+from src.schemas.clinical import ClinicalGrant, clinical_context
 from src.schemas.interconsultation import InterconsultationForInvitee, InterconsultationResponse
-from src.services import audit
+from src.services import audit, clinical_access
+
+_RESOURCE = "consultations"
 
 
 async def _invited_name(session: AsyncSession, invited_doctor_id: uuid.UUID) -> str | None:
@@ -24,16 +33,21 @@ async def _invited_name(session: AsyncSession, invited_doctor_id: uuid.UUID) -> 
     return await session.scalar(select(Profile.full_name).where(Profile.id == invited_doctor_id))
 
 
-def _to_response(inter: Interconsultation, invited_name: str | None) -> InterconsultationResponse:
-    return InterconsultationResponse(
-        id=inter.id,
-        consultation_id=inter.consultation_id,
-        invited_doctor_id=inter.invited_doctor_id,
-        invited_doctor_name=invited_name,
-        created_by_id=inter.created_by_id,
-        status=inter.status,
-        note=inter.note,
-        created_at=inter.created_at,
+def _to_response(
+    inter: Interconsultation, invited_name: str | None, grant: ClinicalGrant | None
+) -> InterconsultationResponse:
+    return InterconsultationResponse.model_validate(
+        {
+            "id": inter.id,
+            "consultation_id": inter.consultation_id,
+            "invited_doctor_id": inter.invited_doctor_id,
+            "invited_doctor_name": invited_name,
+            "created_by_id": inter.created_by_id,
+            "status": inter.status,
+            "note": inter.note,
+            "created_at": inter.created_at,
+        },
+        context=clinical_context(grant),
     )
 
 
@@ -42,14 +56,16 @@ async def create_interconsultation(
     *,
     consultation_id: uuid.UUID,
     invited_doctor_id: uuid.UUID,
-    created_by_id: uuid.UUID,
+    principal: Principal,
     note: str | None = None,
+    ip: str | None = None,
 ) -> InterconsultationResponse:
     """El médico que ATIENDE invita a UN médico del pool. La consulta sigue abierta.
 
     Guardas: la consulta existe; quien invita es el médico asignado; no se invita a sí mismo;
     1 interconsulta por consulta (por ahora).
     """
+    created_by_id = principal.id
     consultation = await session.get(Consultation, consultation_id)
     if consultation is None:
         raise NotFoundError("Consulta no encontrada.")
@@ -94,26 +110,54 @@ async def create_interconsultation(
     await session.commit()
     await session.refresh(inter)
 
-    return _to_response(inter, await _invited_name(session, invited_doctor_id))
+    # Quien invita es el asignado (comprobado arriba): su propia nota vuelve en claro si ejerce.
+    grant = clinical_access.treating_doctor_grant(principal, consultation.assigned_doctor_id)
+    response = _to_response(inter, await _invited_name(session, invited_doctor_id), grant)
+    await clinical_access.audit_clinical_read(
+        session, principal=principal, ip=ip, resource=_RESOURCE, grants=[(consultation_id, grant)]
+    )
+    return response
 
 
 async def get_for_consultation(
-    session: AsyncSession, consultation_id: uuid.UUID
+    session: AsyncSession, consultation_id: uuid.UUID, *, principal: Principal, ip: str | None
 ) -> InterconsultationResponse | None:
-    """La interconsulta de una consulta (para el médico que atiende). None si no hay."""
+    """La interconsulta de una consulta. None si no hay.
+
+    Solo para el médico habilitado asignado a esa consulta (con la nota en claro) o un admin
+    (la misma respuesta con la nota en null). Cualquier otro médico recibe 403 y el intento queda
+    en el audit_log: antes bastaba ser staff para leer la nota de la interconsulta de cualquier
+    caso conociendo su id."""
+    consultation = await session.get(Consultation, consultation_id)
+    if consultation is None:
+        raise NotFoundError("Consulta no encontrada.")
+    grant = clinical_access.treating_doctor_grant(principal, consultation.assigned_doctor_id)
+    if grant is None and not principal.is_admin:
+        await clinical_access.audit_clinical_denied(
+            session, principal=principal, ip=ip, resource=_RESOURCE, resource_id=consultation_id
+        )
+        raise ForbiddenError("Solo el médico que atiende la consulta puede ver su interconsulta.")
     inter = await session.scalar(
         select(Interconsultation).where(Interconsultation.consultation_id == consultation_id)
     )
     if inter is None:
         return None
-    return _to_response(inter, await _invited_name(session, inter.invited_doctor_id))
+    response = _to_response(inter, await _invited_name(session, inter.invited_doctor_id), grant)
+    await clinical_access.audit_clinical_read(
+        session, principal=principal, ip=ip, resource=_RESOURCE, grants=[(consultation_id, grant)]
+    )
+    return response
 
 
 async def list_for_invitee(
-    session: AsyncSession, invited_doctor_id: uuid.UUID
+    session: AsyncSession, principal: Principal, *, ip: str | None
 ) -> list[InterconsultationForInvitee]:
     """Interconsultas asignadas a un médico invitado, con datos LIMITADOS (motivo, notas, edad y
-    el video para unirse) — SIN identidad del paciente."""
+    el video para unirse) — SIN identidad del paciente.
+
+    El invitado es equipo tratante de ESE caso: ve motivo y notas si está habilitado para ejercer
+    (`interconsultation_grant`). La lectura queda auditada con los ids de las consultas."""
+    invited_doctor_id = principal.id
     stmt = (
         select(
             Interconsultation.id,
@@ -133,18 +177,17 @@ async def list_for_invitee(
         .order_by(Interconsultation.created_at.desc())
     )
     rows = (await session.execute(stmt)).all()
-    return [
-        InterconsultationForInvitee(
-            id=r.id,
-            consultation_id=r.consultation_id,
-            status=r.status,
-            note=r.note,
-            chief_complaint=r.chief_complaint,
-            internal_note=r.internal_note,
-            clinical_notes=r.clinical_notes,
-            patient_age_range=r.patient_age_range,
-            video_room_url=r.video_room_url,
-            created_at=r.created_at,
-        )
+    # Una sola vía para todo el listado: el filtro de arriba ya garantiza que es el invitado.
+    grant = clinical_access.interconsultation_grant(principal)
+    response = [
+        InterconsultationForInvitee.model_validate(r._asdict(), context=clinical_context(grant))
         for r in rows
     ]
+    await clinical_access.audit_clinical_read(
+        session,
+        principal=principal,
+        ip=ip,
+        resource=_RESOURCE,
+        grants=[(r.consultation_id, grant) for r in rows],
+    )
+    return response

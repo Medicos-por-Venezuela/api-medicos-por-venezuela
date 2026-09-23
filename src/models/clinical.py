@@ -10,7 +10,9 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
+from src.core.clinical_crypto import Sealed
 from src.db.base import Base
+from src.db.encrypted import EncryptedText
 
 
 def _consultation_fk() -> Mapped[uuid.UUID]:
@@ -26,8 +28,12 @@ class Prescription(Base):
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
     consultation_id: Mapped[uuid.UUID] = _consultation_fk()
-    medications: Mapped[str] = mapped_column(Text, nullable=False)
-    instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    medications: Mapped[Sealed] = mapped_column(
+        EncryptedText("prescriptions.medications"), nullable=False
+    )
+    instructions: Mapped[Sealed | None] = mapped_column(
+        EncryptedText("prescriptions.instructions"), nullable=True
+    )
     pdf_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     issued_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -41,8 +47,10 @@ class Referral(Base):
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
     consultation_id: Mapped[uuid.UUID] = _consultation_fk()
-    referred_to: Mapped[str] = mapped_column(Text, nullable=False)
-    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    referred_to: Mapped[Sealed] = mapped_column(
+        EncryptedText("referrals.referred_to"), nullable=False
+    )
+    reason: Mapped[Sealed] = mapped_column(EncryptedText("referrals.reason"), nullable=False)
     pdf_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     issued_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -57,7 +65,7 @@ class RestNote(Base):
     )
     consultation_id: Mapped[uuid.UUID] = _consultation_fk()
     days: Mapped[int] = mapped_column(Integer, nullable=False)
-    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[Sealed] = mapped_column(EncryptedText("rest_notes.reason"), nullable=False)
     pdf_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     issued_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -71,7 +79,7 @@ class TreatmentPlan(Base):
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
     consultation_id: Mapped[uuid.UUID] = _consultation_fk()
-    plan: Mapped[str] = mapped_column(Text, nullable=False)
+    plan: Mapped[Sealed] = mapped_column(EncryptedText("treatment_plans.plan"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -86,7 +94,7 @@ class FollowUp(Base):
     consultation_id: Mapped[uuid.UUID] = _consultation_fk()
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'pending'"))
-    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    notes: Mapped[Sealed | None] = mapped_column(EncryptedText("follow_ups.notes"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -100,7 +108,7 @@ class Message(Base):
     )
     consultation_id: Mapped[uuid.UUID] = _consultation_fk()
     sender_role: Mapped[str] = mapped_column(Text, nullable=False)
-    body: Mapped[str] = mapped_column(Text, nullable=False)
+    body: Mapped[Sealed] = mapped_column(EncryptedText("messages.body"), nullable=False)
     sent_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

@@ -2,6 +2,10 @@
 
 No confundir con `/interconsultations`, que es la segunda opinión EN VIVO durante una consulta
 activa de la cola. Ver .knowledge/interconsultas.md.
+
+Motivo y notas van cifrados en la BD. Los ve en claro el médico que pide (de sus solicitudes) y
+el especialista que tomó el caso; la bandeja muestra solo el motivo; el admin, nada
+(`clinical_access` dice con qué nivel se generó cada respuesta). Toda lectura queda auditada.
 """
 
 import uuid
@@ -10,6 +14,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
+from src.core.observability import client_ip
 from src.core.ratelimit import limiter
 from src.core.security import Principal, require_permission
 from src.db.session import get_db
@@ -44,7 +49,7 @@ _TAKE = "interconsultation_requests.take"  # darla
     status_code=status.HTTP_201_CREATED,
     summary="Solicitar una interconsulta",
     responses={
-        403: {"description": "El paciente no fue registrado por quien llama."},
+        403: {"description": "El paciente no fue registrado por quien llama (queda auditado)."},
         404: {"description": "Paciente o especialidad no encontrados."},
         409: {"description": "No puedes pedirte una interconsulta a vos mismo."},
         422: {
@@ -67,14 +72,17 @@ async def create_request(
     """Crea la solicitud y difunde el aviso por correo.
 
     En modo `specialty` le llega a todos los médicos habilitados de esa especialidad; en modo
-    `doctor`, solo al elegido. `notified_count` dice a cuántos se les avisó.
+    `doctor`, solo al elegido. `notified_count` dice a cuántos se les avisó. El correo no lleva
+    el motivo (sin texto clínico fuera de la API): solo especialidad, edad y enlace al panel.
 
     El envío va en segundo plano y es best-effort: que un correo falle **no** cambia el 201 ni
     deshace la solicitud.
 
     `request` es obligatorio para slowapi (lee la IP), aunque no se use aquí. El tope existe
     porque una sola petición dispara hasta `MAIL_FANOUT_MAX` correos a médicos reales."""
-    response, difusion = await requests_service.create_request(db, payload, principal.id)
+    response, difusion = await requests_service.create_request(
+        db, payload, principal, ip=client_ip(request)
+    )
     background.add_task(send_bulk, **difusion)
     return response
 
@@ -85,6 +93,7 @@ async def create_request(
     summary="Mis solicitudes de interconsulta",
 )
 async def list_my_requests(
+    request: Request,
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -94,7 +103,9 @@ async def list_my_requests(
 
     Si un caso ya fue tomado, incluye la identidad y el contacto del especialista — que es el
     objetivo del flujo: que los dos médicos se hablen."""
-    return await requests_service.list_mine(db, principal.id, skip=skip, limit=limit)
+    return await requests_service.list_mine(
+        db, principal, ip=client_ip(request), skip=skip, limit=limit
+    )
 
 
 @router.get(
@@ -104,6 +115,7 @@ async def list_my_requests(
     responses={403: {"description": "Requiere el permiso interconsultation_requests.take."}},
 )
 async def inbox(
+    request: Request,
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -111,9 +123,12 @@ async def inbox(
 ) -> list[InterconsultationRequestInbox]:
     """Solicitudes ABIERTAS de tu especialidad, más las dirigidas a vos.
 
-    **Anonimizadas**: motivo, notas y rango etario del paciente. Ni su identidad ni la del
-    médico que pide — el caso se elige por el caso."""
-    return await requests_service.inbox(db, principal.id, skip=skip, limit=limit)
+    **Anonimizadas**: motivo y rango etario del paciente. Ni su identidad ni la del médico que
+    pide — el caso se elige por el caso. Las notas clínicas salen en null hasta tomarlo
+    (`clinical_access = "summary"`, como la cola)."""
+    return await requests_service.inbox(
+        db, principal, ip=client_ip(request), skip=skip, limit=limit
+    )
 
 
 @router.get(
@@ -122,6 +137,7 @@ async def inbox(
     summary="Casos activos que tomé",
 )
 async def taken_by_me(
+    request: Request,
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -129,7 +145,9 @@ async def taken_by_me(
 ) -> list[InterconsultationRequestTaken]:
     """Los casos que tomaste y siguen abiertos, con el contacto del médico tratante. Sin esta
     lista perderías ese contacto al recargar la página."""
-    return await requests_service.taken_by_me(db, principal.id, skip=skip, limit=limit)
+    return await requests_service.taken_by_me(
+        db, principal, ip=client_ip(request), skip=skip, limit=limit
+    )
 
 
 @router.post(
@@ -137,7 +155,7 @@ async def taken_by_me(
     response_model=InterconsultationRequestTaken,
     summary="Tomar una solicitud de interconsulta",
     responses={
-        403: {"description": "La interconsulta no es para tu especialidad."},
+        403: {"description": "La interconsulta no es para tu especialidad (queda auditado)."},
         404: {"description": "Solicitud no encontrada."},
         409: {"description": "Otro especialista ya la tomó, o ya no está abierta."},
     },
@@ -145,14 +163,19 @@ async def taken_by_me(
 async def take_request(
     request_id: uuid.UUID,
     background: BackgroundTasks,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission(_TAKE)),
 ) -> InterconsultationRequestTaken:
     """Asigna la solicitud a quien llama y le devuelve el contacto del médico tratante.
 
     Carrera resuelta con bloqueo de fallo rápido: si dos especialistas la toman a la vez, uno
-    recibe 200 y el otro **409** de inmediato, sin quedarse colgado."""
-    respuesta, aviso = await requests_service.take(db, request_id, principal.id)
+    recibe 200 y el otro **409** de inmediato, sin quedarse colgado.
+
+    Quien lo toma pasa a ser equipo tratante del caso: recibe motivo y notas en claro."""
+    respuesta, aviso = await requests_service.take(
+        db, request_id, principal, ip=client_ip(request)
+    )
     if aviso:
         background.add_task(send_mail, **aviso)
     return respuesta
@@ -163,18 +186,19 @@ async def take_request(
     response_model=InterconsultationRequestResponse,
     summary="Cancelar mi solicitud (aún sin tomar)",
     responses={
-        403: {"description": "La solicitud no es tuya."},
+        403: {"description": "La solicitud no es tuya (queda auditado)."},
         404: {"description": "Solicitud no encontrada."},
         409: {"description": "Ya fue tomada: no se puede cancelar."},
     },
 )
 async def cancel_request(
     request_id: uuid.UUID,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission(_WRITE)),
 ) -> InterconsultationRequestResponse:
     """Retira una solicitud que nadie tomó todavía. Solo el médico que la creó."""
-    return await requests_service.cancel(db, request_id, principal.id)
+    return await requests_service.cancel(db, request_id, principal, ip=client_ip(request))
 
 
 @router.post(
@@ -182,13 +206,14 @@ async def cancel_request(
     response_model=InterconsultationRequestResponse,
     summary="Cerrar mi caso (solo el médico tratante)",
     responses={
-        403: {"description": "La solicitud no es tuya (el especialista NO cierra el caso)."},
+        403: {"description": "No es tuya: el especialista NO cierra el caso (auditado)."},
         404: {"description": "Solicitud no encontrada."},
         409: {"description": "Solo se cierra un caso que un especialista haya tomado."},
     },
 )
 async def close_request(
     request_id: uuid.UUID,
+    request: Request,
     payload: InterconsultationRequestClose | None = None,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission(_WRITE)),
@@ -198,5 +223,9 @@ async def close_request(
     Es exclusivo del médico **tratante**: el especialista no cierra ni suelta el caso. Quien
     sabe si la ayuda sirvió es quien la pidió."""
     return await requests_service.close(
-        db, request_id, principal.id, payload.closing_note if payload else None
+        db,
+        request_id,
+        principal,
+        payload.closing_note if payload else None,
+        ip=client_ip(request),
     )
