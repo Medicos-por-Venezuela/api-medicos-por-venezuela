@@ -90,6 +90,6 @@ via, tiers, ids}`, `ip`, `correlation_id`, `created_at`. Un listado = una fila c
 - `db/migrations/20260923_134911_rls_tablas_clinicas_deny_all.sql`: deny-all en tablas clínicas,
   fuera las policies `USING (true)` de `treatment_plans`/`messages`, fuera TRUNCATE, índice GIN
   del audit.
-- `db/post-backfill/…_clinical_ciphertext_checks…sql`: CHECK `enc:v1:%`. Se promueve a
-  `db/migrations/` en un PR posterior, tras el backfill en prod.
+- `db/migrations/20260923_214425_clinical_ciphertext_checks.sql`: CHECK `enc:v1:%` en las 18
+  columnas. Vivió en `db/post-backfill/` hasta que prod terminó el backfill (2026-09-23).
 - `scripts/encrypt_clinical_data.py`: backfill/rotación en Python (la clave no toca SQL).

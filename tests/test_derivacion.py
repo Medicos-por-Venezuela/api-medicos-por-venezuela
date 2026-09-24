@@ -23,7 +23,7 @@ from src.models.consultation import Consultation
 from src.models.consultation_event import ConsultationEvent
 from src.models.patient import Patient
 from src.models.specialty import Specialty
-from tests._helpers import GENERAL, add_doctor, auth_headers, specialty_id_by_name
+from tests._helpers import GENERAL, add_doctor, auth_headers, make_profile, specialty_id_by_name
 
 PREFIX = "/api/v1"
 
@@ -187,6 +187,42 @@ async def test_derivar_un_caso_que_no_es_de_tu_cola_es_403(
         headers=auth_headers(trauma.id),
     )
     assert resp.status_code == 403, resp.text
+
+
+async def test_admin_puro_no_puede_derivar_por_no_poder_ver_el_motivo(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Un admin sin ficha de médico ve TODAS las colas (no lo frena `ensure_can_take`), pero no
+    ejerce medicina: no tiene grant clínico sobre el caso, y derivar sin poder leer el motivo no
+    tiene sentido (decisión de producto 2026-09-23). Debe dar 403 y quedar un audit de denegado,
+    igual que los otros 403 sobre un caso concreto."""
+    destino = await _specialty(db_session)
+    admin = make_profile(role="admin")
+    db_session.add(admin)
+    await db_session.flush()
+    caso = await _case(db_session, await specialty_id_by_name(db_session, GENERAL))
+
+    resp = await client.post(
+        f"{PREFIX}/consultations/{caso.id}/derive",
+        json={"specialty_id": str(destino.id)},
+        headers=auth_headers(admin.id),
+    )
+    assert resp.status_code == 403, resp.text
+
+    caso = await _reload(db_session, caso)
+    assert caso.status == "waiting" and caso.specialty_id != destino.id  # no se movió
+
+    audit = (
+        await db_session.scalars(
+            select(AuditLog).where(
+                AuditLog.action == "READ_CLINICAL_DATA",
+                AuditLog.actor_user_id == admin.id,
+                AuditLog.resource_id == str(caso.id),
+            )
+        )
+    ).all()
+    assert len(audit) == 1
+    assert audit[0].metadata_["outcome"] == "denied"
 
 
 async def test_derivar_un_caso_ya_tomado_es_409(

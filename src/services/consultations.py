@@ -3,6 +3,7 @@
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +28,9 @@ from src.services import audit, queue_access
 from src.services.doctors import practicing_doctor_exists
 from src.services.jitsi import new_room_url
 from src.services.specialties import compute_priority
+
+if TYPE_CHECKING:  # security -> services/__init__ -> consultations: import circular en runtime
+    from src.core.security import Principal
 
 # Estados en los que la consulta sigue "viva" para el heartbeat del paciente.
 _HEARTBEAT_OPEN_STATUSES = {"waiting", "in_progress"}
@@ -762,6 +766,8 @@ async def derive_in_queue(
     actor_user_id: uuid.UUID,
     actor_specialty_id: uuid.UUID | None,
     actor_is_admin: bool,
+    principal: "Principal",
+    ip: str | None = None,
 ) -> Consultation:
     """Deriva un caso que NADIE ha tomado a la cola de otra especialidad.
 
@@ -769,7 +775,14 @@ async def derive_in_queue(
     conserva `queued_at`, así que no pierde su turno. Solo lo deriva quien lo ve en su cola.
 
     Escritura condicional sobre la especialidad que se leyó: si en el medio otro médico lo tomó
-    o lo derivó, el UPDATE no matchea y se responde 409 en vez de pisar su decisión."""
+    o lo derivó, el UPDATE no matchea y se responde 409 en vez de pisar su decisión.
+
+    Derivar sin poder leer el motivo no tiene sentido (decisión de producto 2026-09-23): además
+    de estar en su cola (`ensure_can_take`), el caller necesita el mismo permiso clínico que le
+    daría el panel sobre ESTE caso (`clinical_access.grant_for_queue_item`) — así un admin que
+    no ejerce, que sí ve todas las colas, no puede derivar un caso cuyo motivo no puede leer."""
+    from src.services import clinical_access  # diferido: mismo ciclo que `Principal`
+
     consultation = await get_consultation(session, consultation_id)
     if consultation.status != "waiting" or consultation.assigned_doctor_id is not None:
         raise ConflictError("Este caso ya no está en la cola.")
@@ -780,6 +793,23 @@ async def derive_in_queue(
         specialty_id=actor_specialty_id,
         is_admin=actor_is_admin,
     )
+    scope = await clinical_access.queue_grant(session, principal)
+    grant = clinical_access.grant_for_queue_item(
+        principal,
+        scope,
+        assigned_doctor_id=consultation.assigned_doctor_id,
+        specialty_id=consultation.specialty_id,
+        status=consultation.status,
+    )
+    if grant is None:
+        await clinical_access.audit_clinical_denied(
+            session,
+            principal=principal,
+            ip=ip,
+            resource="consultations",
+            resource_id=consultation.id,
+        )
+        raise ForbiddenError("Solo puede derivar quien puede ver el motivo del caso.")
     origin_id = consultation.specialty_id
     target = await _derivation_target(session, target_specialty_id, origin_id)
     result = await session.execute(

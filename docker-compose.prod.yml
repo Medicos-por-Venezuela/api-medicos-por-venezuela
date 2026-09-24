@@ -11,11 +11,23 @@ services:
     image: api-medicos-por-venezuela
     container_name: mpv-api
     restart: unless-stopped
+    # Solo loopback: la única entrada desde fuera es Caddy (corre en el host y hace
+    # `reverse_proxy` a 127.0.0.1:8000). Publicado en 0.0.0.0, cualquiera que llegara al
+    # puerto se saltaría el TLS y podría falsificar X-Forwarded-For (ver docs/proxy-e-ip-real.md).
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
+    networks:
+      - api
     # Inyecta las variables de entorno (Supabase, JWT, CORS...) desde el archivo.
     env_file:
       - .env.production
+    # IP de Caddy vista desde el contenedor: el gateway de la red `api`, porque el tráfico del
+    # host a 127.0.0.1:8000 llega por docker-proxy (o por NAT si userland-proxy está apagado) y
+    # en ambos casos sale del gateway. Solo de esa IP se acepta X-Forwarded-For: así el
+    # audit_log y el rate limit ven la IP real del cliente. Va aquí y no en .env.production
+    # porque está atado a la subnet de abajo, y `environment` pisa a `env_file`.
+    environment:
+      FORWARDED_ALLOW_IPS: "172.30.0.1"
     # Rotación de logs: sin esto, el json-file de Docker crece sin límite y puede llenar
     # el disco del EC2. 5 archivos de 10 MB = ~50 MB de historial por contenedor.
     logging:
@@ -25,3 +37,13 @@ services:
         max-file: "5"
     # Sin volumen de ./src ni --reload: corre el código horneado en la imagen.
     # El CMD del Dockerfile ya es: uvicorn src.main:app --host 0.0.0.0 --port 8000
+
+# Subnet fija para que la IP del gateway (= la de Caddy, ver FORWARDED_ALLOW_IPS) no cambie
+# entre recreaciones de la red. Si se cambia, hay que cambiar FORWARDED_ALLOW_IPS con ella
+# (tests/test_proxy_headers.py lo comprueba).
+networks:
+  api:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          gateway: 172.30.0.1

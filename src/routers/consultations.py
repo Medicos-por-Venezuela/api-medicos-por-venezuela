@@ -887,7 +887,12 @@ async def start_scheduled_consultation(
     summary="Derivar un caso de la cola a otra especialidad (sin tomarlo)",
     responses={
         **_NOT_FOUND,
-        403: {"description": "El caso no es de las colas del médico."},
+        403: {
+            "description": (
+                "El caso no es de las colas del médico, o quien deriva no puede ver el motivo "
+                "(p. ej. un admin que no ejerce)."
+            )
+        },
         409: {"description": "El caso ya no está en la cola o cambió mientras se derivaba."},
         422: {"description": "Especialidad de destino inválida, igual a la actual o sin médicos."},
     },
@@ -896,13 +901,15 @@ async def derive_consultation(
     consultation_id: uuid.UUID,
     payload: DeriveRequest,
     background_tasks: BackgroundTasks,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_permission("queue.take")),
 ) -> ConsultationResponse:
     """Pasa un caso que nadie tomó a la cola de otra especialidad. Es el mismo caso: conserva
-    su hora de llegada, así que el paciente no pierde el turno. Solo lo deriva quien lo ve en su
-    cola, y se le avisa al paciente por correo. El caso sigue sin médico, así que la respuesta
-    va sin contenido clínico (`clinical_access = "none"`)."""
+    su hora de llegada, así que el paciente no pierde el turno. Solo lo deriva quien puede ver
+    el motivo del caso (quien lo ve en su cola y ejerce medicina; derivar sin poder leer el
+    motivo no tiene sentido), y se le avisa al paciente por correo. El caso sigue sin médico,
+    así que la respuesta va sin contenido clínico (`clinical_access = "none"`)."""
     consultation = await consultations_service.derive_in_queue(
         db,
         consultation_id,
@@ -910,6 +917,8 @@ async def derive_consultation(
         actor_user_id=principal.id,
         actor_specialty_id=principal.specialty_id,
         actor_is_admin=principal.is_admin,
+        principal=principal,
+        ip=client_ip(request),
     )
     await _queue_derivation_email(background_tasks, db, consultation)
     return ConsultationResponse.model_validate(consultation, context=clinical_context(None))

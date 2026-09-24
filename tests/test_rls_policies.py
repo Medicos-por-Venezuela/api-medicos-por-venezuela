@@ -39,10 +39,12 @@ async def _as_browser(session: AsyncSession, user_id: uuid.UUID) -> None:
 
 
 async def _role(session: AsyncSession, user_id: uuid.UUID) -> str | None:
-    await _as_browser(session, user_id)
-    role = await session.scalar(text("select public.current_user_role()"))
-    await session.execute(text("reset role"))
-    return role
+    """El criterio de `current_user_role()` para ese usuario. Con sus claims pero SIN cambiar a
+    `authenticated`: desde 20260923_193000 el navegador ya no la ejecuta directo (las policies la
+    usan a través de is_staff/is_admin, que corren como dueño). `auth.uid()` sale de los claims."""
+    claims = json.dumps({"sub": str(user_id), "role": "authenticated"})
+    await session.execute(text("select set_config('request.jwt.claims', :c, true)"), {"c": claims})
+    return await session.scalar(text("select public.current_user_role()"))
 
 
 async def _patient_with_consultation(
@@ -281,3 +283,63 @@ async def test_realtime_conserva_solo_la_metadata_administrativa(
         ).all()
     )
     assert columnas == {"id", "status", "assigned_doctor_id"}
+
+
+# Las policies de RLS se evalúan con los privilegios de quien consulta: estas tres las necesita
+# `authenticated` (Realtime del panel, paciente viendo lo suyo, perfil propio). Ninguna otra
+# función SECURITY DEFINER se ejecuta desde el navegador: el frontend ya no llama a RPCs.
+_RLS_HELPERS = {"owns_patient", "is_admin", "is_staff"}
+
+
+async def test_navegador_no_ejecuta_funciones_security_definer(db_session: AsyncSession) -> None:
+    """20260923_193000 (Security Advisor): mark_patient_entered_call y compañía se podían llamar
+    por /rest/v1/rpc sin sesión y sin comprobar quién llamaba."""
+    rows = (
+        await db_session.execute(
+            text(
+                "select p.proname, has_function_privilege('anon', p.oid, 'execute') as anon, "
+                "has_function_privilege('authenticated', p.oid, 'execute') as auth "
+                "from pg_proc p join pg_namespace n on n.oid = p.pronamespace "
+                "where n.nspname = 'public' and p.prosecdef"
+            )
+        )
+    ).all()
+    assert rows, "debería haber funciones SECURITY DEFINER en public"
+    assert [r.proname for r in rows if r.anon] == []
+    assert {r.proname for r in rows if r.auth} == _RLS_HELPERS
+
+
+async def test_admin_users_cerrada_al_navegador(db_session: AsyncSession) -> None:
+    """Tabla heredada con password_hash: tenía policies `public` de INSERT (WITH CHECK true) y
+    SELECT, y todos los privilegios para anon/authenticated."""
+    policies = (
+        await db_session.execute(
+            text("select policyname from pg_policies where tablename = 'admin_users'")
+        )
+    ).all()
+    grants = (
+        await db_session.execute(
+            text(
+                "select privilege_type from information_schema.role_table_grants "
+                "where table_name = 'admin_users' and grantee in ('anon', 'authenticated')"
+            )
+        )
+    ).all()
+    assert policies == [] and grants == []
+
+
+async def test_funciones_de_trigger_con_search_path_fijo(db_session: AsyncSession) -> None:
+    configs = dict(
+        (
+            await db_session.execute(
+                text(
+                    "select proname, array_to_string(proconfig, ',') from pg_proc "
+                    "where proname in ('audit_log_block_write', 'generate_consultation_code')"
+                )
+            )
+        ).all()
+    )
+    assert configs == {
+        "audit_log_block_write": "search_path=public",
+        "generate_consultation_code": "search_path=public",
+    }

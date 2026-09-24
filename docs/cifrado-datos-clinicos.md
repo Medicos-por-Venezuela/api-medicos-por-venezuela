@@ -80,10 +80,12 @@ en SQL) y `address_encrypted` (ya va cifrada de extremo a extremo con otro esque
    - Es idempotente: si se corta, se vuelve a lanzar el mismo comando.
 4. Desplegar el frontend (rama `dev_aws`) con el marcador de confidencial y sin la edición de la
    nota del médico en el panel admin.
-5. PR aparte: mover `db/post-backfill/20260923_134911_clinical_ciphertext_checks_despues_del_backfill.sql`
-   a `db/migrations/` y desplegar. Añade `CHECK (col LIKE 'enc:v1:%')` en todas las columnas:
-   desde ahí, ningún texto en claro puede volver a entrar a la base, ni por SQL. Si queda algo sin
-   cifrar, la migración aborta y dice qué correr.
+5. Desplegar la migración `20260923_214425_clinical_ciphertext_checks.sql` (PR aparte, hecho
+   tras el backfill de prod del 2026-09-23). Añade `CHECK (col LIKE 'enc:v1:%')` en las 18
+   columnas: desde ahí, ningún texto en claro puede volver a entrar a la base, ni por SQL. Si
+   queda algo sin cifrar, la migración aborta y dice qué correr. No podía ir en el mismo deploy
+   que la API: `deploy.sh` migra ANTES de cambiar la imagen, y el CHECK habría rechazado las
+   escrituras de la API vieja y cualquier UPDATE sobre una fila legada.
 
 Por qué el backfill es Python y no SQL: con `pgp_sym_encrypt(texto, 'clave')` la clave quedaría
 en el texto de la consulta, en `pg_stat_statements`, en los logs de Postgres y en el historial
@@ -100,8 +102,16 @@ Si tras el backfill hay que volver a una API anterior al cifrado (que no sabe le
    docker tag api-medicos-por-venezuela api-medicos-por-venezuela:cifrado
    KID=$(docker logs mpv-api 2>&1 | grep -o 'kid=[0-9a-f]*' | tail -1 | cut -d= -f2); echo "$KID"
    ```
-2. Si ya se aplicaron los `CHECK` de `db/post-backfill/`, quitarlos (el script se niega a
-   descifrar mientras existan).
+2. Quitar los `CHECK` de texto cifrado (migración `20260923_214425`); el script se niega a
+   descifrar mientras existan. Desde el SQL Editor de Supabase:
+   ```sql
+   do $$ declare r record; begin
+     for r in select conrelid::regclass as t, conname from pg_constraint
+              where conname like '%\_cifrado' loop
+       execute format('alter table %s drop constraint %I', r.t, r.conname);
+     end loop;
+   end $$;
+   ```
 3. Desplegar la API anterior (`./deploy.sh <rama o commit anterior>`).
 4. Descifrar todo con la imagen conservada, incluido lo que la API nueva escribió mientras tanto:
    ```bash
