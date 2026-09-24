@@ -26,7 +26,7 @@ HEALTH_URL="${HEALTH_URL:-http://localhost:8000/api/v1/health}"
 # el de arriba pasa y la API está caída para el público. PUBLIC_HEALTH_URL= lo salta.
 PUBLIC_HEALTH_URL="${PUBLIC_HEALTH_URL-https://api.medicosporvenezuela.org/api/v1/health}"
 
-BRANCH="dev"
+BRANCH="main"
 ASSUME_YES=0
 for arg in "$@"; do
   case "$arg" in
