@@ -1,12 +1,11 @@
--- Migración: clinical ciphertext checks despues del backfill
--- Creada:    2026-09-23 13:49:11
+-- Migración: clinical ciphertext checks
+-- Creada:    2026-09-23 21:44:25
 --
--- ⚠️ NO está en db/migrations/ a propósito. Se mueve allí en un PR posterior, cuando en
--- producción ya se corrió `scripts/encrypt_clinical_data.py` y `--verify` da 0 pendientes.
--- Motivo: deploy.sh aplica las migraciones ANTES de cambiar la imagen. Si esto corriera en el
--- mismo deploy, rechazaría las escrituras de la API vieja (que aún guarda en claro) y cualquier
--- UPDATE sobre una fila legada (un CHECK se evalúa sobre la fila entera, aunque el UPDATE solo
--- cambie el `status`).
+-- Viene de db/post-backfill/ (PR del cifrado clínico, #114): se dejó fuera de db/migrations/ hasta
+-- que producción terminara el backfill, porque deploy.sh aplica las migraciones ANTES de cambiar
+-- la imagen y un CHECK habría rechazado las escrituras de la API vieja y cualquier UPDATE sobre
+-- una fila legada. Backfill hecho el 2026-09-23 (audit_log: clinical_data.bulk_encrypt
+-- started/finished; 0 valores en claro, verificado en solo lectura) y VACUUM FULL corrido.
 --
 -- Qué hace: garantiza a nivel de base que en estas columnas solo entra texto cifrado por la
 -- API. Un INSERT/UPDATE por SQL, por un script o por una API vieja con texto en claro falla.

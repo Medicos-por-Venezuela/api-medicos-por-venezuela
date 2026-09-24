@@ -15,8 +15,10 @@ import os
 import uuid
 
 import pytest
+import pytest_asyncio
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scripts import encrypt_clinical_data as backfill
@@ -46,6 +48,23 @@ FIELD = "consultations.chief_complaint"
 @pytest.fixture
 def ring() -> Keyring:
     return Keyring.from_config(generate_key())
+
+
+@pytest_asyncio.fixture
+async def sin_checks_de_cifrado(db_session: AsyncSession) -> None:
+    """Quita, SOLO dentro de la transacción del test, los CHECK `enc:v1:%` de la migración
+    20260923_214425: los tests del backfill y del rollback simulan filas legadas en claro, que
+    la base real ya no admite. El rollback del test los devuelve."""
+    nombres = (
+        await db_session.execute(
+            text(
+                "select conrelid::regclass::text, conname from pg_constraint "
+                r"where conname like '%\_cifrado'"
+            )
+        )
+    ).all()
+    for tabla, nombre in nombres:
+        await db_session.execute(text(f'alter table {tabla} drop constraint "{nombre}"'))
 
 
 # --- Módulo de cifrado ---
@@ -296,7 +315,9 @@ async def _asyncpg(session: AsyncSession):
 
 
 async def test_backfill_cifra_lo_legado_y_recifra_lo_rotado(
-    db_session: AsyncSession, monkeypatch
+    db_session: AsyncSession,
+    monkeypatch,
+    sin_checks_de_cifrado: None,
 ) -> None:
     vieja_key = generate_key()
     vieja = Keyring.from_config(vieja_key)
@@ -355,6 +376,7 @@ def test_generate_key_imprime_una_clave_valida(capsys) -> None:
 
 async def test_backfill_no_aborta_por_una_fila_indescifrable(
     db_session: AsyncSession,
+    sin_checks_de_cifrado: None,
 ) -> None:
     """Una fila cifrada con una clave ajena se informa por id y la corrida sigue."""
     rota = await _patient(db_session)
@@ -392,6 +414,7 @@ def test_backfill_se_niega_a_usar_la_clave_de_desarrollo_contra_una_base_remota(
 
 async def test_decrypt_deja_en_claro_y_el_ida_y_vuelta_no_pierde_nada(
     db_session: AsyncSession,
+    sin_checks_de_cifrado: None,
 ) -> None:
     """Rollback de emergencia: --decrypt devuelve exactamente el texto original, y volver a
     cifrar después funciona (el ensayo de prod hace esta misma ida y vuelta)."""
@@ -418,6 +441,7 @@ def test_decrypt_exige_confirmacion(capsys) -> None:
 
 async def test_backfill_no_pisa_lo_que_la_api_escribe_durante_la_corrida(
     db_session: AsyncSession,
+    sin_checks_de_cifrado: None,
 ) -> None:
     """Entre leer el lote y escribirlo, la API cambia una fila (un médico edita la nota): el
     UPDATE condicional no la pisa con el valor viejo cifrado, la cuenta como `raced`."""
@@ -499,7 +523,9 @@ def test_escribir_sin_operador_no_corre(capsys) -> None:
 
 
 async def test_corrida_queda_auditada_al_empezar_y_al_terminar(
-    db_session: AsyncSession, monkeypatch
+    db_session: AsyncSession,
+    monkeypatch,
+    sin_checks_de_cifrado: None,
 ) -> None:
     import asyncpg
 
@@ -536,7 +562,9 @@ async def test_corrida_queda_auditada_al_empezar_y_al_terminar(
     assert raw.startswith("enc:v1:")
 
 
-async def test_corrida_que_falla_deja_constancia(db_session: AsyncSession, monkeypatch) -> None:
+async def test_corrida_que_falla_deja_constancia(
+    db_session: AsyncSession, monkeypatch, sin_checks_de_cifrado: None
+) -> None:
     import asyncpg
 
     conn = await _asyncpg(db_session)
@@ -574,4 +602,40 @@ async def test_contar_o_verificar_no_escribe_audit(db_session: AsyncSession, mon
     await backfill.run(_args(dry_run=True))
     await backfill.run(_args(decrypt=True, verify=True))
 
+    assert len(await _corridas(db_session)) == antes
+
+
+async def test_la_base_rechaza_texto_clinico_en_claro(db_session: AsyncSession) -> None:
+    """20260923_214425: en las columnas cifradas solo entra `enc:v1:`. Un INSERT/UPDATE en claro
+    —por SQL, un script o una API vieja— falla en la base, no depende de pasar por la API."""
+    patient = await _patient(db_session, description="asma")
+    nested = await db_session.begin_nested()
+    with pytest.raises(IntegrityError, match="patients_description_cifrado"):
+        await db_session.execute(
+            text("update patients set description = 'en claro' where id = :id"),
+            {"id": patient.id},
+        )
+    await nested.rollback()
+    raw, _ = await _raw(db_session, patient.id)
+    assert raw.startswith("enc:v1:")
+
+
+async def test_decrypt_se_niega_mientras_esten_los_checks(
+    db_session: AsyncSession, monkeypatch, capsys
+) -> None:
+    """Con los CHECK de texto cifrado puestos, descifrar fallaría fila a fila: el script sale
+    antes de tocar nada ni de escribir audit, y dice qué quitar."""
+    import asyncpg
+
+    conn = await _asyncpg(db_session)
+
+    async def _connect(**_):
+        return _SinCerrar(conn)
+
+    monkeypatch.setattr(asyncpg, "connect", _connect)
+    antes = len(await _corridas(db_session))
+
+    assert await backfill.run(_args(decrypt=True, yes=True, operator="alguien@example.org")) == 2
+
+    assert "CHECK de texto cifrado" in capsys.readouterr().err
     assert len(await _corridas(db_session)) == antes
