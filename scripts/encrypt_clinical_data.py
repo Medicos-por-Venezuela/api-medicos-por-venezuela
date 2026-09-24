@@ -18,8 +18,8 @@ conteos.
 
 Rollback de emergencia (`--decrypt`): deja las columnas otra vez en claro, para volver a una
 versión de la API anterior al cifrado, que no sabe leer `enc:v1:`. Escribe datos clínicos en
-claro en la base, así que exige `--yes`, y se niega si ya están los CHECK de
-`db/post-backfill/` (los rechazarían fila a fila). Secuencia: desplegar la API vieja, correr
+claro en la base, así que exige `--yes`, y se niega si están los CHECK de texto cifrado
+(migración 20260923_214425: los rechazarían fila a fila). Secuencia: desplegar la API vieja, correr
 `--decrypt --yes` (lo que la API nueva escribió cifrado mientras tanto también se descifra) y
 `--decrypt --verify`. Se puede repetir.
 
@@ -241,8 +241,9 @@ async def run(args: argparse.Namespace) -> int:
             )
             if checks:
                 print(
-                    f"Hay {checks} CHECK de texto cifrado (db/post-backfill/): rechazarían el "
-                    "texto en claro. Quítalos antes (alter table … drop constraint …_cifrado).",
+                    f"Hay {checks} CHECK de texto cifrado (migración 20260923_214425): "
+                    "rechazarían el texto en claro. Quítalos antes "
+                    "(alter table … drop constraint …_cifrado).",
                     file=sys.stderr,
                 )
                 return 2
