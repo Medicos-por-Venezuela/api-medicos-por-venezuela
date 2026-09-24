@@ -19,9 +19,12 @@ COMPOSE="docker-compose.prod.yml"
 ENV_FILE=".env.production"
 IMAGE="api-medicos-por-venezuela"
 # localhost es lo robusto (el script corre en el propio EC2; no depende de la IP
-# pública ni del Security Group). Para chequear el acceso EXTERNO, sobreescribí:
-#   HEALTH_URL=http://100.31.160.0:8000/api/v1/health ./deploy.sh
+# pública ni del Security Group). El 8000 solo escucha en 127.0.0.1: desde fuera no
+# responde, se entra por Caddy (ver docs/proxy-e-ip-real.md).
 HEALTH_URL="${HEALTH_URL:-http://localhost:8000/api/v1/health}"
+# El mismo health pero a través de Caddy: si el upstream de Caddy no es 127.0.0.1:8000,
+# el de arriba pasa y la API está caída para el público. PUBLIC_HEALTH_URL= lo salta.
+PUBLIC_HEALTH_URL="${PUBLIC_HEALTH_URL-https://api.medicosporvenezuela.org/api/v1/health}"
 
 BRANCH="dev"
 ASSUME_YES=0
@@ -63,8 +66,17 @@ for i in $(seq 1 15); do
   sleep 2
 done
 
+if [ "${code:-}" = "200" ] && [ -n "$PUBLIC_HEALTH_URL" ]; then
+  public_code="$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_HEALTH_URL" || true)"
+  if [ "$public_code" != "200" ]; then
+    echo "❌ ERROR — la API responde en localhost pero por Caddy devuelve '${public_code:-sin respuesta}'." >&2
+    echo "   ¿El reverse_proxy de Caddy apunta a 127.0.0.1:8000? Ver docs/proxy-e-ip-real.md" >&2
+    exit 1
+  fi
+fi
+
 if [ "${code:-}" = "200" ]; then
-  echo "✅ OK — health 200. Deploy completo."
+  echo "✅ OK — health 200 (localhost y Caddy). Deploy completo."
   docker compose -f "$COMPOSE" exec -T api python artisan migrate:status | tail -n 12
 else
   echo "❌ ERROR — health devolvió '${code:-sin respuesta}'." >&2

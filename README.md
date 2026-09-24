@@ -239,6 +239,13 @@ te conectás, no algo que corras vos — por eso tampoco hace falta `host.docker
 | Cómo llega `api` a Postgres | `host.docker.internal:54322` (o nativo, sin Docker) | Pooler por internet (`DATABASE_URL`) |
 | JWT | ES256 vía JWKS (`SUPABASE_JWKS_URL` seteado) | HS256 con secreto compartido (`SUPABASE_JWKS_URL` vacío) |
 | Config | `docker-compose.yml` (valores fijos de dev) | `docker-compose.prod.yml` + `.env.production` (secretos reales) |
+| Quién llega al `:8000` | Cualquiera (`0.0.0.0`) | Solo el host (`127.0.0.1`): se entra por Caddy |
+
+**Proxy e IP real (prod):** Caddy corre en el host del EC2 y hace `reverse_proxy` a
+`127.0.0.1:8000`. uvicorn acepta `X-Forwarded-For` solo del gateway de la red docker de la API
+(`FORWARDED_ALLOW_IPS`), así que el `audit_log` y el rate limit ven la IP del cliente y nadie puede
+falsificarla. Detalle, verificación y el paso manual previo al primer deploy:
+[docs/proxy-e-ip-real.md](docs/proxy-e-ip-real.md).
 
 ## Migraciones de esquema
 
