@@ -38,7 +38,10 @@ class Tier(StrEnum):
 
 
 # Por qué se concede el acceso. Va al audit_log (`metadata.via`).
-GrantReason = Literal["patient_owner", "assigned_doctor", "queue_scope", "interconsultation"]
+# `admin_queue`: el admin ve el motivo en la cola del panel para gestionarla/triar (2026-09-27).
+GrantReason = Literal[
+    "patient_owner", "assigned_doctor", "queue_scope", "interconsultation", "admin_queue"
+]
 
 
 @dataclass(frozen=True)

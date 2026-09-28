@@ -6,7 +6,9 @@ Modelo (RBAC decide la acción, estos atributos deciden el objeto):
 - Médico invitado a una interconsulta / especialista que tomó la solicitud: igual que el
   tratante, para ESE caso (decisión de producto 2026-09-23).
 - Médico habilitado cuya cola incluye un caso SIN asignar: SUMMARY, para decidir si lo toma.
-- Admin / super_admin: nada. Ve estado, asignación, prioridad, métricas; el contenido va en null.
+- Admin / super_admin: nada, con UNA excepción: en la cola del panel (``panel_queue_grant``)
+  recibe SUMMARY de los casos en espera, porque la gestiona y necesita el motivo para triar. El
+  listado de consultas, el detalle, la cadena y los eventos le siguen dando ``none``.
   Un admin que además ejerce como médico recibe lo que le toca COMO médico, no como admin.
 
 Cada lectura concedida escribe `READ_CLINICAL_DATA` en `audit_log` con actor, ids, vía, IP y
@@ -85,6 +87,31 @@ def grant_for_queue_item(
     ):
         return summary_grant("queue_scope")
     return None
+
+
+def panel_queue_grant(
+    principal: Principal,
+    scope: "queue_access.QueueScope | None",
+    *,
+    assigned_doctor_id: uuid.UUID | None,
+    specialty_id: uuid.UUID | None,
+    status: str,
+) -> ClinicalGrant | None:
+    """Grant de una fila de la COLA DEL PANEL. Igual que `grant_for_queue_item`, pero el admin
+    —que ve todas las colas para gestionarlas— recibe SUMMARY en los casos en espera: necesita el
+    motivo para triar y derivar (decisión de producto 2026-09-27).
+
+    Es una excepción ACOTADA al panel: el listado de consultas (incluido /admin/pacientes), el
+    detalle, la cadena y los eventos le siguen dando `none`."""
+    if principal.is_admin and status == "waiting" and assigned_doctor_id is None:
+        return summary_grant("admin_queue")
+    return grant_for_queue_item(
+        principal,
+        scope,
+        assigned_doctor_id=assigned_doctor_id,
+        specialty_id=specialty_id,
+        status=status,
+    )
 
 
 async def audit_clinical_read(

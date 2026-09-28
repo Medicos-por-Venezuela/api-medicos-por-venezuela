@@ -642,15 +642,23 @@ async def test_el_dueno_sigue_leyendo_su_paciente_por_su_ruta(
 # --- Teléfono de emergencia y dirección cifrada E2E ---------------------------
 
 
-async def test_alta_publica_exige_emergencia_y_direccion(client: AsyncClient) -> None:
-    """Los dos campos son obligatorios en el alta pública (decisión del equipo)."""
+async def test_alta_publica_exige_emergencia_y_acepta_direccion_opcional(
+    client: AsyncClient,
+) -> None:
+    """El teléfono de emergencia sigue siendo obligatorio en el alta pública (decisión del
+    equipo). La dirección dejó de pedirse (2026-09-27): omitirla es válido; si viene, debe llegar
+    YA cifrada (v1:base64) por compatibilidad con clientes viejos."""
     sin_emergencia = valid_patient_payload()
     del sin_emergencia["emergency_phone"]
     assert (await client.post(f"{PREFIX}/patients", json=sin_emergencia)).status_code == 422
 
-    sin_direccion = valid_patient_payload()
+    sin_direccion = valid_patient_payload(
+        full_name="Paciente Sin Dirección",
+        phone_whatsapp="+58412000298",
+        emergency_phone="+58414000298",
+    )
     del sin_direccion["address_encrypted"]
-    assert (await client.post(f"{PREFIX}/patients", json=sin_direccion)).status_code == 422
+    assert (await client.post(f"{PREFIX}/patients", json=sin_direccion)).status_code == 201
 
     # La dirección debe llegar YA cifrada (v1:base64); texto plano se rechaza.
     plano = valid_patient_payload(address_encrypted="Calle Falsa 123")
