@@ -384,9 +384,10 @@ async def consultation_panel(
     si no ejerce ninguna especialidad no recibe colas (una sola lista).
 
     Contenido clínico por fila (`clinical_access`): en `mine`, `full`; en `waiting`, `summary`
-    (motivo, antecedentes, alergias) si el caso está en SUS colas como médico, y `none` (null) si
-    no — el admin que no ejerce los recibe todos en null. El audit va por petición (una fila
-    por vía de acceso con todos los ids), no por fila del panel."""
+    (motivo, antecedentes, alergias) si el caso está en SUS colas como médico **o si el principal
+    es admin** (ve todas las colas y necesita el motivo para triar); `none` (null) en el resto.
+    El audit va por petición (una fila por vía de acceso con todos los ids), no por fila del
+    panel."""
     waiting, mine, my_closed, scope = await consultations_service.get_panel(
         db,
         principal.id,
@@ -400,7 +401,18 @@ async def consultation_panel(
         if not principal.is_admin and clinical_access.practices_medicine(principal)
         else await clinical_access.queue_grant(db, principal)
     )
-    waiting_grants = _queue_item_grants(principal, clinical_scope, waiting)
+    # `panel_queue_grant` y no `grant_for_queue_item`: el admin recibe el motivo de los casos en
+    # espera (solo en esta vista; ver el docstring de la función).
+    waiting_grants = [
+        clinical_access.panel_queue_grant(
+            principal,
+            clinical_scope,
+            assigned_doctor_id=c.assigned_doctor_id,
+            specialty_id=c.specialty_id,
+            status=c.status,
+        )
+        for c in waiting
+    ]
     mine_grants = [_treating(principal, c) for c in mine]
     response = ConsultationPanelResponse(
         waiting=[

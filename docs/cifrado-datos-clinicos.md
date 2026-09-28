@@ -16,7 +16,7 @@ contrato para el frontend.
 | Médico tratante (asignado, habilitado) | Todo el contenido clínico del caso. |
 | Invitado a interconsulta / especialista que tomó la solicitud | Todo, de ESE caso. |
 | Médico habilitado, caso sin asignar en su cola | Motivo y antecedentes, para decidir si lo toma. |
-| admin / super_admin | Nada clínico. Estado, prioridad, asignación, `nota_admin`, métricas y auditoría. |
+| admin / super_admin | Nada clínico, con UNA excepción: en la **cola del panel** recibe motivo y antecedentes (`summary`) para triar. En el resto (listado de consultas, detalle, cadena, eventos): nada. Estado, prioridad, asignación, `nota_admin`, métricas y auditoría. |
 
 Un admin que además ejerce como médico (rol `doctor` + ficha habilitada) recibe lo que le toca
 **como médico** —los casos que tomó por la cola o por el claim—, nunca por ser admin. No puede
@@ -219,8 +219,8 @@ acabaría escrito como nota.
 }
 ```
 
-- `clinical_access`: `"full"` (tratante), `"summary"` (paciente dueño o médico viendo su cola:
-  motivo y antecedentes, sin notas) o `"none"` (sin permiso).
+- `clinical_access`: `"full"` (tratante), `"summary"` (paciente dueño, médico viendo su cola, o
+  admin en la cola del panel: motivo y antecedentes, sin notas) o `"none"` (sin permiso).
 - Regla de UI: si un campo clínico viene en `null` y `clinical_access` no es `"full"`, pintar
   **"[Información médica confidencial]"**, no un vacío. Si viene en `null` con `"full"`, está vacío.
 - El admin no envía `chief_complaint`, `internal_note` ni `clinical_notes` en el PATCH: la API

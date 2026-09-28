@@ -139,11 +139,11 @@ async def grant_roles(session: AsyncSession, user_id: uuid.UUID, codes: list[str
 
 
 def valid_patient_payload(**overrides) -> dict:
-    """Payload válido para alta pública de paciente (incluye emergency_phone y address_encrypted).
+    """Payload válido para alta pública de paciente (incluye emergency_phone).
 
-    `address_encrypted` usa un ciphertext v1 válido (base64 dummy). Los tests que necesiten
-    validaciones específicas (teléfono igual, formato inválido, etc.) deben sobrescribir
-    los campos correspondientes.
+    `address_encrypted` es legado opcional (el alta ya no la pide, 2026-09-27) y usa un ciphertext
+    v1 válido (base64 dummy). Los tests que necesiten validaciones específicas (teléfono igual,
+    formato inválido, etc.) deben sobrescribir los campos correspondientes.
     """
     base = {
         "full_name": "Paciente Test",

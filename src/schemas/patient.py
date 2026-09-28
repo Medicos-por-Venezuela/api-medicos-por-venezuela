@@ -37,8 +37,11 @@ class PatientCreate(PatientBase):
 
     # Teléfono de emergencia obligatorio en el alta pública.
     emergency_phone: str = Field(..., min_length=5, max_length=30)
-    # Dirección cifrada E2E (v1:base64 sealed box). Obligatoria en el alta pública.
-    address_encrypted: str = Field(..., pattern=r"^v1:[A-Za-z0-9+/=]+$", max_length=4000)
+    # Dirección cifrada E2E (v1:base64 sealed box). LEGADO: el alta pública ya no la pide
+    # (2026-09-27); se sigue aceptando, cifrada, por compatibilidad con clientes viejos.
+    address_encrypted: str | None = Field(
+        default=None, pattern=r"^v1:[A-Za-z0-9+/=]+$", max_length=4000
+    )
 
     @model_validator(mode="after")
     def _validaciones_alta_publica(self) -> "PatientCreate":

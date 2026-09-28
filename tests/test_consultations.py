@@ -1340,12 +1340,13 @@ async def test_el_paciente_ve_su_motivo_y_nunca_las_notas(
     assert all(r.metadata_["tiers"] == ["summary"] for r in lecturas)
 
 
-async def test_la_cola_da_el_motivo_solo_a_quien_la_atiende(
-    client: AsyncClient, db_session: AsyncSession
+async def test_la_cola_del_panel_da_el_motivo_al_medico_y_al_admin(
+    client: AsyncClient, db_session: AsyncSession, admin_identity: Profile
 ) -> None:
-    """Decisión 1 del spec: el médico cuya cola incluye el caso ve motivo, antecedentes y
-    alergias para decidir si lo toma (SUMMARY). Fuera de su cola, o siendo admin sin ejercer,
-    null."""
+    """El médico cuya cola incluye el caso ve motivo, antecedentes y alergias para decidir si lo
+    toma (SUMMARY). El admin ve TODAS las colas para gestionarlas, así que en el PANEL también
+    recibe el motivo (decisión 2026-09-27); en el listado de consultas sigue sin contenido
+    clínico."""
     cid, _ = await _caso_clinico(client, db_session)
     ajeno, _ = await _caso_clinico(client, db_session, specialty=_TRAUMA)
     doc = await add_doctor(db_session, specialty=GENERAL)
@@ -1368,15 +1369,27 @@ async def test_la_cola_da_el_motivo_solo_a_quien_la_atiende(
     assert en_board["chief_complaint"] == "Dolor torácico"
     assert en_board["internal_note"] is None
 
-    # El admin que no ejerce ve toda la cola, sin contenido clínico.
+    # El admin que no ejerce ve toda la cola CON el motivo: la gestiona y lo necesita para triar.
     admin_panel = (await client.get(f"{PREFIX}/consultations/panel")).json()
     for c in admin_panel["waiting"]:
         if c["id"] in (cid, ajeno):
-            assert c["clinical_access"] == "none"
-            assert c["chief_complaint"] is None
-            assert c["patient"]["allergies"] is None
+            assert c["clinical_access"] == "summary"
+            assert c["chief_complaint"] == "Dolor torácico"
+            assert c["patient"]["allergies"] == "Penicilina"
+    via_admin = [
+        r for r in await _lecturas(db_session, admin_identity.id) if cid in r.metadata_["ids"]
+    ]
+    assert [r.metadata_["via"] for r in via_admin] == ["admin_queue"]
+    assert all(r.metadata_["tiers"] == ["summary"] for r in via_admin)
 
-    # Un admin que además ejerce Medicina general: SUMMARY en su cola, nada fuera de ella.
+    # La excepción es SOLO del panel: el listado de consultas (el del panel admin) sigue sin
+    # contenido clínico.
+    listado = (await client.get(f"{PREFIX}/consultations")).json()
+    en_listado = next(c for c in listado if c["id"] == cid)
+    assert en_listado["clinical_access"] == "none"
+    assert en_listado["chief_complaint"] is None
+
+    # Un admin que además ejerce: en el panel recibe SUMMARY en TODA la cola, no solo en la suya.
     dual = await add_doctor(db_session, role="admin", specialty=GENERAL)
     await grant_roles(db_session, dual.id, ["doctor"])
     dual_panel = (
@@ -1385,8 +1398,8 @@ async def test_la_cola_da_el_motivo_solo_a_quien_la_atiende(
     por_id = {c["id"]: c for c in dual_panel["waiting"]}
     assert por_id[cid]["clinical_access"] == "summary"
     assert por_id[cid]["chief_complaint"] == "Dolor torácico"
-    assert por_id[ajeno]["clinical_access"] == "none"
-    assert por_id[ajeno]["chief_complaint"] is None
+    assert por_id[ajeno]["clinical_access"] == "summary"
+    assert por_id[ajeno]["chief_complaint"] == "Dolor torácico"
 
 
 async def test_tomar_de_la_cola_da_acceso_de_tratante(
