@@ -94,6 +94,28 @@ class Settings(BaseSettings):
     # Borrar esta bandera y el `if` de require_consultation_token una vez hecho el cutover.
     CONSULTATION_TOKEN_REQUIRED: bool = True
 
+    # --- Verificación de correo en el registro (código OTP de 6 dígitos) ---
+    # Secreto PROPIO para firmar el token de verificación (HS256). En producción es OBLIGATORIO
+    # definirlo por entorno (32 bytes aleatorios); el default solo sirve en local.
+    EMAIL_VERIFICATION_SECRET: str = "dev-insecure-email-verification-secret-change-me"
+    # TTL del código de 6 dígitos en minutos (60 = 1 hora, dentro del rango 30-90 pedido).
+    EMAIL_VERIFICATION_CODE_TTL_MINUTES: int = 60
+    # TTL del token de verificación emitido tras validar el código (15 min).
+    EMAIL_VERIFICATION_TOKEN_TTL_MINUTES: int = 15
+    # Máximos intentos de verificación por código (tras superarlo se marca consumido).
+    EMAIL_VERIFICATION_MAX_ATTEMPTS: int = 5
+    # Cooldown entre reenvíos en segundos (60 s).
+    EMAIL_VERIFICATION_RESEND_SECONDS: int = 60
+    # Máximo de envíos por ventana horaria móvil (5/hora).
+    EMAIL_VERIFICATION_MAX_SENDS_PER_HOUR: int = 5
+    # Gate global: si True, los endpoints de alta exigen `email_verification_token`.
+    EMAIL_VERIFICATION_REQUIRED: bool = True
+    # Dev/e2e: el endpoint de envío devuelve el código. El arranque aborta en producción.
+    EMAIL_VERIFICATION_DEBUG_CODE: bool = False
+    # Rate limits específicos para los endpoints de verificación.
+    EMAIL_VERIFICATION_SEND_RATE_LIMIT: str = "10/minute"
+    EMAIL_VERIFICATION_VERIFY_RATE_LIMIT: str = "20/minute"
+
     # --- Cifrado de datos clínicos (ver src/core/clinical_crypto.py) ---
     # AES-256-GCM, 32 bytes en base64. Vive SOLO aquí: ni en Supabase ni en el frontend. Sin
     # ella no hay forma de leer motivos ni notas de la base, así que se custodia como el
