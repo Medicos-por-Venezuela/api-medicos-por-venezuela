@@ -24,6 +24,10 @@ def _prod_secrets(monkeypatch) -> None:
         "CLINICAL_DATA_ENCRYPTION_KEY",
         "cHJvZHVjY2lvbi1jbGF2ZS1jbGluaWNhLTMyYnl0ZXM=",
     )
+    # Guard de verificación de correo (OTP): sin un secreto real, el guard nuevo aborta antes.
+    monkeypatch.setattr(
+        main_module.settings, "EMAIL_VERIFICATION_SECRET", "un-secreto-de-verificacion-real"
+    )
 
 
 async def test_lifespan_falla_en_prod_si_service_role_key_default(monkeypatch) -> None:
@@ -128,5 +132,33 @@ async def test_lifespan_clave_clinica_default_con_espacio_tambien_falla(monkeypa
     )
 
     with pytest.raises(RuntimeError, match="CLINICAL_DATA_ENCRYPTION_KEY"):
+        async with main_module.lifespan(main_module.app):
+            pass
+
+
+async def test_lifespan_falla_en_prod_si_el_secreto_de_verificacion_es_default(
+    monkeypatch,
+) -> None:
+    """Con el secreto por defecto cualquiera podría firmar tokens de verificación de correo."""
+    monkeypatch.setattr(main_module, "_IS_PROD", True)
+    _prod_secrets(monkeypatch)
+    monkeypatch.setattr(
+        main_module.settings,
+        "EMAIL_VERIFICATION_SECRET",
+        main_module._INSECURE_EMAIL_VERIFICATION_DEFAULT,
+    )
+
+    with pytest.raises(RuntimeError, match="EMAIL_VERIFICATION_SECRET"):
+        async with main_module.lifespan(main_module.app):
+            pass
+
+
+async def test_lifespan_falla_en_prod_si_el_debug_code_esta_activo(monkeypatch) -> None:
+    """El flag dev/e2e expondría el código OTP en la respuesta del endpoint de envío."""
+    monkeypatch.setattr(main_module, "_IS_PROD", True)
+    _prod_secrets(monkeypatch)
+    monkeypatch.setattr(main_module.settings, "EMAIL_VERIFICATION_DEBUG_CODE", True)
+
+    with pytest.raises(RuntimeError, match="EMAIL_VERIFICATION_DEBUG_CODE"):
         async with main_module.lifespan(main_module.app):
             pass
