@@ -163,8 +163,15 @@ Tabla `message_attachments` (nueva): `id` (uuid PK), `message_id` (uuid FK messa
 
 - CA3.1 Grant: médico tratante actual o previo en la cadena (`messages.read` + pertenencia),
   paciente dueño (sesión con `owns_patient` o `X-Consultation-Token` válido de esa consulta).
+  **«Tratante» = ejercer como médico habilitado y estar o haber estado ASIGNADO** (precisado el
+  2026-10-06, backlog C-13): el `assigned_doctor_id` actual, el de una consulta anterior de la
+  cadena, o quien escribió el evento `opened` de esta consulta —el claim— y luego fue reasignado.
+  **Haber dejado una fila en `consultation_events` NO es pertenencia**: un admin que cierra,
+  reasigna o cambia un estado deja la suya, y eso concedía lectura de los cuerpos contra CA3.2.
 - CA3.2 Sin grant, el cuerpo y nombres de archivos salen `null` (fail-closed) y la respuesta no falla; el admin con
-  `consultations.read` recibe metadatos, conteos y cuerpos/adjuntos `null`.
+  `consultations.read` recibe metadatos, conteos y cuerpos/adjuntos `null`. Esto vale **también
+  para el admin que gestionó el caso** (cerrarlo, reasignarlo, cambiarle el estado): gestionar no
+  es atender, y ninguna de esas acciones le concede lectura clínica (ver CA3.1).
 - CA3.3 Toda lectura concedida se audita con `READ_CLINICAL_DATA` (vía `messages`, una entrada por
   página, no por mensaje).
 - CA3.4 Incluye `unread_count` para el llamante (mensajes de la otra dirección sin `read_at`).
@@ -289,6 +296,76 @@ falta `WHATSAPP_APP_SECRET`.
 - CA15.2 Prohibición estricta de GIF: `image/gif` y extensión `.gif` son rechazados con HTTP 422 en la API y bloqueados en el input de cliente.
 - CA15.3 `POST /consultations/{id}/attachments`: recibe archivo multipart de médico tratante o paciente dueño. Valida magic bytes, extensión y tamaño (máx. 10 MB). Guarda en bucket privado (`chat-attachments`) y registra fila en `message_attachments` con nombre cifrado (`EncryptedText`).
 - CA15.4 `GET /consultations/{id}/attachments/{id}`: descarga y visualización segura con cabecera `X-Content-Type-Options: nosniff`. Exige pertenencia a la consulta (`clinical_access`) y registra `READ_CLINICAL_DATA`. Sin grant: 404 (médico ajeno) o 401.
+
+### R16 — Iniciar la videollamada desde el hilo (botón de cámara)
+
+> **CA16.6 a CA16.8 se reescribieron el 2026-10-06, después de la primera implementación.** La
+> primera versión mandaba en el cuerpo del mensaje un enlace con token (`/entrar-videoconsulta?c=…&t=…`).
+> Al probarlo, el cliente vio en pantalla el JWT completo —válido 24 h— porque la interfaz, al no
+> poder validar que el origen coincidía, dejaba la URL en texto plano. El criterio cambió por
+> seguridad, no por estética: el cuerpo ya no lleva secretos y la llamada ya no emite ningún token.
+> El cambio lo decidió el coordinador a partir del reporte del cliente, no el implementador. La
+> numeración se renumeró en el mismo acto (las antiguas CA16.7 y CA16.8 son hoy CA16.9 y CA16.10).
+>
+> Añadido el 2026-10-06 a pedido del cliente. Toma de `spec-chat-tiempo-real.md` §9 y D6
+> **solo el botón y la asimetría**: el médico llama, el paciente no. **No** entra en este
+> requisito nada de `call_sessions`, timbre, banner de aceptar/rechazar, cuenta atrás,
+> `call.incoming` por WebSocket ni registro del ciclo de vida de la llamada. Jitsi **no se toca**:
+> se reutiliza la sala de la consulta y se sigue abriendo en ventana aparte.
+
+El médico tratante ve en la cabecera del hilo un botón con icono de cámara que abre la
+videoconsulta. El paciente se entera por un mensaje de sistema en el propio hilo.
+
+- CA16.1 El botón vive en la cabecera del hilo de mensajería, junto al indicador de presencia del
+  paciente, y **solo se renderiza para el médico** (mismo criterio que `IndicadorPresenciaPaciente`:
+  el componente no lo pinta si el llamante es paciente, no se oculta por CSS). Hoy el hilo del
+  médico se monta únicamente en `/panel-medico/consulta/[id]`; si en el futuro se monta en el
+  buzón, el botón viaja con él.
+- CA16.2 **Habilitado solo con el paciente en línea.** Deshabilitado en cualquier otro caso, con un
+  texto que diga por qué («El paciente no está conectado»). La señal es la presencia del paciente
+  que ya recibe el hilo; no se introduce una tercera fuente de presencia.
+- CA16.3 `POST /consultations/{id}/video-call`, permiso `messages.write` **y** ser el médico
+  tratante actual o previo en la cadena. Un médico ajeno recibe 404 (no 403, criterio de CA2.1);
+  un paciente —con sesión o con `X-Consultation-Token`— recibe **404**, nunca puede iniciar la
+  llamada. Un admin no tratante recibe 404.
+- CA16.4 Asegura la sala con `ensure_video_room` (idempotente: si la consulta ya tiene
+  `video_room_url` lo reutiliza) y responde 201 con `{ room_url, message_id }`. Si la consulta no
+  admite mensajes (lista blanca de CA2.2), 409.
+- CA16.5 Crea en el hilo un **mensaje de sistema**: `sender_role = system`, `direction = system`,
+  `kind = call`, `sender_user_id` nulo, cuerpo cifrado con el aviso. El esquema ya admite esos tres
+  valores, así que **no hace falta migración**. El paciente lo ve en el hilo sin recargar, porque el
+  hilo ya refresca por su cuenta.
+- CA16.6 **El cuerpo del mensaje no contiene ninguna URL ni ningún token.** Es solo el texto del
+  aviso. Quien lo lee ya está autenticado para estar en ese hilo —el paciente por sesión o por
+  `X-Consultation-Token`, el médico por sesión—, así que la interfaz construye el acceso con el
+  contexto que ya tiene (`consultation_id` más su propia credencial) y lo presenta como un botón.
+  Razón: un enlace con token dentro del cuerpo deja un secreto de 24 h de vida escrito en el
+  historial clínico y a la vista en pantalla, visible en cualquier captura o pantalla compartida,
+  y obligaba a validar en cliente un origen que en desarrollo nunca coincide.
+- CA16.7 El botón del aviso **no navega a `/entrar-videoconsulta`**: esa página espera el token en
+  la barra de direcciones y usarla reintroduciría la fuga que CA16.6 elimina (`sala-espera.tsx` ya
+  borra ese parámetro de la URL por el mismo motivo). En su lugar ejecuta en sitio el mismo flujo
+  de la plataforma que esa página: pedir la sala a la API, marcar la entrada del paciente y abrir
+  con el ayudante de Jitsi del repo. El paciente nunca recibe un enlace a Jitsi: pulsa un botón de
+  la propia interfaz y el destino lo resuelve nuestro código tras una llamada autenticada. El
+  criterio de `video_ready_email` —donde el enlace sí es necesario, porque el destinatario no está
+  autenticado— no cambia.
+- CA16.8 Solo el **aviso más reciente** del hilo lleva botón; los anteriores quedan como constancia.
+  Todos muestran su hora. El botón del aviso es del **paciente**: el médico ya tiene el de la
+  cabecera, que pasa por el modal previo, y un segundo botón le permitiría saltárselo.
+- CA16.9 Registra `audit_log` `call.started` sin contenido. No se loguea la URL de la sala.
+- CA16.10 El médico abre la sala con el patrón vigente: `window.open` **dentro del gesto del clic**
+  (si no, el navegador lo bloquea), pasando por `browserRoomUrl` y mostrando
+  `AntesDeEntrarModal` con `para="medico"` como ya hace el detalle de la consulta. Nada de iframe:
+  la CSP declara `frame-src 'none'` y el origen niega cámara y micrófono por `Permissions-Policy`.
+
+**Limitación conocida y aceptada.** La presencia del paciente en el hilo la provee Supabase
+Realtime, y se apaga cuando la pestaña del paciente pasa a segundo plano — que es justo lo que
+ocurre al abrir Jitsi en un móvil. Consecuencia: después de que el paciente entre a la llamada, el
+médico lo verá como desconectado y el botón se deshabilitará. No rompe la llamada en curso, pero
+impide reintentar sin esperar a que el paciente vuelva a la pestaña. Resolverlo pide una señal de
+presencia duradera (el `entered_call_at` que ya existe, o la presencia calculada en la API), y
+queda fuera de este requisito.
 
 ## Requisitos no funcionales
 

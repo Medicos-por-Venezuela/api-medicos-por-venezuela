@@ -10,6 +10,7 @@ Cubre:
 """
 
 import asyncio
+import json
 import uuid
 from collections.abc import AsyncGenerator, Iterator
 from contextlib import asynccontextmanager
@@ -19,7 +20,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core import consultation_token
@@ -29,6 +30,7 @@ from src.core.ratelimit import limiter
 from src.core.security import Principal, get_optional_principal
 from src.db.session import AsyncSessionLocal, get_session_factory
 from src.main import app
+from src.models.audit_log import AuditLog
 from src.models.clinical import Message
 from src.models.consultation import Consultation
 from src.models.consultation_event import ConsultationEvent
@@ -36,6 +38,7 @@ from src.models.doctor import Doctor
 from src.models.patient import Patient
 from src.models.profile import Profile
 from src.services import messaging, notifications, storage
+from src.services.clinical_access import READ_CLINICAL_DATA
 from tests._helpers import (
     GENERAL,
     add_doctor,
@@ -1803,6 +1806,7 @@ async def test_sin_credenciales_todas_las_rutas_del_hilo_dan_401(
     assert (
         await anon_client.get(f"{PREFIX}/consultations/{cid}/attachments/{uuid.uuid4()}")
     ).status_code == 401
+    assert (await anon_client.post(f"{PREFIX}/consultations/{cid}/video-call")).status_code == 401
 
 
 async def test_staff_sin_permiso_de_mensajeria_recibe_403(
@@ -1826,6 +1830,7 @@ async def test_staff_sin_permiso_de_mensajeria_recibe_403(
     assert (
         await anon_client.get(f"{PREFIX}/consultations/{cid}/attachments/{uuid.uuid4()}")
     ).status_code == 403
+    assert (await anon_client.post(f"{PREFIX}/consultations/{cid}/video-call")).status_code == 403
 
 
 async def test_subida_sin_multipart_valido_da_422(
@@ -1913,35 +1918,54 @@ async def test_inbox_stream_se_cierra_si_falla_la_senal(
     assert "event: inbox" not in resp.text
 
 
-async def test_medico_que_intervino_en_el_caso_sigue_en_el_hilo(
+async def test_medico_reasignado_conserva_el_hilo_del_tramo_que_atendio(
     client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """Quien dejó un evento en el caso (lo atendió antes de reasignarlo) conserva el hilo."""
-    tratante = await add_doctor(db_session)
-    previo = await add_doctor(db_session)
-    cid, _, token = await _create_test_case(client, db_session, doctor=tratante)
+    """CA3.1: quien TOMÓ el caso sigue leyendo y escribiendo aunque luego se lo reasignen.
 
-    db_session.add(
-        ConsultationEvent(
-            id=uuid.uuid4(),
-            consultation_id=uuid.UUID(cid),
-            event_type="claimed",
-            created_by=previo.id,
-        )
+    Es el daño colateral a evitar al estrechar el criterio del grant (backlog C-13): su
+    asignación ya no está en la fila de la consulta, pero el evento `opened` que escribió el
+    claim sí — y ése sí significa «atendí este caso». Se monta con los endpoints reales (claim
+    atómico + reasignación del admin por PATCH), no insertando el evento a mano.
+    """
+    primero = await add_doctor(db_session, specialty=GENERAL)
+    segundo = await add_doctor(db_session, specialty=GENERAL)
+    cid, _, token = await _create_test_case(client, db_session, status="waiting")
+
+    tomado = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/claim", json={}, headers=auth_headers(primero.id)
     )
-    await db_session.flush()
+    assert tomado.status_code == 200, tomado.text
+    assert tomado.json()["assigned_doctor_id"] == str(primero.id)
 
+    # El paciente le escribe sobre el tramo que él atendió
     await anon_client.post(
         f"{PREFIX}/consultations/{cid}/messages",
         headers={"X-Consultation-Token": token},
-        json={"body": "Mensaje del paciente"},
+        json={"body": "Doctora, sigo con el dolor que le comenté"},
     )
 
-    lectura = await anon_client.get(
-        f"{PREFIX}/consultations/{cid}/messages", headers=auth_headers(previo.id)
+    # Un admin reasigna el caso a otro médico
+    reasignado = await client.patch(
+        f"{PREFIX}/consultations/{cid}", json={"assigned_doctor_id": str(segundo.id)}
     )
-    assert lectura.status_code == 200
-    assert lectura.json()["items"][0]["body"] == "Mensaje del paciente"
+    assert reasignado.status_code == 200, reasignado.text
+    assert reasignado.json()["assigned_doctor_id"] == str(segundo.id)
+
+    # `primero` ya no es el asignado y CONSERVA el hilo: lee el cuerpo y puede responder
+    lectura = await anon_client.get(
+        f"{PREFIX}/consultations/{cid}/messages", headers=auth_headers(primero.id)
+    )
+    assert lectura.status_code == 200, lectura.text
+    assert lectura.json()["clinical_access"] == "full"
+    assert lectura.json()["items"][0]["body"] == "Doctora, sigo con el dolor que le comenté"
+
+    respuesta = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/messages",
+        headers=auth_headers(primero.id),
+        json={"body": "Lo veo mañana a primera hora"},
+    )
+    assert respuesta.status_code == 201, respuesta.text
 
 
 async def test_descarga_con_token_de_otra_sala_da_404(
@@ -1964,3 +1988,597 @@ async def test_descarga_con_token_de_otra_sala_da_404(
         headers={"X-Consultation-Token": token_de_otro},
     )
     assert resp.status_code == 404
+
+
+# =====================================================================
+# 9. Iniciar la videollamada desde el hilo (R16)
+# =====================================================================
+
+
+async def _system_call_messages(db: AsyncSession, cid: str) -> list[Message]:
+    """Mensajes de sistema de llamada del hilo, en orden."""
+    rows = await db.execute(
+        select(Message)
+        .where(
+            Message.consultation_id == uuid.UUID(cid),
+            Message.sender_role == "system",
+        )
+        .order_by(Message.sent_at.asc(), Message.id.asc())
+    )
+    return list(rows.scalars().all())
+
+
+async def test_el_medico_tratante_inicia_la_llamada_y_deja_un_mensaje_de_sistema(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """CA16.3/CA16.4/CA16.5/CA16.7: 201 con `{room_url, message_id}`, un único mensaje de
+    sistema en el hilo y la traza `call.started` sin la URL de la sala."""
+    doc = await add_doctor(db_session)
+    cid, _, _ = await _create_test_case(client, db_session, doctor=doc)
+
+    resp = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(doc.id)
+    )
+    assert resp.status_code == 201, resp.text
+    data = resp.json()
+
+    # Al médico sí se le devuelve la sala de Jitsi: es la ventana que abre con el clic.
+    assert settings.JITSI_DOMAIN in data["room_url"]
+    consulta = await db_session.get(Consultation, uuid.UUID(cid))
+    assert consulta is not None
+    assert consulta.video_room_url == data["room_url"]
+
+    mensajes = await _system_call_messages(db_session, cid)
+    assert len(mensajes) == 1
+    sistema = mensajes[0]
+    assert str(sistema.id) == data["message_id"]
+    assert sistema.sender_role == "system"
+    assert sistema.direction == "system"
+    assert sistema.kind == "call"
+    assert sistema.sender_user_id is None
+    assert sistema.channel == "web"
+    # La columna apunta a una tabla que no existe (deuda declarada): se queda nula.
+    assert sistema.call_session_id is None
+
+    # Cifrado en reposo: el CHECK `messages_body_cifrado` exige el prefijo `enc:v1:`.
+    crudo = await db_session.scalar(
+        text("select body from messages where id = :id"), {"id": sistema.id}
+    )
+    assert crudo.startswith("enc:v1:")
+
+    # Auditoría: `call.started`, sin contenido y sin la URL de la sala.
+    entradas = list(
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "call.started",
+                    AuditLog.resource_id == cid,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(entradas) == 1
+    traza = entradas[0]
+    assert traza.actor_user_id == doc.id
+    assert traza.resource == "consultations"
+    assert settings.JITSI_DOMAIN not in json.dumps(traza.metadata_)
+    assert "body" not in (traza.metadata_ or {})
+
+
+async def test_dos_llamadas_reutilizan_la_misma_sala(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """CA16.4: `ensure_video_room` es idempotente — dos clics no dejan a médico y paciente en
+    salas distintas. El aviso en el hilo sí se repite (cada intento deja constancia)."""
+    doc = await add_doctor(db_session)
+    cid, _, _ = await _create_test_case(client, db_session, doctor=doc)
+
+    primera = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(doc.id)
+    )
+    segunda = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(doc.id)
+    )
+    assert primera.status_code == 201 and segunda.status_code == 201
+    assert primera.json()["room_url"] == segunda.json()["room_url"]
+    assert primera.json()["message_id"] != segunda.json()["message_id"]
+
+    mensajes = await _system_call_messages(db_session, cid)
+    assert len(mensajes) == 2
+    # Y una sola sala en la consulta.
+    consulta = await db_session.get(Consultation, uuid.UUID(cid))
+    assert consulta is not None
+    assert consulta.video_room_url == primera.json()["room_url"]
+
+
+async def test_la_sala_que_ya_existia_no_se_regenera(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Si la consulta ya traía sala (la crea el panel antes del claim), se devuelve esa misma."""
+    doc = await add_doctor(db_session)
+    cid, _, _ = await _create_test_case(client, db_session, doctor=doc)
+    consulta = await db_session.get(Consultation, uuid.UUID(cid))
+    assert consulta is not None
+    sala_previa = f"https://{settings.JITSI_DOMAIN}/vamed-sala-previa"
+    consulta.video_room_url = sala_previa
+    await db_session.flush()
+
+    resp = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(doc.id)
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["room_url"] == sala_previa
+
+
+async def test_solo_el_medico_tratante_inicia_la_videollamada(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """CA16.3: médico ajeno, admin no tratante y paciente (sesión o token) reciben 404.
+
+    El 404 y no 403 es deliberado: un 403 confirmaría que esa consulta existe. Y el paciente
+    con token válido es la barrera de la asimetría — el token abre SU hilo, no la llamada.
+    """
+    doc = await add_doctor(db_session)
+    ajeno = await add_doctor(db_session)
+    paciente_user_id = uuid.uuid4()
+    db_session.add(
+        Profile(
+            id=paciente_user_id,
+            full_name="Paciente Con Cuenta",
+            role="patient",
+            active=True,
+            verified=True,
+            role_chosen=True,
+        )
+    )
+    await db_session.flush()
+    cid, _, token = await _create_test_case(
+        client, db_session, doctor=doc, patient_user_id=paciente_user_id
+    )
+
+    # 1. Médico de otro caso
+    r_ajeno = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(ajeno.id)
+    )
+    assert r_ajeno.status_code == 404, r_ajeno.text
+
+    # 2. Paciente con token válido de ESA consulta (test obligatorio de la asimetría)
+    r_token = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers={"X-Consultation-Token": token}
+    )
+    assert r_token.status_code == 404, r_token.text
+
+    # 3. Paciente con su propia sesión
+    r_sesion = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(paciente_user_id)
+    )
+    assert r_sesion.status_code == 404, r_sesion.text
+
+    # 4. Admin no tratante (tiene `messages.write`, pero no es el médico del caso)
+    r_admin = await client.post(f"{PREFIX}/consultations/{cid}/video-call")
+    assert r_admin.status_code == 404, r_admin.text
+
+    # 5. Consulta inexistente
+    r_fantasma = await anon_client.post(
+        f"{PREFIX}/consultations/{uuid.uuid4()}/video-call", headers=auth_headers(doc.id)
+    )
+    assert r_fantasma.status_code == 404
+
+    # Ninguno de los rechazos dejó sala ni mensaje en el hilo.
+    consulta = await db_session.get(Consultation, uuid.UUID(cid))
+    assert consulta is not None
+    assert consulta.video_room_url is None
+    assert await _system_call_messages(db_session, cid) == []
+
+
+async def test_el_medico_que_intervino_antes_en_la_cadena_puede_iniciar(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """CA16.3: «tratante actual o previo en la cadena», el mismo criterio del resto del hilo."""
+    primero = await add_doctor(db_session)
+    especialista = await add_doctor(db_session)
+    # La cadena real: el caso que atendió `primero` quedó como PADRE de la consulta del
+    # especialista. No basta con que `primero` haya dejado un evento en la hija — eso lo deja
+    # también un admin que la gestiona (backlog C-13).
+    cid_padre, _, _ = await _create_test_case(client, db_session, doctor=primero)
+    cid, _, _ = await _create_test_case(client, db_session, doctor=especialista)
+    consulta = await db_session.get(Consultation, uuid.UUID(cid))
+    assert consulta is not None
+    consulta.parent_consultation_id = uuid.UUID(cid_padre)
+    await db_session.flush()
+
+    resp = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(primero.id)
+    )
+    assert resp.status_code == 201, resp.text
+
+
+async def test_videollamada_en_consulta_que_no_admite_mensajes_da_409(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """CA16.4: fuera de la lista blanca de `check_can_write_in_consultation`, 409.
+
+    `referred_to_specialist` sí admite mensajes pero ya no admite sala (`_ROOM_STATUSES` de
+    `services/consultations.py`): también 409, el que lanza `ensure_video_room`.
+    """
+    doc = await add_doctor(db_session)
+    cid, _, _ = await _create_test_case(client, db_session, doctor=doc)
+    consulta = await db_session.get(Consultation, uuid.UUID(cid))
+    assert consulta is not None
+
+    consulta.status = "urgent_in_person"
+    await db_session.flush()
+    fuera = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(doc.id)
+    )
+    assert fuera.status_code == 409, fuera.text
+    assert fuera.json()["detail"] == "Esta consulta ya no admite mensajes."
+
+    consulta.status = "waiting"
+    await db_session.flush()
+    en_espera = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(doc.id)
+    )
+    assert en_espera.status_code == 409, en_espera.text
+
+    consulta.status = "referred_to_specialist"
+    await db_session.flush()
+    derivada = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(doc.id)
+    )
+    assert derivada.status_code == 409, derivada.text
+    assert derivada.json()["detail"] == "La consulta ya no está abierta."
+
+    assert await _system_call_messages(db_session, cid) == []
+
+
+async def test_el_aviso_de_la_llamada_se_lee_con_grant_y_sale_null_sin_el(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El cuerpo del aviso es contenido clínico como cualquier otro: lo ven el médico tratante
+    y el paciente dueño (`summary_grant`), y sale `null` para quien no tiene grant (el admin).
+    """
+    doc = await add_doctor(db_session)
+    cid, _, token = await _create_test_case(client, db_session, doctor=doc)
+
+    inicio = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(doc.id)
+    )
+    assert inicio.status_code == 201, inicio.text
+    message_id = inicio.json()["message_id"]
+
+    def _aviso(payload: dict) -> dict:
+        avisos = [m for m in payload["items"] if m["id"] == message_id]
+        assert len(avisos) == 1
+        return avisos[0]
+
+    # 1. El médico tratante lo lee descifrado
+    del_medico = await anon_client.get(
+        f"{PREFIX}/consultations/{cid}/messages", headers=auth_headers(doc.id)
+    )
+    assert del_medico.status_code == 200
+    cuerpo_medico = _aviso(del_medico.json())["body"]
+    assert cuerpo_medico is not None
+
+    # 2. El paciente dueño también: este mensaje existe para que se entere
+    del_paciente = await anon_client.get(
+        f"{PREFIX}/consultations/{cid}/messages", headers={"X-Consultation-Token": token}
+    )
+    assert del_paciente.status_code == 200
+    aviso_paciente = _aviso(del_paciente.json())
+    assert aviso_paciente["body"] == cuerpo_medico
+    assert aviso_paciente["kind"] == "call"
+    assert aviso_paciente["direction"] == "system"
+    assert aviso_paciente["sender_role"] == "system"
+
+    # 3. Ni la sala de Jitsi ni ninguna otra URL se cuelan en el cuerpo
+    assert settings.JITSI_DOMAIN not in cuerpo_medico
+    assert inicio.json()["room_url"] not in cuerpo_medico
+
+    # 4. Sin grant (admin no tratante) el cuerpo sale null, fail-closed
+    del_admin = await client.get(f"{PREFIX}/consultations/{cid}/messages")
+    assert del_admin.status_code == 200
+    assert _aviso(del_admin.json())["body"] is None
+    assert _aviso(del_admin.json())["kind"] == "call"
+
+
+async def test_el_aviso_de_llamada_no_cuenta_como_no_leido_para_nadie(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Decisión documentada: `direction='system'` no es "la dirección contraria" de ninguno de
+    los dos lados, así que el aviso NO cuenta como no leído ni para el médico ni para el
+    paciente, y el marcado de leído lo ignora. Es la única lectura coherente para ambos: si
+    contara para el paciente, el médico vería un no-leído por su propio clic."""
+    doc = await add_doctor(db_session)
+    cid, _, token = await _create_test_case(client, db_session, doctor=doc)
+
+    assert (
+        await anon_client.post(
+            f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(doc.id)
+        )
+    ).status_code == 201
+
+    del_medico = await anon_client.get(
+        f"{PREFIX}/consultations/{cid}/messages", headers=auth_headers(doc.id)
+    )
+    assert del_medico.json()["unread_count"] == 0
+    del_paciente = await anon_client.get(
+        f"{PREFIX}/consultations/{cid}/messages", headers={"X-Consultation-Token": token}
+    )
+    assert del_paciente.json()["unread_count"] == 0
+
+    # Marcar leído no toca el aviso (no hay nada de la dirección contraria).
+    marcado = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/messages/read", headers={"X-Consultation-Token": token}
+    )
+    assert marcado.status_code == 200
+    assert marcado.json()["marked"] == 0
+
+    # El hilo entra al buzón del médico, pero sin inflar el contador.
+    buzon = await anon_client.get(f"{PREFIX}/inbox", headers=auth_headers(doc.id))
+    assert buzon.status_code == 200
+    fila = next(f for f in buzon.json() if f["consultation_id"] == cid)
+    assert fila["unread_count"] == 0
+    assert fila["last_direction"] == "system"
+
+
+async def test_iniciar_la_llamada_no_le_escribe_al_paciente(
+    client: AsyncClient,
+    anon_client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """El paciente se entera por el mensaje del hilo, no por correo: el botón solo se habilita
+    con el paciente en línea, así que `video_ready_email` sería redundante y gastaría el rate
+    limit de correo."""
+    doc = await add_doctor(db_session)
+    cid, pid, _ = await _create_test_case(client, db_session, doctor=doc)
+    patient = await db_session.get(Patient, uuid.UUID(pid))
+    assert patient is not None
+    patient.email = "paciente@example.com"
+    await db_session.flush()
+
+    enviados: list[str] = []
+
+    async def mock_send_mail(
+        to_email: str,
+        subject: str,
+        text: str,
+        html: str = "",
+        category: str = "general",
+    ) -> bool:
+        enviados.append(subject)
+        return True
+
+    monkeypatch.setattr(notifications, "send_mail", mock_send_mail)
+
+    resp = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(doc.id)
+    )
+    assert resp.status_code == 201, resp.text
+    assert enviados == []
+
+
+async def test_el_cuerpo_del_aviso_de_llamada_no_lleva_ninguna_url_ni_token(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """CA16.6: el cuerpo es SOLO el texto del aviso — ni URL ni token, de ningún tipo.
+
+    Este test es el que impide que la regresión vuelva. El cuerpo llevaba el enlace de
+    `/entrar-videoconsulta` con un token de consulta fresco, o sea un secreto de 24 h de vida
+    escrito en texto legible dentro del historial clínico y a la vista de cualquiera que mire
+    la pantalla o comparta pantalla. Quien lee el hilo ya está autenticado para estar ahí: el
+    acceso lo arma la interfaz con el `consultation_id` y su propia credencial.
+    """
+    doc = await add_doctor(db_session)
+    cid, _, token = await _create_test_case(client, db_session, doctor=doc)
+
+    inicio = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(doc.id)
+    )
+    assert inicio.status_code == 201, inicio.text
+
+    # Se revisan los dos lectores con grant: el cuerpo es el mismo para ambos.
+    for headers in (auth_headers(doc.id), {"X-Consultation-Token": token}):
+        hilo = await anon_client.get(f"{PREFIX}/consultations/{cid}/messages", headers=headers)
+        assert hilo.status_code == 200
+        aviso = next(m for m in hilo.json()["items"] if m["kind"] == "call")
+        cuerpo = aviso["body"]
+        assert cuerpo is not None
+
+        # Nada que se parezca a un enlace...
+        assert "http" not in cuerpo
+        assert "://" not in cuerpo
+        assert settings.JITSI_DOMAIN not in cuerpo
+        assert settings.FRONTEND_URL not in cuerpo
+        assert "entrar-videoconsulta" not in cuerpo
+        # ...ni a un JWT (el token de consulta empieza por el `eyJ` del header base64).
+        assert "eyJ" not in cuerpo
+        assert "t=" not in cuerpo
+        assert token not in cuerpo
+        assert inicio.json()["room_url"] not in cuerpo
+
+    # Y el texto exacto que queda en el hilo, para que cambiarlo sea una decisión consciente.
+    assert cuerpo == "El médico inició la videoconsulta."
+    assert cuerpo == messaging._CALL_STARTED_BODY
+
+
+# =====================================================================
+# 18. «Tocar el caso» no es «ser el tratante» (backlog C-13)
+# =====================================================================
+
+
+async def _lecturas_clinicas(db: AsyncSession, actor_id: uuid.UUID, consultation_id: str) -> int:
+    """Entradas `READ_CLINICAL_DATA` de ese actor sobre el hilo de esa consulta."""
+    return (
+        await db.scalar(
+            select(func.count(AuditLog.id)).where(
+                AuditLog.action == READ_CLINICAL_DATA,
+                AuditLog.actor_user_id == actor_id,
+                AuditLog.resource == "messages",
+                AuditLog.resource_id == consultation_id,
+            )
+        )
+    ) or 0
+
+
+async def test_el_admin_que_gestiono_el_caso_no_lee_ni_escribe_el_hilo(
+    client: AsyncClient,
+    anon_client: AsyncClient,
+    db_session: AsyncSession,
+    admin_identity: Profile,
+) -> None:
+    """C-13: gestionar el caso NO concede lectura clínica, ni aunque deje eventos suyos.
+
+    El admin deja su fila en `consultation_events` al cambiar un estado o cerrar, y el criterio
+    viejo concedía `treating_grant` por la mera existencia de esa fila: leía la conversación
+    descifrada. `security.md` dice lo contrario —ser admin nunca concede lectura clínica— y
+    CA3.2 exige que reciba los cuerpos en `null`. Los eventos se dejan con los endpoints
+    reales, no insertándolos a mano.
+    """
+    doc = await add_doctor(db_session, specialty=GENERAL)
+    cid, _, token = await _create_test_case(client, db_session, doctor=doc)
+    secreto = "Tengo fiebre alta y manchas en la piel"
+    await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/messages",
+        headers={"X-Consultation-Token": token},
+        json={"body": secreto},
+    )
+
+    # El admin (el `client` del conftest) gestiona el caso de verdad
+    evento = await client.post(
+        f"{PREFIX}/consultations/{cid}/events",
+        json={"consultation_id": cid, "event_type": "admin_update"},
+    )
+    assert evento.status_code in (200, 201), evento.text
+    cierre = await client.post(
+        f"{PREFIX}/consultations/{cid}/close", json={"outcome": "patient_no_show"}
+    )
+    assert cierre.status_code == 200, cierre.text
+
+    eventos = (await client.get(f"{PREFIX}/consultations/{cid}/events")).json()
+    suyos = [e for e in eventos if e["created_by"] == str(admin_identity.id)]
+    assert {e["event_type"] for e in suyos} >= {"admin_update", "patient_no_show"}, suyos
+
+    # 1. Lee METADATOS, nunca el cuerpo (CA3.2): el hilo existe, la conversación no se le abre
+    hilo = await client.get(f"{PREFIX}/consultations/{cid}/messages")
+    assert hilo.status_code == 200, hilo.text
+    cuerpo = hilo.json()
+    assert cuerpo["clinical_access"] == "none"
+    assert cuerpo["unread_count"] == 1
+    assert len(cuerpo["items"]) == 1
+    assert cuerpo["items"][0]["body"] is None
+    assert cuerpo["items"][0]["sender_role"] == "patient"  # los metadatos sí viajan
+    assert secreto not in hilo.text
+
+    # 2. Tampoco genera una entrada de lectura concedida
+    assert await _lecturas_clinicas(db_session, admin_identity.id, cid) == 0
+
+    # 3. Ni escribe, ni adjunta, ni marca leído, ni inicia la videollamada
+    # (la consulta se cerró hace un instante, así que la ventana de CA2.2 sigue abierta: el
+    # 404/403 es por el grant, no por el estado)
+    escribir = await client.post(
+        f"{PREFIX}/consultations/{cid}/messages", json={"body": "A ver qué se dijeron"}
+    )
+    assert escribir.status_code == 404, escribir.text
+    adjuntar = await client.post(
+        f"{PREFIX}/consultations/{cid}/attachments",
+        files={"file": ("informe.pdf", PDF_BYTES, "application/pdf")},
+    )
+    assert adjuntar.status_code == 404, adjuntar.text
+    marcar = await client.post(f"{PREFIX}/consultations/{cid}/messages/read")
+    assert marcar.status_code == 403, marcar.text
+    llamar = await client.post(f"{PREFIX}/consultations/{cid}/video-call")
+    assert llamar.status_code == 404, llamar.text
+
+    # 4. El médico tratante no se ve afectado por el cambio
+    del_medico = await anon_client.get(
+        f"{PREFIX}/consultations/{cid}/messages", headers=auth_headers(doc.id)
+    )
+    assert del_medico.json()["items"][0]["body"] == secreto
+    assert del_medico.json()["clinical_access"] == "full"
+
+
+async def test_medico_ajeno_con_evento_en_el_caso_tampoco_entra(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Un médico que dejó un evento sin haber tomado el caso no es tratante de nada.
+
+    `POST /consultations/{id}/events` y la derivación los puede ejercer un médico sobre un caso
+    AÚN SIN ASIGNAR: con el criterio viejo, eso le abría el hilo para siempre.
+    """
+    tratante = await add_doctor(db_session, specialty=GENERAL)
+    ajeno = await add_doctor(db_session, specialty=GENERAL)
+    cid, _, token = await _create_test_case(client, db_session, doctor=tratante)
+    await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/messages",
+        headers={"X-Consultation-Token": token},
+        json={"body": "Mensaje privado para mi médica"},
+    )
+
+    # Evento de un tipo que NO implica haber atendido (lo insertamos directo: el endpoint ya
+    # exige pertenencia, y lo que se prueba aquí es el criterio del grant, no esa puerta)
+    db_session.add(
+        ConsultationEvent(
+            id=uuid.uuid4(),
+            consultation_id=uuid.UUID(cid),
+            event_type="derived",
+            created_by=ajeno.id,
+        )
+    )
+    await db_session.flush()
+
+    lectura = await anon_client.get(
+        f"{PREFIX}/consultations/{cid}/messages", headers=auth_headers(ajeno.id)
+    )
+    assert lectura.status_code == 404, lectura.text
+    escribir = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/messages",
+        headers=auth_headers(ajeno.id),
+        json={"body": "Déjame ver"},
+    )
+    assert escribir.status_code == 404, escribir.text
+    llamar = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(ajeno.id)
+    )
+    assert llamar.status_code == 404, llamar.text
+
+
+async def test_la_lectura_concedida_queda_auditada_una_vez_por_pagina(
+    client: AsyncClient,
+    anon_client: AsyncClient,
+    db_session: AsyncSession,
+    admin_identity: Profile,
+) -> None:
+    """CA3.3: una entrada `READ_CLINICAL_DATA` por página leída, no una por mensaje.
+
+    Es la traza de no repudio del hilo: si un refactor se llevara la llamada a
+    `audit_clinical_read`, nadie lo notaría sin este test.
+    """
+    doc = await add_doctor(db_session, specialty=GENERAL)
+    cid, _, token = await _create_test_case(client, db_session, doctor=doc)
+    for i in range(3):
+        await anon_client.post(
+            f"{PREFIX}/consultations/{cid}/messages",
+            headers={"X-Consultation-Token": token},
+            json={"body": f"Mensaje {i}"},
+        )
+
+    assert await _lecturas_clinicas(db_session, doc.id, cid) == 0
+
+    lectura = await anon_client.get(
+        f"{PREFIX}/consultations/{cid}/messages", headers=auth_headers(doc.id)
+    )
+    assert lectura.status_code == 200
+    assert len(lectura.json()["items"]) == 3
+    assert await _lecturas_clinicas(db_session, doc.id, cid) == 1  # una por página, no tres
+
+    # Una segunda página leída suma otra entrada (la traza cuenta accesos, no mensajes)
+    await anon_client.get(f"{PREFIX}/consultations/{cid}/messages", headers=auth_headers(doc.id))
+    assert await _lecturas_clinicas(db_session, doc.id, cid) == 2
+
+    # El admin, sin grant, no deja entrada de lectura concedida
+    await client.get(f"{PREFIX}/consultations/{cid}/messages")
+    assert await _lecturas_clinicas(db_session, admin_identity.id, cid) == 0

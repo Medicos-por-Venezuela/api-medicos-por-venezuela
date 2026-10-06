@@ -102,6 +102,20 @@ class ReadReceiptResponse(BaseModel):
     marked: int
 
 
+class VideoCallStartResponse(BaseModel):
+    """Respuesta de `POST /consultations/{id}/video-call` (R16).
+
+    `room_url` es la sala Jitsi para que el médico la abra en una ventana aparte: viaja en esta
+    respuesta autenticada y solo se le devuelve a él. `message_id` es el mensaje de sistema que
+    quedó en el hilo para que el paciente se entere; su cuerpo es solo el texto del aviso, sin
+    ninguna URL ni token (CA16.6). El acceso lo arma la interfaz con el `consultation_id` y la
+    credencial del lector.
+    """
+
+    room_url: str
+    message_id: uuid.UUID
+
+
 class InboxThreadResponse(BaseModel):
     """Fila del buzón del médico (con presencia asimétrica del paciente).
 

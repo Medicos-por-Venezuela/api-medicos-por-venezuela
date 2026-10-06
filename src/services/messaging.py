@@ -3,7 +3,9 @@
 Reglas duras (.claude/rules/mensajeria.md y security.md):
 - Un hilo = una consulta (messages.consultation_id).
 - Cuerpos cifrados en reposo (EncryptedText).
-- Grant de lectura: solo médico tratante/cadena o paciente dueño. El admin NO lee cuerpos.
+- Grant de lectura: solo médico tratante/cadena o paciente dueño. El admin NO lee cuerpos — y
+  «tratante» significa estar o haber estado ASIGNADO (ver `is_doctor_in_chain`), no haber dejado
+  una fila en `consultation_events`.
 - Auditoría clínica: toda lectura concedida registra READ_CLINICAL_DATA.
 - Presencia asimétrica: solo el médico tratante ve si el paciente está en línea.
 - Adjuntos clínicos: PDF e imágenes (JPG, PNG, WEBP). GIF estrictamente prohibido (422).
@@ -38,9 +40,10 @@ from src.models.patient import Patient
 from src.models.specialty import Specialty
 from src.schemas.clinical import ClinicalGrant, summary_grant, treating_grant
 from src.schemas.message import InboxThreadResponse, MessageCreate
+from src.services import consultations as consultations_service
 from src.services import notifications, storage
 from src.services.audit import log_action
-from src.services.clinical_access import audit_clinical_read
+from src.services.clinical_access import audit_clinical_read, practices_medicine
 
 logger = logging.getLogger("mpv.messaging")
 
@@ -80,19 +83,63 @@ def is_patient_online(consultation_id: uuid.UUID, last_seen_at: datetime | None 
     return False
 
 
+# Qué `event_type` significa «fui el médico tratante de este caso» — y por qué solo ese.
+#
+# Este criterio concedía grant por la MERA EXISTENCIA de una fila en `consultation_events` con
+# `created_by = yo`, y eso mezcla dos cosas que no son la misma: «atendí este caso» y «lo toqué
+# administrativamente». Un admin que cierra, reasigna o cambia un estado deja su fila
+# (`admin_update`, `closed`, `patient_no_show`, `derived`…) y con ella obtenía
+# `treating_grant("assigned_doctor")`: leía la conversación descifrada. Va contra `security.md`
+# («ser admin nunca concede lectura clínica»), contra `.claude/rules/mensajeria.md` y contra el
+# fail-closed de CA3.2 (el admin recibe los cuerpos en `null`). Backlog C-13.
+#
+# De los `event_type` que escribe el producto, **solo `opened`** implica haber sido el tratante:
+# lo escriben `claim_consultation` y `start_scheduled_consultation`, que en el MISMO `UPDATE`
+# ponen `assigned_doctor_id` en el actor. Los demás los deja quien no atendió nada: `derived`
+# sobre un caso aún sin asignar, `closed`/`patient_no_show` un admin que cierra, `admin_update`
+# un admin por definición, y cualquier texto libre vía `POST /consultations/{id}/events`.
+#
+# Si se añade un evento nuevo que signifique «tomé el caso», va en este conjunto — y solo si su
+# escritura garantiza, como las dos de arriba, que el actor queda asignado.
+_TREATING_EVENT_TYPES = frozenset({"opened"})
+
+
 async def is_doctor_in_chain(
-    session: AsyncSession, consultation: Consultation, doctor_user_id: uuid.UUID
+    session: AsyncSession, consultation: Consultation, principal: Principal
 ) -> bool:
-    """Verifica si el médico es el tratante actual o previo en la cadena."""
+    """¿El llamante es, o fue, el médico TRATANTE de este hilo? (CA3.1 y CA1.3)
+
+    Tres señales, todas condicionadas a **ejercer como médico habilitado**:
+
+    1. es el `assigned_doctor_id` actual de la consulta;
+    2. lo es de alguna consulta anterior de la cadena — el tramo que sí atendió (CA1.3);
+    3. dejó un evento `opened` en ESTA consulta: la tomó y después se la reasignaron, así que su
+       asignación ya no está en la fila pero el claim sí quedó escrito.
+
+    La condición de ejercer es la misma de `clinical_access.treating_doctor_grant`
+    (`practices_medicine` + asignado), que es la que usa el resto del repo. Tenerla distinta aquí
+    era la causa de que la mensajería concediera lo que los demás módulos niegan: una sola
+    definición del criterio (misma lección que `doctors._blocked_reason`).
+
+    Un admin que solo gestionó el caso no entra por ninguna de las tres. Qué hacer con el `False`
+    lo decide cada llamante: metadatos sin cuerpos en `list_messages` (CA3.2), 403 en
+    `mark_as_read` y en la descarga de adjuntos, 404 en las escrituras y en la videollamada.
+    """
+    # Un admin que no ejerce no es tratante de nada, dé la vuelta que dé por los eventos.
+    if not practices_medicine(principal):
+        return False
+
+    doctor_user_id = principal.id
     if consultation.assigned_doctor_id == doctor_user_id:
         return True
 
-    # Eventos de asignación en esta consulta
+    # Tomó el caso y luego se lo reasignaron o lo derivó: el claim quedó en el evento.
     stmt = (
         select(ConsultationEvent.id)
         .where(
             ConsultationEvent.consultation_id == consultation.id,
             ConsultationEvent.created_by == doctor_user_id,
+            ConsultationEvent.event_type.in_(_TREATING_EVENT_TYPES),
         )
         .limit(1)
     )
@@ -246,7 +293,7 @@ async def upload_attachment(
 
     # Permisos de subida: tratante o paciente dueño
     if principal is not None and principal.is_staff:
-        if not await is_doctor_in_chain(session, consultation, principal.id):
+        if not await is_doctor_in_chain(session, consultation, principal):
             raise NotFoundError("Consulta no encontrada.")
         uploader_role = "doctor"
         uploader_user_id = principal.id
@@ -321,7 +368,7 @@ async def get_attachment_for_download(
     # Evaluación de grant clínico (admin NO puede descargar archivos clínicos)
     grant: ClinicalGrant | None = None
     if principal is not None and principal.is_staff:
-        if await is_doctor_in_chain(session, consultation, principal.id):
+        if await is_doctor_in_chain(session, consultation, principal):
             grant = treating_grant("assigned_doctor")
         elif principal.is_admin:
             # Ser admin sin ser el médico tratante no concede acceso a adjuntos clínicos
@@ -383,7 +430,7 @@ async def send_message(
 
     is_doctor = principal is not None and principal.is_staff
     if is_doctor:
-        if not await is_doctor_in_chain(session, consultation, principal.id):
+        if not await is_doctor_in_chain(session, consultation, principal):
             raise NotFoundError("Consulta no encontrada.")
         sender_role = "doctor"
         direction = "doctor_to_patient"
@@ -492,6 +539,97 @@ async def send_message(
     return reloaded or message, grant, True
 
 
+# Cuerpo del mensaje de sistema que anuncia la videollamada (CA16.5/CA16.6). Es SOLO el texto del
+# aviso: ninguna URL y ningún token.
+#
+# Llevaba el enlace de `/entrar-videoconsulta` con un token de consulta fresco, y eso es un
+# secreto de 24 h de vida escrito en texto legible dentro del historial clínico y a la vista en
+# el hilo — visible en cualquier captura o pantalla compartida, y expuesto en cuanto el cliente
+# no puede validar que el origen coincide (en desarrollo nunca coincide: `FRONTEND_URL` apunta a
+# producción y el navegador está en localhost). Quien lee este mensaje ya está autenticado para
+# estar en el hilo, así que la interfaz arma el acceso con el `consultation_id` y su propia
+# credencial y lo pinta como un botón; aquí no se emite ningún token (uno menos en circulación).
+#
+# `build_join_url` sigue siendo el camino correcto para `video_ready_email`: ahí el destinatario
+# NO está autenticado y el enlace tokenizado es lo único que lo deja entrar. No se toca.
+_CALL_STARTED_BODY = "El médico inició la videoconsulta."
+
+
+async def start_video_call(
+    session: AsyncSession,
+    consultation_id: uuid.UUID,
+    principal: Principal | None,
+    client_ip: str | None = None,
+) -> tuple[str, uuid.UUID]:
+    """Inicia la videollamada del hilo y deja constancia con un mensaje de sistema (R16).
+
+    Asimetría dura (CA16.3): llama **solo** el médico tratante, actual o previo en la cadena
+    (mismo criterio que el resto del hilo, `is_doctor_in_chain`). Todo el resto —paciente con
+    sesión, paciente con token de consulta, médico ajeno, admin no tratante— recibe
+    `NotFoundError`, nunca un 403: un 403 confirmaría que la consulta existe.
+
+    No se dispara `video_ready_email`: el paciente se entera por el mensaje del hilo (el botón
+    solo se habilita con el paciente en línea), así el correo sería redundante y gastaría el
+    rate limit de Mailtrap.
+
+    Devuelve `(room_url, message_id)`.
+    """
+    consultation = await session.get(Consultation, consultation_id)
+    if consultation is None:
+        raise NotFoundError("Consulta no encontrada.")
+
+    # El paciente nunca inicia la llamada: ni con sesión propia ni con `X-Consultation-Token`.
+    if principal is None or not principal.is_staff:
+        raise NotFoundError("Consulta no encontrada.")
+    if not await is_doctor_in_chain(session, consultation, principal):
+        raise NotFoundError("Consulta no encontrada.")
+
+    check_can_write_in_consultation(consultation, is_doctor=True)
+
+    # Sala idempotente: si ya existe se reutiliza (`ensure_video_room`). Dos clics no dejan a
+    # médico y paciente en salas distintas. No se duplica esa lógica aquí.
+    consultation = await consultations_service.ensure_video_room(session, consultation.id)
+    room_url = consultation.video_room_url
+    if not room_url:  # pragma: no cover - ensure_video_room ya falla con ConflictError
+        raise ConflictError("La consulta ya no está abierta.")
+
+    # `direction='system'` no es ninguna de las dos direcciones, así que este mensaje NO cuenta
+    # como no leído para nadie (ni para el médico que lo provocó ni para el paciente): los
+    # contadores y el marcado de leído siguen mirando solo `doctor_to_patient` /
+    # `patient_to_doctor`. Decisión deliberada y simétrica (ver spec R16 en tasks/).
+    message_id = uuid.uuid4()
+    message = Message(
+        id=message_id,
+        consultation_id=consultation.id,
+        sender_role="system",
+        sender_user_id=None,
+        direction="system",
+        channel="web",
+        kind="call",
+        # `call_session_id` se queda nulo a propósito: la columna apunta a una tabla que no
+        # existe (deuda declarada) y R16 excluye el ciclo de vida de la llamada.
+        body=_CALL_STARTED_BODY,
+        sent_at=datetime.now(UTC),
+        delivery_status="sent",
+    )
+    session.add(message)
+
+    # Sin contenido y sin la URL de la sala (CA16.7).
+    await log_action(
+        session,
+        action="call.started",
+        actor_user_id=principal.id,
+        resource="consultations",
+        resource_id=str(consultation.id),
+        metadata={"consultation_id": str(consultation.id), "message_id": str(message_id)},
+        ip=client_ip,
+        correlation_id=correlation_id_ctx.get(),
+    )
+    await session.commit()
+
+    return room_url, message_id
+
+
 async def list_messages(
     session: AsyncSession,
     consultation_id: uuid.UUID,
@@ -514,7 +652,7 @@ async def list_messages(
     grant: ClinicalGrant | None = None
     is_doctor = principal is not None and principal.is_staff
     if is_doctor:
-        if await is_doctor_in_chain(session, consultation, principal.id):
+        if await is_doctor_in_chain(session, consultation, principal):
             grant = treating_grant("assigned_doctor")
         elif principal.is_admin:
             # Admin sin ser médico del caso ve metadatos pero NO cuerpos (grant = None)
@@ -608,7 +746,7 @@ async def mark_as_read(
 
     is_doctor = principal is not None and principal.is_staff
     if is_doctor:
-        if await is_doctor_in_chain(session, consultation, principal.id):
+        if await is_doctor_in_chain(session, consultation, principal):
             opposing_direction = "patient_to_doctor"
         elif principal.is_admin:
             raise ForbiddenError("Los administradores no marcan mensajes como leídos.")
@@ -646,6 +784,17 @@ def _is_or_was_treating(principal: Principal):
     están `consultations.read` y los metadatos del caso, CA3.2). Sin este filtro el admin
     recibía el buzón de toda la plataforma, incluida la presencia del paciente
     (`patient_online` / `patient_last_seen_at`), que la spec concede al médico tratante.
+
+    **Por qué esto y `is_doctor_in_chain` son dos funciones y no una.** Responden preguntas
+    distintas y, sobre todo, en lenguajes distintos: esto es una expresión SQL que entra en el
+    `WHERE` de una consulta agregada (no puede recorrer la cadena en Python, ni abrir una
+    consulta por fila), y aquélla es un predicado `async` que sí la recorre entera. Además lo
+    que deciden no es lo mismo: esto decide **qué hilos se LISTAN** (metadatos y contadores, sin
+    un solo cuerpo), y `is_doctor_in_chain` decide **quién LEE la conversación y escribe en
+    ella** — por eso solo aquélla exige ejercer como médico habilitado y mira el evento del
+    claim. Consecuencia conocida y aceptada: un médico puede tener grant sobre un hilo de un
+    tramo lejano de la cadena que su buzón no lista (este filtro sube un solo nivel; subir la
+    cadena completa en SQL pide un CTE recursivo y no hace falta para el buzón).
     """
     return (Consultation.assigned_doctor_id == principal.id) | (
         Consultation.parent_consultation_id.in_(

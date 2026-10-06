@@ -43,6 +43,7 @@ from src.schemas.message import (
     MessageResponse,
     MessagesThreadResponse,
     ReadReceiptResponse,
+    VideoCallStartResponse,
 )
 from src.services import messaging, notifications
 
@@ -342,6 +343,70 @@ async def mark_messages_read(
         consultation_token_str=x_consultation_token,
     )
     return ReadReceiptResponse(marked=marked)
+
+
+@router.post(
+    "/consultations/{consultation_id}/video-call",
+    response_model=VideoCallStartResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Iniciar la videollamada desde el hilo (solo el médico tratante)",
+    responses={
+        201: {"description": "Sala asegurada y mensaje de sistema creado en el hilo."},
+        401: {"description": "No autenticado (sin sesión ni token de consulta)."},
+        403: {"description": "Permiso messages.write requerido para staff."},
+        404: {
+            "description": (
+                "Consulta no encontrada, o el llamante no es el médico tratante: médico ajeno, "
+                "admin no tratante y paciente (con sesión o con token) reciben 404, nunca 403."
+            )
+        },
+        409: {"description": "La consulta no admite mensajes o ya no está abierta."},
+    },
+)
+async def start_video_call(
+    consultation_id: uuid.UUID,
+    request: Request,
+    x_consultation_token: str | None = Header(default=None, alias=_CONSULTATION_TOKEN_HEADER),
+    principal: Principal | None = Depends(get_optional_principal),
+    db: AsyncSession = Depends(get_db),
+) -> VideoCallStartResponse:
+    """Inicia la videoconsulta del hilo y deja constancia para el paciente (R16).
+
+    Asegura la sala de la consulta (idempotente: dos clics devuelven la misma URL) y crea en el
+    hilo un **mensaje de sistema** (`sender_role=system`, `direction=system`, `kind=call`) con el
+    texto del aviso. El paciente lo ve en el hilo sin recargar; no se le manda correo.
+
+    El cuerpo del mensaje **no lleva ninguna URL ni ningún token** (CA16.6): quien lo lee ya está
+    autenticado para estar en el hilo, así que la interfaz arma el acceso con el `consultation_id`
+    y su propia credencial. `room_url` se devuelve **aquí**, en esta respuesta autenticada, para
+    que el médico abra su ventana.
+
+    Solo el médico tratante, actual o previo en la cadena. El paciente **nunca** inicia la
+    llamada: con sesión o con `X-Consultation-Token` recibe 404. Queda en `audit_log` como
+    `call.started`, sin contenido ni URL de sala.
+    """
+    if principal is None and not x_consultation_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Autenticación requerida.",
+        )
+    if (
+        principal is not None
+        and principal.is_staff
+        and not principal.has_permission("messages.write")
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No tienes permiso para esta acción.",
+        )
+
+    room_url, message_id = await messaging.start_video_call(
+        db,
+        consultation_id=consultation_id,
+        principal=principal,
+        client_ip=client_ip(request),
+    )
+    return VideoCallStartResponse(room_url=room_url, message_id=message_id)
 
 
 async def _extract_upload_file(request: Request) -> tuple[str, bytes, str | None]:
