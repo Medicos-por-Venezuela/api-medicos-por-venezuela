@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import case, func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -43,7 +44,11 @@ from src.services.clinical_access import audit_clinical_read
 
 logger = logging.getLogger("mpv.messaging")
 
-# Registro en memoria de presencia de pacientes (D3 en spec-chat-tiempo-real.md)
+# Presencia del paciente EN MEMORIA DE PROCESO. Correcto para el despliegue actual (un solo
+# uvicorn, ver `.claude/rules/commands.md`): con varias réplicas cada una vería solo a los
+# pacientes que le tocaron, así que el buzón diría "Desconectado" de alguien que está escribiendo
+# contra otra réplica. El respaldo persistente es `consultations.patient_last_seen_at`, que sí es
+# compartido; compartir además el registro en vivo (Redis) es v2 y está fuera de alcance.
 _ACTIVE_PATIENTS: dict[uuid.UUID, datetime] = {}
 
 
@@ -53,18 +58,23 @@ def record_patient_presence(consultation_id: uuid.UUID) -> None:
 
 
 def is_patient_online(consultation_id: uuid.UUID, last_seen_at: datetime | None = None) -> bool:
-    """Determina si el paciente está en línea (actividad en últimos 45 segundos)."""
+    """Indica si el paciente está en línea.
+
+    Umbral: `MESSAGING_PATIENT_PRESENCE_TTL_SECONDS` desde la última señal, sea del registro
+    en memoria o de `consultations.patient_last_seen_at`.
+    """
     now = datetime.now(UTC)
+    ttl = settings.MESSAGING_PATIENT_PRESENCE_TTL_SECONDS
     active_ts = _ACTIVE_PATIENTS.get(consultation_id)
     if active_ts:
-        if (now - active_ts).total_seconds() <= 45:
+        if (now - active_ts).total_seconds() <= ttl:
             return True
         _ACTIVE_PATIENTS.pop(consultation_id, None)
 
     if last_seen_at:
         if last_seen_at.tzinfo is None:
             last_seen_at = last_seen_at.replace(tzinfo=UTC)
-        if (now - last_seen_at).total_seconds() <= 45:
+        if (now - last_seen_at).total_seconds() <= ttl:
             return True
 
     return False
@@ -120,22 +130,56 @@ async def is_patient_owner(
     return False
 
 
-def check_can_write_in_consultation(consultation: Consultation, is_doctor: bool) -> None:
-    """Valida si el estado y ventana de la consulta admiten nuevos mensajes."""
-    if is_doctor and consultation.status == "waiting":
-        raise ConflictError("La consulta aún no ha sido tomada por un médico.")
+# LISTA BLANCA de estados que admiten mensajes (CA2.2). Es blanca y no negra a propósito: con
+# una lista negra, cualquier estado nuevo del enum (`CONSULTATION_STATUSES`) nacería escribible
+# sin que nadie lo decidiera — `urgent_in_person` y `contacted_whatsapp` pasaban así.
+#
+# `contacted_whatsapp` está dentro por decisión del cliente (2026-10-05) y no por CA2.2, que no
+# lo menciona: es un caso ABIERTO con médico asignado (ver `_OPEN_ASSIGNED_STATUSES` en
+# `services/consultations.py`) y describe justo al paciente al que el médico tuvo que dar su
+# número personal — o sea, el escenario que este módulo existe para reemplazar.
+# `urgent_in_person` sigue FUERA: ahí la vía es la atención presencial, no el seguimiento escrito.
+_WRITABLE_STATUSES = frozenset(
+    {"in_progress", "scheduled", "referred_to_specialist", "contacted_whatsapp"}
+)
+# Cerrada: admite mensajes solo dentro de MESSAGING_AFTER_CLOSE_HOURS desde el cierre.
+_CLOSED_STATUSES = frozenset({"closed", "cancelled", "patient_no_show", "closed_by_admin"})
+# `waiting` lo escribe SOLO el paciente: todavía no hay médico tratante, así que para el médico
+# no es "su" hilo (y para el paciente es la sala de espera, donde sí puede escribir).
+_PATIENT_ONLY_STATUSES = frozenset({"waiting"})
 
-    _CLOSED_STATUSES = {"closed", "cancelled", "patient_no_show", "closed_by_admin"}
-    if consultation.status in _CLOSED_STATUSES:
+_NO_MESSAGES_DETAIL = "Esta consulta ya no admite mensajes."
+
+
+def check_can_write_in_consultation(consultation: Consultation, is_doctor: bool) -> None:
+    """Valida si el estado y la ventana de la consulta admiten nuevos mensajes (CA2.2/CA4.5).
+
+    Lanza `ConflictError` (409) para todo estado que no esté en la lista blanca.
+    """
+    status = consultation.status
+
+    if status in _WRITABLE_STATUSES:
+        return
+
+    if status in _PATIENT_ONLY_STATUSES:
+        if is_doctor:
+            raise ConflictError("La consulta aún no ha sido tomada por un médico.")
+        return
+
+    if status in _CLOSED_STATUSES:
         closed_reference = (
             consultation.closed_at or consultation.ended_at or consultation.created_at
         )
-        if closed_reference:
-            if closed_reference.tzinfo is None:
-                closed_reference = closed_reference.replace(tzinfo=UTC)
-            limit = closed_reference + timedelta(hours=settings.MESSAGING_AFTER_CLOSE_HOURS)
-            if datetime.now(UTC) > limit:
-                raise ConflictError("Esta consulta ya no admite mensajes.")
+        if closed_reference is None:
+            raise ConflictError(_NO_MESSAGES_DETAIL)
+        if closed_reference.tzinfo is None:
+            closed_reference = closed_reference.replace(tzinfo=UTC)
+        limit = closed_reference + timedelta(hours=settings.MESSAGING_AFTER_CLOSE_HOURS)
+        if datetime.now(UTC) > limit:
+            raise ConflictError(_NO_MESSAGES_DETAIL)
+        return
+
+    raise ConflictError(_NO_MESSAGES_DETAIL)
 
 
 def validate_attachment_file(
@@ -222,7 +266,7 @@ async def upload_attachment(
 
     attachment_id = uuid.uuid4()
     storage_path = f"consultations/{consultation.id}/attachments/{attachment_id}.bin"
-    storage.save_attachment_file(storage_path, content)
+    await storage.save_attachment_file(storage_path, content, content_type=mime_type)
 
     attachment = MessageAttachment(
         id=attachment_id,
@@ -290,7 +334,7 @@ async def get_attachment_for_download(
     else:
         raise NotFoundError("Consulta no encontrada.")
 
-    data = storage.get_attachment_file(attachment.storage_path)
+    data = await storage.get_attachment_file(attachment.storage_path)
     if data is None:
         raise NotFoundError("El archivo no se encuentra en el almacenamiento.")
 
@@ -305,6 +349,20 @@ async def get_attachment_for_download(
     )
 
     return data, clean_filename, attachment.mime_type
+
+
+async def _find_by_client_msg_id(
+    session: AsyncSession, consultation_id: uuid.UUID, client_msg_id: str
+) -> Message | None:
+    """Busca el mensaje ya persistido con ese `client_msg_id` en el hilo (idempotencia)."""
+    return await session.scalar(
+        select(Message)
+        .where(
+            Message.consultation_id == consultation_id,
+            Message.client_msg_id == client_msg_id,
+        )
+        .options(selectinload(Message.attachments))
+    )
 
 
 async def send_message(
@@ -359,16 +417,9 @@ async def send_message(
         ):
             raise ConflictError("Límite de mensajes por hora alcanzado para esta consulta.")
 
-    # Idempotencia por client_msg_id
+    # Idempotencia por client_msg_id: primero el camino barato (ya existe).
     if data.client_msg_id:
-        existing = await session.scalar(
-            select(Message)
-            .where(
-                Message.consultation_id == consultation.id,
-                Message.client_msg_id == data.client_msg_id,
-            )
-            .options(selectinload(Message.attachments))
-        )
+        existing = await _find_by_client_msg_id(session, consultation.id, data.client_msg_id)
         if existing is not None:
             return existing, grant, False
 
@@ -398,8 +449,22 @@ async def send_message(
         sent_at=datetime.now(UTC),
         delivery_status="sent",
     )
-    session.add(message)
-    await session.flush()
+
+    # El SELECT de arriba no cierra la carrera: dos envíos simultáneos con el mismo
+    # client_msg_id pasan ambos el chequeo y el segundo INSERT choca con el índice único
+    # parcial `uq_messages_consultation_client_msg`. Sin este savepoint, eso era un 500 (y
+    # dejaba la transacción abortada); con él se vuelve atrás solo el INSERT y se devuelve el
+    # mensaje que ganó la carrera, que es lo que el cliente pedía al mandar un client_msg_id.
+    try:
+        async with session.begin_nested():
+            session.add(message)
+            await session.flush()
+    except IntegrityError:
+        if data.client_msg_id:
+            winner = await _find_by_client_msg_id(session, consultation.id, data.client_msg_id)
+            if winner is not None:
+                return winner, grant, False
+        raise
 
     for att in attachments:
         att.message_id = message.id
@@ -574,6 +639,21 @@ async def mark_as_read(
     return marked
 
 
+def _is_or_was_treating(principal: Principal):
+    """Filtro de pertenencia del buzón: el llamante ES o FUE el tratante del hilo (CA7.1).
+
+    Se aplica **también al admin**: `/inbox` no es la herramienta de supervisión (para eso
+    están `consultations.read` y los metadatos del caso, CA3.2). Sin este filtro el admin
+    recibía el buzón de toda la plataforma, incluida la presencia del paciente
+    (`patient_online` / `patient_last_seen_at`), que la spec concede al médico tratante.
+    """
+    return (Consultation.assigned_doctor_id == principal.id) | (
+        Consultation.parent_consultation_id.in_(
+            select(Consultation.id).where(Consultation.assigned_doctor_id == principal.id)
+        )
+    )
+
+
 async def get_inbox(
     session: AsyncSession,
     principal: Principal,
@@ -598,17 +678,8 @@ async def get_inbox(
         .join(Patient, Patient.id == Consultation.patient_id)
         .outerjoin(Specialty, Specialty.id == Consultation.specialty_id)
         .join(Message, Message.consultation_id == Consultation.id)
+        .where(_is_or_was_treating(principal))
     )
-
-    if not principal.is_admin:
-        stmt = stmt.where(
-            (Consultation.assigned_doctor_id == principal.id)
-            | (
-                Consultation.parent_consultation_id.in_(
-                    select(Consultation.id).where(Consultation.assigned_doctor_id == principal.id)
-                )
-            )
-        )
 
     stmt = stmt.group_by(
         Consultation.id,
@@ -711,15 +782,8 @@ async def get_inbox_signal(
         func.count(case((unread_filter, 1))).label("unread_count"),
     ).join(Message, Message.consultation_id == Consultation.id)
 
-    if not principal.is_admin:
-        stmt = stmt.where(
-            (Consultation.assigned_doctor_id == principal.id)
-            | (
-                Consultation.parent_consultation_id.in_(
-                    select(Consultation.id).where(Consultation.assigned_doctor_id == principal.id)
-                )
-            )
-        )
+    # Mismo filtro de pertenencia que `get_inbox`, admin incluido (CA7.1).
+    stmt = stmt.where(_is_or_was_treating(principal))
 
     stmt = stmt.group_by(Consultation.id)
     rows = (await session.execute(stmt)).all()

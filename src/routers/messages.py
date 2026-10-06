@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from src.core.config import settings
 from src.core.errors import UnprocessableError
 from src.core.observability import client_ip
+from src.core.ratelimit import limiter
 from src.core.security import (
     Principal,
     get_optional_principal,
@@ -40,6 +41,7 @@ from src.schemas.message import (
     InboxThreadResponse,
     MessageCreate,
     MessageResponse,
+    MessagesThreadResponse,
     ReadReceiptResponse,
 )
 from src.services import messaging, notifications
@@ -162,7 +164,7 @@ async def inbox_stream(
 
 @router.get(
     "/consultations/{consultation_id}/messages",
-    response_model=list[MessageResponse],
+    response_model=MessagesThreadResponse,
     summary="Listar mensajes de un hilo de consulta",
     responses={
         401: {"description": "No autenticado (sin sesión ni token de consulta)."},
@@ -181,8 +183,13 @@ async def list_messages(
     x_consultation_token: str | None = Header(default=None, alias=_CONSULTATION_TOKEN_HEADER),
     principal: Principal | None = Depends(get_optional_principal),
     db: AsyncSession = Depends(get_db),
-) -> list[MessageResponse]:
+) -> MessagesThreadResponse:
     """Lista los mensajes de la consulta con grant clínico fail-closed.
+
+    Devuelve `{ consultation_id, unread_count, items, clinical_access }`: `unread_count`
+    (CA3.4) son los mensajes de la otra dirección sin leer **para el llamante**, y va en el
+    cuerpo porque una cabecera no es legible desde el navegador cross-origin sin exponerla.
+    El header `X-Unread-Count` se mantiene por compatibilidad, pero el cuerpo manda.
 
     Sin grant (ej. admin), los cuerpos y nombres de adjuntos salen null.
     """
@@ -216,7 +223,14 @@ async def list_messages(
     response.headers["X-Unread-Count"] = str(unread_count)
 
     context = clinical_context(grant)
-    return [MessageResponse.model_validate(m, context=context) for m in messages]
+    return MessagesThreadResponse.model_validate(
+        {
+            "consultation_id": consultation_id,
+            "unread_count": unread_count,
+            "items": messages,
+        },
+        context=context,
+    )
 
 
 @router.post(
@@ -232,8 +246,10 @@ async def list_messages(
         404: {"description": "Consulta no encontrada."},
         409: {"description": "Consulta cerrada o no admite mensajes."},
         422: {"description": "Datos de mensaje inválidos."},
+        429: {"description": "Demasiados mensajes desde esta IP (`PUBLIC_WRITE_RATE_LIMIT`)."},
     },
 )
+@limiter.limit(settings.PUBLIC_WRITE_RATE_LIMIT)
 async def send_message(
     consultation_id: uuid.UUID,
     data: MessageCreate,
@@ -385,8 +401,10 @@ async def _extract_upload_file(request: Request) -> tuple[str, bytes, str | None
                 "Formato inválido (GIF prohibido), magic bytes no coinciden o excede 10 MB."
             )
         },
+        429: {"description": "Demasiadas subidas desde esta IP (`PUBLIC_WRITE_RATE_LIMIT`)."},
     },
 )
+@limiter.limit(settings.PUBLIC_WRITE_RATE_LIMIT)
 async def upload_attachment(
     consultation_id: uuid.UUID,
     request: Request,

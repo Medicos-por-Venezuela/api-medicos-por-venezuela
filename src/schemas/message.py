@@ -6,6 +6,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from src.core.config import settings
 from src.schemas.clinical import ClinicalAccessMixin, ClinicalSummary
 
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -26,7 +27,18 @@ class MessageCreate(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    body: str | None = Field(default=None, max_length=4000)
+    # El tope (CA2.3: 0 a 2000 caracteres) sale de `MESSAGING_MAX_BODY_CHARS`, no de un número
+    # cableado aquí: así el OpenAPI publica el mismo límite que valida la API y que pinta el
+    # `maxLength` del frontend. Se lee al importar, como el resto de los usos de `settings` en
+    # módulos: cambiar la env exige reiniciar el proceso, igual que para todo lo demás.
+    body: str | None = Field(
+        default=None,
+        max_length=settings.MESSAGING_MAX_BODY_CHARS,
+        description=(
+            f"Texto del mensaje, hasta {settings.MESSAGING_MAX_BODY_CHARS} caracteres "
+            "(`MESSAGING_MAX_BODY_CHARS`). Las etiquetas HTML se eliminan."
+        ),
+    )
     attachment_ids: list[uuid.UUID] = Field(default_factory=list)
     client_msg_id: str | None = Field(default=None, max_length=128)
 
@@ -110,8 +122,17 @@ class InboxThreadResponse(BaseModel):
 
 
 class MessagesThreadResponse(ClinicalAccessMixin):
-    """Hilo completo con metadatos y lista de mensajes."""
+    """Página del hilo de una consulta: los mensajes y el contador de no leídos del llamante.
+
+    Es el cuerpo de `GET /consultations/{id}/messages`. `unread_count` va aquí (CA3.4) y no
+    solo en la cabecera `X-Unread-Count`: el navegador no puede leer una cabecera de una
+    respuesta cross-origin si no está en `expose_headers`.
+    """
 
     consultation_id: uuid.UUID
-    unread_count: int
-    items: list[MessageResponse]
+    unread_count: int = Field(
+        description="Mensajes de la otra dirección sin `read_at` para el llamante (CA3.4)."
+    )
+    items: list[MessageResponse] = Field(
+        default_factory=list, description="Mensajes de la página, ordenados por `sent_at, id`."
+    )

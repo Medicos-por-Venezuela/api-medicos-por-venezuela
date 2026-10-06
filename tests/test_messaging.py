@@ -9,28 +9,42 @@ Cubre:
 - Marcado como leído idempotente y contadores.
 """
 
+import asyncio
 import uuid
+from collections.abc import AsyncGenerator, Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
+import pytest_asyncio
 from httpx import AsyncClient
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core import consultation_token
 from src.core.config import settings
-from src.db.session import get_session_factory
+from src.core.errors import ConflictError, UnprocessableError, UpstreamServiceError
+from src.core.ratelimit import limiter
+from src.core.security import Principal, get_optional_principal
+from src.db.session import AsyncSessionLocal, get_session_factory
 from src.main import app
 from src.models.clinical import Message
 from src.models.consultation import Consultation
+from src.models.consultation_event import ConsultationEvent
+from src.models.doctor import Doctor
 from src.models.patient import Patient
 from src.models.profile import Profile
-from src.services import messaging, notifications
+from src.services import messaging, notifications, storage
 from tests._helpers import (
+    GENERAL,
     add_doctor,
     any_specialty_id,
     auth_headers,
     grant_roles,
+    make_doctor_row,
+    make_profile,
+    specialty_id_by_name,
     valid_patient_payload,
 )
 
@@ -52,6 +66,39 @@ GIF_BYTES = (
     b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!"
     b"\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
 )
+
+
+@pytest.fixture(autouse=True)
+def bucket_falso(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, bytes]]:
+    """Supabase Storage en memoria: `httpx.MockTransport` en lugar del bucket real.
+
+    Ejercita el cliente HTTP completo de `services/storage.py` (URL del objeto, cabeceras de
+    autorización, códigos de estado) sin depender de que el contenedor de Storage del Supabase
+    local esté arriba. Mismo patrón que `fake_kit` en `tests/test_marketing_performance.py`.
+    """
+    objetos: dict[str, bytes] = {}
+    prefijo = f"/storage/v1/object/{settings.STORAGE_BUCKET_ATTACHMENTS}/"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # El bucket es privado: sin el service-role key Storage respondería 401/403.
+        assert request.headers.get("authorization", "").startswith("Bearer ")
+        assert request.url.path.startswith(prefijo), request.url.path
+        clave = request.url.path[len(prefijo) :]
+        if request.method == "POST":
+            objetos[clave] = request.content
+            return httpx.Response(200, json={"Key": clave})
+        if request.method == "GET":
+            if clave not in objetos:
+                return httpx.Response(404, json={"error": "not_found"})
+            return httpx.Response(200, content=objetos[clave])
+        if request.method == "DELETE":
+            if objetos.pop(clave, None) is None:
+                return httpx.Response(404, json={"error": "not_found"})
+            return httpx.Response(200, json={"message": "ok"})
+        return httpx.Response(405, json={"error": "method_not_allowed"})
+
+    monkeypatch.setattr(storage, "_transport", httpx.MockTransport(handler))
+    yield objetos
 
 
 async def _create_test_case(
@@ -309,7 +356,11 @@ async def test_clinical_grant_fail_closed_admin_vs_doctor(
         headers=auth_headers(doc.id),
     )
     assert doc_resp.status_code == 200
-    doc_data = doc_resp.json()
+    doc_body = doc_resp.json()
+    assert doc_body["consultation_id"] == cid
+    assert doc_body["unread_count"] == 1
+    assert doc_body["clinical_access"] == "full"
+    doc_data = doc_body["items"]
     assert len(doc_data) == 1
     assert doc_data[0]["body"] == secret_body
     assert doc_data[0]["clinical_access"] == "full"
@@ -318,7 +369,9 @@ async def test_clinical_grant_fail_closed_admin_vs_doctor(
     # pero body es null y clinical_access='none'
     admin_resp = await client.get(f"{PREFIX}/consultations/{cid}/messages")
     assert admin_resp.status_code == 200
-    admin_data = admin_resp.json()
+    admin_body = admin_resp.json()
+    assert admin_body["clinical_access"] == "none"
+    admin_data = admin_body["items"]
     assert len(admin_data) == 1
     assert admin_data[0]["body"] is None  # FAIL-CLOSED
     assert admin_data[0]["clinical_access"] == "none"
@@ -346,7 +399,7 @@ async def test_admin_who_is_treating_doctor_has_clinical_grant(
         headers=auth_headers(admin_doc.id),
     )
     assert resp.status_code == 200
-    data = resp.json()
+    data = resp.json()["items"]
     assert len(data) == 1
     assert data[0]["body"] == "Dolor abdominal agudo"
     assert data[0]["clinical_access"] == "full"
@@ -586,7 +639,7 @@ async def test_asymmetric_presence_in_inbox(
         headers={"X-Consultation-Token": token},
     )
     assert pat_msgs_resp.status_code == 200
-    for m in pat_msgs_resp.json():
+    for m in pat_msgs_resp.json()["items"]:
         assert "doctor_online" not in m
         assert "doctor_last_seen_at" not in m
 
@@ -615,11 +668,12 @@ async def test_mark_as_read_idempotency_and_counters(
         json={"body": "Mensaje 2"},
     )
 
-    # Médico consulta el hilo: X-Unread-Count es 2
+    # Médico consulta el hilo: unread_count es 2 en el CUERPO (CA3.4) y en la cabecera
     list_resp1 = await anon_client.get(
         f"{PREFIX}/consultations/{cid}/messages",
         headers=auth_headers(doc.id),
     )
+    assert list_resp1.json()["unread_count"] == 2
     assert list_resp1.headers["x-unread-count"] == "2"
 
     # Médico marca como leído
@@ -638,11 +692,12 @@ async def test_mark_as_read_idempotency_and_counters(
     assert read_resp2.status_code == 200
     assert read_resp2.json()["marked"] == 0
 
-    # Ahora X-Unread-Count es 0
+    # Ahora unread_count es 0
     list_resp2 = await anon_client.get(
         f"{PREFIX}/consultations/{cid}/messages",
         headers=auth_headers(doc.id),
     )
+    assert list_resp2.json()["unread_count"] == 0
     assert list_resp2.headers["x-unread-count"] == "0"
 
 
@@ -877,3 +932,1035 @@ async def test_waiting_room_stream_emits_message_event_and_presence_asymmetry(
     assert "doctor_online" not in resp.text
     assert "doctor_last_seen" not in resp.text
     assert "Hola paciente" not in resp.text  # Cero cuerpo clínico en SSE
+
+
+# =====================================================================
+# 9. Lista blanca de estados que admiten mensajes (CA2.2 / CA4.5)
+# =====================================================================
+
+
+async def test_estados_permitidos_para_escribir_en_el_hilo(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """CA2.2: `in_progress`, `scheduled` y `referred_to_specialist` admiten mensajes.
+
+    Y `contacted_whatsapp`, añadido al conjunto por decisión del cliente (2026-10-05): es un
+    caso abierto con médico asignado, y es el paciente al que el médico tuvo que dar su número
+    personal — el escenario que este módulo existe para reemplazar.
+    """
+    doc = await add_doctor(db_session)
+    cid, _, token = await _create_test_case(client, db_session, doctor=doc)
+    consulta = await db_session.get(Consultation, uuid.UUID(cid))
+    assert consulta is not None
+
+    for estado in ("in_progress", "scheduled", "referred_to_specialist", "contacted_whatsapp"):
+        consulta.status = estado
+        await db_session.flush()
+        resp = await anon_client.post(
+            f"{PREFIX}/consultations/{cid}/messages",
+            headers=auth_headers(doc.id),
+            json={"body": f"Mensaje con la consulta en {estado}"},
+        )
+        assert resp.status_code == 201, f"{estado}: {resp.text}"
+
+    # En `contacted_whatsapp` el paciente también escribe y también adjunta: si el médico puede
+    # responder pero el paciente no puede contestar, el hilo no sirve para nada.
+    consulta.status = "contacted_whatsapp"
+    await db_session.flush()
+    del_paciente = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/messages",
+        headers={"X-Consultation-Token": token},
+        json={"body": "Le escribo por aquí en vez de por WhatsApp"},
+    )
+    assert del_paciente.status_code == 201, del_paciente.text
+    adjunto = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/attachments",
+        headers={"X-Consultation-Token": token},
+        files={"file": ("examen.pdf", PDF_BYTES, "application/pdf")},
+    )
+    assert adjunto.status_code == 201, adjunto.text
+
+
+async def test_estados_fuera_de_la_lista_blanca_dan_409(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """CA2.2/CA4.5: todo estado que no esté en la lista blanca rechaza con 409.
+
+    Antes era una lista NEGRA (solo `waiting` y los cierres vencidos), así que `urgent_in_person`
+    —y cualquier estado nuevo del enum— pasaba sin que nadie lo hubiera decidido. En
+    `urgent_in_person` la vía es la atención presencial, no el seguimiento escrito.
+    """
+    doc = await add_doctor(db_session)
+    cid, _, token = await _create_test_case(client, db_session, doctor=doc)
+    consulta = await db_session.get(Consultation, uuid.UUID(cid))
+    assert consulta is not None
+
+    for estado in ("urgent_in_person",):
+        consulta.status = estado
+        await db_session.flush()
+
+        del_medico = await anon_client.post(
+            f"{PREFIX}/consultations/{cid}/messages",
+            headers=auth_headers(doc.id),
+            json={"body": f"Mensaje con la consulta en {estado}"},
+        )
+        assert del_medico.status_code == 409, f"{estado}: {del_medico.text}"
+        assert del_medico.json()["detail"] == "Esta consulta ya no admite mensajes."
+
+        del_paciente = await anon_client.post(
+            f"{PREFIX}/consultations/{cid}/messages",
+            headers={"X-Consultation-Token": token},
+            json={"body": f"Mensaje del paciente en {estado}"},
+        )
+        assert del_paciente.status_code == 409, f"{estado}: {del_paciente.text}"
+        assert del_paciente.json()["detail"] == "Esta consulta ya no admite mensajes."
+
+        # Tampoco se pueden subir adjuntos a un hilo que no admite mensajes
+        adjunto = await anon_client.post(
+            f"{PREFIX}/consultations/{cid}/attachments",
+            headers=auth_headers(doc.id),
+            files={"file": ("informe.pdf", PDF_BYTES, "application/pdf")},
+        )
+        assert adjunto.status_code == 409, f"{estado}: {adjunto.text}"
+
+
+async def test_waiting_lo_escribe_el_paciente_pero_no_el_medico(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """En `waiting` aún no hay tratante: el médico recibe 409, el paciente puede escribir."""
+    doc = await add_doctor(db_session)
+    cid, _, token = await _create_test_case(client, db_session, doctor=doc, status="waiting")
+
+    del_medico = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/messages",
+        headers=auth_headers(doc.id),
+        json={"body": "Mensaje del médico en espera"},
+    )
+    assert del_medico.status_code == 409
+    assert "aún no ha sido tomada" in del_medico.json()["detail"]
+
+    del_paciente = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/messages",
+        headers={"X-Consultation-Token": token},
+        json={"body": "Sigo esperando, doctora"},
+    )
+    assert del_paciente.status_code == 201, del_paciente.text
+
+
+async def test_cerrada_dentro_de_la_ventana_sigue_admitiendo_mensajes(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Cerrada hace menos de MESSAGING_AFTER_CLOSE_HOURS: el hilo sigue abierto (CA2.2)."""
+    doc = await add_doctor(db_session)
+    cid, _, _ = await _create_test_case(client, db_session, doctor=doc)
+    consulta = await db_session.get(Consultation, uuid.UUID(cid))
+    assert consulta is not None
+    consulta.status = "closed"
+    consulta.closed_at = datetime.now(UTC) - timedelta(
+        hours=settings.MESSAGING_AFTER_CLOSE_HOURS - 1
+    )
+    await db_session.flush()
+
+    resp = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/messages",
+        headers=auth_headers(doc.id),
+        json={"body": "Seguimiento tras el cierre"},
+    )
+    assert resp.status_code == 201, resp.text
+
+    # Sin ninguna fecha de referencia se cierra el paso (fail-closed). En la base `created_at`
+    # es NOT NULL, así que la rama se prueba sobre un objeto suelto.
+    huerfana = Consultation(status="cancelled")
+    with pytest.raises(ConflictError):
+        messaging.check_can_write_in_consultation(huerfana, is_doctor=True)
+
+    # Vencida (cerrada hace más de la ventana): 409 también para el paciente
+    consulta.status = "closed"
+    consulta.closed_at = datetime.now(UTC) - timedelta(
+        hours=settings.MESSAGING_AFTER_CLOSE_HOURS + 1
+    )
+    await db_session.flush()
+    vencida = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/messages",
+        headers=auth_headers(doc.id),
+        json={"body": "Mensaje fuera de la ventana"},
+    )
+    assert vencida.status_code == 409
+    assert vencida.json()["detail"] == "Esta consulta ya no admite mensajes."
+
+
+# =====================================================================
+# 10. El buzón del admin NO es el buzón de la plataforma (CA7.1)
+# =====================================================================
+
+
+async def test_inbox_del_admin_filtra_por_pertenencia(
+    client: AsyncClient,
+    anon_client: AsyncClient,
+    db_session: AsyncSession,
+    admin_identity: Profile,
+    factory_de_prueba: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CA7.1: el admin, con `messages.read`, solo ve los hilos en los que es o fue tratante.
+
+    El `/inbox` devolvía el buzón de toda la plataforma al admin, con la presencia del paciente
+    incluida. Para supervisar tiene `consultations.read` y los metadatos del caso (CA3.2).
+    """
+    monkeypatch.setattr(settings, "WAITING_ROOM_STREAM_MAX_SECONDS", 0)
+    doc = await add_doctor(db_session)
+    cid_ajeno, _, token_ajeno = await _create_test_case(client, db_session, doctor=doc)
+    await anon_client.post(
+        f"{PREFIX}/consultations/{cid_ajeno}/messages",
+        headers={"X-Consultation-Token": token_ajeno},
+        json={"body": "Hilo de otro médico"},
+    )
+
+    # 1. El admin no es ni fue tratante de ese hilo: buzón vacío
+    vacio = await client.get(f"{PREFIX}/inbox")
+    assert vacio.status_code == 200
+    assert vacio.json() == []
+
+    # 2. Su stream tampoco cuenta ese hilo ni lo nombra
+    stream = await client.get(f"{PREFIX}/inbox/stream")
+    assert stream.status_code == 200
+    assert '"unread_total":0' in stream.text
+    assert cid_ajeno not in stream.text
+
+    # 3. En cambio, el hilo de un caso que SÍ tiene asignado sí aparece
+    cid_propio, _, token_propio = await _create_test_case(client, db_session, doctor=doc)
+    consulta = await db_session.get(Consultation, uuid.UUID(cid_propio))
+    assert consulta is not None
+    consulta.assigned_doctor_id = admin_identity.id
+    await db_session.flush()
+    await anon_client.post(
+        f"{PREFIX}/consultations/{cid_propio}/messages",
+        headers={"X-Consultation-Token": token_propio},
+        json={"body": "Hilo del propio admin"},
+    )
+
+    propio = await client.get(f"{PREFIX}/inbox")
+    assert propio.status_code == 200
+    hilos = propio.json()
+    assert [h["consultation_id"] for h in hilos] == [cid_propio]
+    assert hilos[0]["unread_count"] == 1
+
+
+async def test_inbox_del_medico_filtra_hilos_ajenos_y_only_unread(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El buzón de un médico no incluye hilos de otro, y `only_unread` filtra los leídos."""
+    doc_a = await add_doctor(db_session)
+    doc_b = await add_doctor(db_session)
+    cid_a, _, token_a = await _create_test_case(client, db_session, doctor=doc_a)
+    cid_b, _, token_b = await _create_test_case(client, db_session, doctor=doc_b)
+
+    for cid, token in ((cid_a, token_a), (cid_b, token_b)):
+        await anon_client.post(
+            f"{PREFIX}/consultations/{cid}/messages",
+            headers={"X-Consultation-Token": token},
+            json={"body": "Buenas tardes"},
+        )
+
+    inbox_a = await anon_client.get(f"{PREFIX}/inbox", headers=auth_headers(doc_a.id))
+    assert [h["consultation_id"] for h in inbox_a.json()] == [cid_a]
+
+    # Tras marcar leído, `only_unread=true` deja el buzón vacío
+    await anon_client.post(
+        f"{PREFIX}/consultations/{cid_a}/messages/read", headers=auth_headers(doc_a.id)
+    )
+    sin_leer = await anon_client.get(
+        f"{PREFIX}/inbox?only_unread=true", headers=auth_headers(doc_a.id)
+    )
+    assert sin_leer.json() == []
+    con_todos = await anon_client.get(f"{PREFIX}/inbox", headers=auth_headers(doc_a.id))
+    assert len(con_todos.json()) == 1
+    assert con_todos.json()[0]["last_direction"] == "patient_to_doctor"
+
+
+# =====================================================================
+# 11. Rate limit por IP en las escrituras (CA4.4)
+# =====================================================================
+
+
+async def test_rate_limit_por_ip_en_envio_y_en_adjuntos(
+    client: AsyncClient,
+    anon_client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CA4.4: `PUBLIC_WRITE_RATE_LIMIT` por IP, ADEMÁS del tope horario por hilo.
+
+    El tope por hilo no frena a quien crea casos nuevos para seguir escribiendo, y el
+    endpoint lo sirve un paciente anónimo con solo un token de sala.
+    """
+    monkeypatch.setattr(limiter, "enabled", True)  # el conftest lo apaga para el resto
+    doc = await add_doctor(db_session)
+    cid, _, token = await _create_test_case(client, db_session, doctor=doc)
+
+    codigos = []
+    for i in range(14):
+        r = await anon_client.post(
+            f"{PREFIX}/consultations/{cid}/messages",
+            headers={"X-Consultation-Token": token},
+            json={"body": f"Mensaje en ráfaga {i}"},
+        )
+        codigos.append(r.status_code)
+    assert 429 in codigos, f"sin rate limit por IP: {codigos}"
+
+    adjuntos = []
+    for _ in range(14):
+        r = await anon_client.post(
+            f"{PREFIX}/consultations/{cid}/attachments",
+            headers={"X-Consultation-Token": token},
+            files={"file": ("examen.pdf", PDF_BYTES, "application/pdf")},
+        )
+        adjuntos.append(r.status_code)
+    assert 429 in adjuntos, f"sin rate limit por IP en adjuntos: {adjuntos}"
+
+
+# =====================================================================
+# 12. Tope de caracteres del cuerpo desde Settings (CA2.3)
+# =====================================================================
+
+
+async def test_tope_de_caracteres_del_cuerpo(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """CA2.3: 0 a 2000 caracteres, y el tope sale de `MESSAGING_MAX_BODY_CHARS`."""
+    assert settings.MESSAGING_MAX_BODY_CHARS == 2000, "CA2.3 fija el tope en 2000"
+    limite = settings.MESSAGING_MAX_BODY_CHARS
+
+    doc = await add_doctor(db_session)
+    cid, _, _ = await _create_test_case(client, db_session, doctor=doc)
+
+    justo = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/messages",
+        headers=auth_headers(doc.id),
+        json={"body": "a" * limite},
+    )
+    assert justo.status_code == 201, justo.text
+    assert len(justo.json()["body"]) == limite
+
+    excede = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/messages",
+        headers=auth_headers(doc.id),
+        json={"body": "a" * (limite + 1)},
+    )
+    assert excede.status_code == 422
+
+    # El OpenAPI publica el MISMO tope: el frontend lo usa como `maxLength` del textarea
+    esquema = (await anon_client.get(f"{PREFIX}/openapi.json")).json()
+    body_schema = esquema["components"]["schemas"]["MessageCreate"]["properties"]["body"]
+    assert any(v.get("maxLength") == limite for v in body_schema["anyOf"])
+
+
+# =====================================================================
+# 13. Concurrencia (R5 doble marcado, y doble envío con el mismo client_msg_id)
+# =====================================================================
+#
+# Usan sesiones y conexiones REALES (sin el override de `get_db`): con la sesión compartida del
+# resto de los tests no habría dos transacciones y la carrera no probaría nada. Mismo montaje
+# que `tests/test_queue_concurrency.py`.
+
+
+async def _sembrar_hilo_real() -> dict:
+    """Committea un médico con ficha habilitada, su paciente y una consulta `in_progress`."""
+    async with AsyncSessionLocal() as s:
+        doctor = make_profile(role="doctor", specialty=GENERAL)
+        doctor.specialty_id = await specialty_id_by_name(s, GENERAL)
+        s.add(doctor)
+        await s.flush()
+        s.add(make_doctor_row(doctor.id))
+
+        paciente = Patient(
+            full_name="Paciente Mensajeria Concurrente",
+            phone_whatsapp="+58412999888",
+            affected_zone="Caracas",
+            consent=True,
+        )
+        s.add(paciente)
+        await s.flush()
+
+        consulta = Consultation(
+            code=f"TEST-{uuid.uuid4().hex[:10]}",
+            patient_id=paciente.id,
+            specialty_id=doctor.specialty_id,
+            status="in_progress",
+            assigned_doctor_id=doctor.id,
+        )
+        s.add(consulta)
+        await s.commit()
+        return {
+            "consultation_id": consulta.id,
+            "patient_id": paciente.id,
+            "doctor_id": doctor.id,
+        }
+
+
+async def _borrar_hilo_real(datos: dict) -> None:
+    async with AsyncSessionLocal() as s:
+        await s.execute(delete(Message).where(Message.consultation_id == datos["consultation_id"]))
+        await s.execute(delete(Consultation).where(Consultation.id == datos["consultation_id"]))
+        await s.execute(delete(Patient).where(Patient.id == datos["patient_id"]))
+        await s.execute(delete(Doctor).where(Doctor.user_id == datos["doctor_id"]))
+        await s.execute(delete(Profile).where(Profile.id == datos["doctor_id"]))
+        await s.commit()
+
+
+@pytest_asyncio.fixture
+async def hilo_real() -> AsyncGenerator[dict, None]:
+    datos = await _sembrar_hilo_real()
+    try:
+        yield datos
+    finally:
+        await _borrar_hilo_real(datos)
+
+
+async def test_envios_simultaneos_con_el_mismo_client_msg_id(
+    live_client: AsyncClient, hilo_real: dict
+) -> None:
+    """Dos envíos a la vez con el mismo `client_msg_id` dejan UNA fila, nunca un 500.
+
+    La idempotencia se resolvía con un SELECT previo, que no cierra la carrera: ambos pasaban
+    el chequeo y el segundo INSERT choca con el índice único parcial
+    `uq_messages_consultation_client_msg`. Ahora ese choque se captura, se vuelve atrás el
+    savepoint y se devuelve el mensaje que ganó.
+    """
+    cid = hilo_real["consultation_id"]
+    headers = auth_headers(hilo_real["doctor_id"])
+    client_msg_id = f"carrera-{uuid.uuid4()}"
+
+    async def enviar() -> httpx.Response:
+        return await live_client.post(
+            f"{PREFIX}/consultations/{cid}/messages",
+            headers=headers,
+            json={"body": "Mensaje duplicado por doble clic", "client_msg_id": client_msg_id},
+        )
+
+    respuestas = await asyncio.gather(*[enviar() for _ in range(4)])
+    codigos = [r.status_code for r in respuestas]
+    assert all(c in (200, 201) for c in codigos), codigos
+    assert codigos.count(201) == 1, f"debe crearse exactamente una vez: {codigos}"
+    assert len({r.json()["id"] for r in respuestas}) == 1, "todos devuelven el mismo mensaje"
+
+    async with AsyncSessionLocal() as s:
+        filas = await s.scalar(
+            select(func.count(Message.id)).where(
+                Message.consultation_id == cid, Message.client_msg_id == client_msg_id
+            )
+        )
+    assert filas == 1
+
+
+async def test_doble_marcado_leido_concurrente_es_idempotente(
+    live_client: AsyncClient, hilo_real: dict
+) -> None:
+    """R5/CA5.1: N marcados simultáneos reparten el conteo; nada se marca dos veces.
+
+    La escritura es condicional (`UPDATE ... WHERE read_at IS NULL`) y lo que se devuelve es el
+    `rowcount`: si dos marcados contaran los mismos mensajes, la suma pasaría del total y el
+    buzón del médico restaría no leídos que no existen.
+    """
+    cid = hilo_real["consultation_id"]
+    headers = auth_headers(hilo_real["doctor_id"])
+
+    total_mensajes = 3
+    async with AsyncSessionLocal() as s:
+        for i in range(total_mensajes):
+            s.add(
+                Message(
+                    id=uuid.uuid4(),
+                    consultation_id=cid,
+                    sender_role="patient",
+                    direction="patient_to_doctor",
+                    channel="web",
+                    kind="text",
+                    body=f"Mensaje sin leer {i}",
+                    sent_at=datetime.now(UTC),
+                    delivery_status="sent",
+                )
+            )
+        await s.commit()
+
+    async def marcar() -> int:
+        resp = await live_client.post(
+            f"{PREFIX}/consultations/{cid}/messages/read", headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()["marked"]
+
+    marcados = await asyncio.gather(*[marcar() for _ in range(4)])
+    assert sum(marcados) == total_mensajes, f"doble marcado: {marcados}"
+    assert max(marcados) <= total_mensajes
+
+    async with AsyncSessionLocal() as s:
+        pendientes = await s.scalar(
+            select(func.count(Message.id)).where(
+                Message.consultation_id == cid,
+                Message.direction == "patient_to_doctor",
+                Message.read_at.is_(None),
+            )
+        )
+    assert pendientes == 0
+
+    # Y un marcado posterior sigue siendo un no-op (idempotencia)
+    assert await marcar() == 0
+
+
+# =====================================================================
+# 14. Cliente de Supabase Storage (bucket privado, CA15.3)
+# =====================================================================
+
+
+async def test_storage_guarda_lee_y_borra_en_el_bucket(bucket_falso: dict[str, bytes]) -> None:
+    """El binario va al bucket por su ruta de UUID; borrar dos veces no es un error."""
+    ruta = f"consultations/{uuid.uuid4()}/attachments/{uuid.uuid4()}.bin"
+
+    assert await storage.save_attachment_file(ruta, PDF_BYTES, "application/pdf") == ruta
+    assert bucket_falso[ruta] == PDF_BYTES
+    assert await storage.get_attachment_file(ruta) == PDF_BYTES
+    assert await storage.delete_attachment_file(ruta) is True
+    assert await storage.delete_attachment_file(ruta) is False
+    assert await storage.get_attachment_file(ruta) is None
+
+
+async def test_storage_rechaza_rutas_de_traversal() -> None:
+    """Una ruta con `..` o absoluta no puede salirse del prefijo del bucket."""
+    for ruta in ("../../etc/passwd", "/", "..", ""):
+        with pytest.raises(UpstreamServiceError):
+            await storage.get_attachment_file(ruta)
+
+
+async def test_storage_traduce_fallos_a_error_de_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Storage caído o rechazando no se escapa como 500: es un 502 sin detalles internos."""
+
+    def error_del_servidor(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "InternalError", "bucket": "chat-attachments"})
+
+    monkeypatch.setattr(storage, "_transport", httpx.MockTransport(error_del_servidor))
+    ruta = "consultations/x/attachments/y.bin"
+    with pytest.raises(UpstreamServiceError):
+        await storage.save_attachment_file(ruta, PDF_BYTES, "application/pdf")
+    with pytest.raises(UpstreamServiceError):
+        await storage.get_attachment_file(ruta)
+    with pytest.raises(UpstreamServiceError):
+        await storage.delete_attachment_file(ruta)
+
+    def sin_red(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("sin red", request=request)
+
+    monkeypatch.setattr(storage, "_transport", httpx.MockTransport(sin_red))
+    with pytest.raises(UpstreamServiceError):
+        await storage.save_attachment_file(ruta, PDF_BYTES, "application/pdf")
+    with pytest.raises(UpstreamServiceError):
+        await storage.get_attachment_file(ruta)
+    with pytest.raises(UpstreamServiceError):
+        await storage.delete_attachment_file(ruta)
+
+
+# =====================================================================
+# 15. Presencia y validaciones (unidad)
+# =====================================================================
+
+
+def test_presencia_del_paciente_usa_el_umbral_de_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """El umbral sale de `MESSAGING_PATIENT_PRESENCE_TTL_SECONDS`, no de un 45 cableado."""
+    monkeypatch.setattr(settings, "MESSAGING_PATIENT_PRESENCE_TTL_SECONDS", 45)
+    cid = uuid.uuid4()
+    assert messaging.is_patient_online(cid) is False
+
+    messaging.record_patient_presence(cid)
+    assert messaging.is_patient_online(cid) is True
+
+    # Una señal más vieja que el umbral se descarta y se limpia del registro en memoria
+    messaging._ACTIVE_PATIENTS[cid] = datetime.now(UTC) - timedelta(seconds=46)
+    assert messaging.is_patient_online(cid) is False
+    assert cid not in messaging._ACTIVE_PATIENTS
+
+    # Respaldo persistente (`consultations.patient_last_seen_at`), con y sin zona
+    reciente = datetime.now(UTC) - timedelta(seconds=5)
+    assert messaging.is_patient_online(cid, reciente) is True
+    assert messaging.is_patient_online(cid, reciente.replace(tzinfo=None)) is True
+    assert messaging.is_patient_online(cid, datetime.now(UTC) - timedelta(seconds=120)) is False
+
+    monkeypatch.setattr(settings, "MESSAGING_PATIENT_PRESENCE_TTL_SECONDS", 1)
+    assert messaging.is_patient_online(cid, reciente) is False
+
+
+def test_validacion_de_adjuntos_nombre_y_tamano() -> None:
+    """Nombre vacío, nombre en blanco y archivo por encima del tope: 422."""
+    with pytest.raises(UnprocessableError):
+        messaging.validate_attachment_file("", PDF_BYTES, "application/pdf")
+    with pytest.raises(UnprocessableError):
+        messaging.validate_attachment_file("   ", PDF_BYTES, "application/pdf")
+
+    enorme = b"%PDF-1.4" + b"0" * settings.MESSAGING_MAX_ATTACHMENT_SIZE_BYTES
+    with pytest.raises(UnprocessableError) as exc:
+        messaging.validate_attachment_file("enorme.pdf", enorme, "application/pdf")
+    assert "tamaño máximo" in str(exc.value)
+
+
+def test_ventana_tras_cierre_con_fecha_sin_zona() -> None:
+    """Una `closed_at` sin zona se interpreta como UTC, no revienta la comparación."""
+    reciente = Consultation(status="closed", closed_at=datetime.now(UTC).replace(tzinfo=None))
+    messaging.check_can_write_in_consultation(reciente, is_doctor=True)
+
+    vencida = Consultation(
+        status="closed",
+        closed_at=(
+            datetime.now(UTC) - timedelta(hours=settings.MESSAGING_AFTER_CLOSE_HOURS + 1)
+        ).replace(tzinfo=None),
+    )
+    with pytest.raises(ConflictError):
+        messaging.check_can_write_in_consultation(vencida, is_doctor=True)
+
+
+# =====================================================================
+# 16. Pertenencia: 404 en TODAS las rutas del hilo (IDOR)
+# =====================================================================
+
+
+async def test_consulta_inexistente_da_404_en_todas_las_rutas(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Ninguna ruta del hilo filtra la existencia de una consulta que no está."""
+    doc = await add_doctor(db_session)
+    h = auth_headers(doc.id)
+    fantasma = uuid.uuid4()
+
+    assert (
+        await anon_client.get(f"{PREFIX}/consultations/{fantasma}/messages", headers=h)
+    ).status_code == 404
+    assert (
+        await anon_client.post(
+            f"{PREFIX}/consultations/{fantasma}/messages", headers=h, json={"body": "Hola"}
+        )
+    ).status_code == 404
+    assert (
+        await anon_client.post(f"{PREFIX}/consultations/{fantasma}/messages/read", headers=h)
+    ).status_code == 404
+    assert (
+        await anon_client.post(
+            f"{PREFIX}/consultations/{fantasma}/attachments",
+            headers=h,
+            files={"file": ("informe.pdf", PDF_BYTES, "application/pdf")},
+        )
+    ).status_code == 404
+    assert (
+        await anon_client.get(
+            f"{PREFIX}/consultations/{fantasma}/attachments/{uuid.uuid4()}", headers=h
+        )
+    ).status_code == 404
+
+
+async def test_medico_ajeno_y_token_cruzado_dan_404_en_todo_el_hilo(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Ni un médico de otro caso ni un token de otra sala leen, marcan ni suben adjuntos."""
+    doc = await add_doctor(db_session)
+    ajeno = await add_doctor(db_session)
+    cid, _, _ = await _create_test_case(client, db_session, doctor=doc)
+    _, _, token_de_otro = await _create_test_case(client, db_session, doctor=doc)
+
+    for headers in (auth_headers(ajeno.id), {"X-Consultation-Token": token_de_otro}):
+        assert (
+            await anon_client.get(f"{PREFIX}/consultations/{cid}/messages", headers=headers)
+        ).status_code == 404
+        assert (
+            await anon_client.post(f"{PREFIX}/consultations/{cid}/messages/read", headers=headers)
+        ).status_code == 404
+        assert (
+            await anon_client.post(
+                f"{PREFIX}/consultations/{cid}/attachments",
+                headers=headers,
+                files={"file": ("informe.pdf", PDF_BYTES, "application/pdf")},
+            )
+        ).status_code == 404
+        assert (
+            await anon_client.get(
+                f"{PREFIX}/consultations/{cid}/attachments/{uuid.uuid4()}", headers=headers
+            )
+        ).status_code == 404
+
+
+async def test_el_admin_no_marca_como_leido(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El admin no es parte de la conversación: marcar leído es 403, no un 200 silencioso."""
+    doc = await add_doctor(db_session)
+    cid, _, token = await _create_test_case(client, db_session, doctor=doc)
+    await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/messages",
+        headers={"X-Consultation-Token": token},
+        json={"body": "Mensaje del paciente"},
+    )
+
+    resp = await client.post(f"{PREFIX}/consultations/{cid}/messages/read")
+    assert resp.status_code == 403
+
+
+async def test_el_paciente_marca_como_leido_lo_del_medico(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El paciente marca leído solo la dirección contraria (CA5.1)."""
+    doc = await add_doctor(db_session)
+    cid, _, token = await _create_test_case(client, db_session, doctor=doc)
+    await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/messages",
+        headers=auth_headers(doc.id),
+        json={"body": "Le escribo el resultado"},
+    )
+    await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/messages",
+        headers={"X-Consultation-Token": token},
+        json={"body": "Gracias doctora"},
+    )
+
+    marcado = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/messages/read",
+        headers={"X-Consultation-Token": token},
+    )
+    assert marcado.status_code == 200
+    assert marcado.json()["marked"] == 1  # solo el del médico
+
+    # Y el médico sigue teniendo el suyo sin leer
+    hilo = await anon_client.get(
+        f"{PREFIX}/consultations/{cid}/messages", headers=auth_headers(doc.id)
+    )
+    assert hilo.json()["unread_count"] == 1
+
+
+async def test_adjunto_de_otra_consulta_no_se_puede_vincular(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Vincular un adjunto que no es de este hilo es 400, no un mensaje a medias."""
+    doc = await add_doctor(db_session)
+    cid_a, _, _ = await _create_test_case(client, db_session, doctor=doc)
+    cid_b, _, _ = await _create_test_case(client, db_session, doctor=doc)
+
+    subido = await anon_client.post(
+        f"{PREFIX}/consultations/{cid_b}/attachments",
+        headers=auth_headers(doc.id),
+        files={"file": ("informe.pdf", PDF_BYTES, "application/pdf")},
+    )
+    att_id = subido.json()["id"]
+
+    resp = await anon_client.post(
+        f"{PREFIX}/consultations/{cid_a}/messages",
+        headers=auth_headers(doc.id),
+        json={"body": "Mira esto", "attachment_ids": [att_id]},
+    )
+    assert resp.status_code == 400
+
+    inexistente = await anon_client.post(
+        f"{PREFIX}/consultations/{cid_a}/messages",
+        headers=auth_headers(doc.id),
+        json={"body": "Mira esto", "attachment_ids": [str(uuid.uuid4())]},
+    )
+    assert inexistente.status_code == 400
+
+
+async def test_adjunto_sin_binario_en_el_bucket_da_404(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Si la fila existe pero el objeto no está en el bucket, es 404 y no un 500."""
+    doc = await add_doctor(db_session)
+    cid, _, _ = await _create_test_case(client, db_session, doctor=doc)
+    subido = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/attachments",
+        headers=auth_headers(doc.id),
+        files={"file": ("informe.pdf", PDF_BYTES, "application/pdf")},
+    )
+    att_id = subido.json()["id"]
+
+    ruta = f"consultations/{cid}/attachments/{att_id}.bin"
+    assert await storage.delete_attachment_file(ruta) is True
+
+    resp = await anon_client.get(
+        f"{PREFIX}/consultations/{cid}/attachments/{att_id}", headers=auth_headers(doc.id)
+    )
+    assert resp.status_code == 404
+
+
+async def test_paginacion_del_hilo_con_after_id_y_before_id(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """`after_id` y `before_id` recortan el hilo por `sent_at, id` (orden estable)."""
+    doc = await add_doctor(db_session)
+    cid, _, token = await _create_test_case(client, db_session, doctor=doc)
+
+    ids = []
+    for i in range(3):
+        resp = await anon_client.post(
+            f"{PREFIX}/consultations/{cid}/messages",
+            headers={"X-Consultation-Token": token},
+            json={"body": f"Mensaje {i}"},
+        )
+        ids.append(resp.json()["id"])
+
+    h = auth_headers(doc.id)
+    despues = await anon_client.get(
+        f"{PREFIX}/consultations/{cid}/messages?after_id={ids[0]}", headers=h
+    )
+    assert [m["id"] for m in despues.json()["items"]] == ids[1:]
+
+    antes = await anon_client.get(
+        f"{PREFIX}/consultations/{cid}/messages?before_id={ids[2]}", headers=h
+    )
+    assert [m["id"] for m in antes.json()["items"]] == ids[:2]
+
+    # Un id inexistente no recorta nada (no es un filtro silencioso ni un error)
+    todos = await anon_client.get(
+        f"{PREFIX}/consultations/{cid}/messages?after_id={uuid.uuid4()}", headers=h
+    )
+    assert [m["id"] for m in todos.json()["items"]] == ids
+
+
+async def test_hilo_de_la_cadena_de_derivacion(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """CA1.3/CA2.1: quien FUE tratante en la cadena sigue leyendo el hilo de la consulta hija."""
+    doc_padre = await add_doctor(db_session)
+    doc_hija = await add_doctor(db_session)
+    cid_padre, patient_id, _ = await _create_test_case(client, db_session, doctor=doc_padre)
+
+    padre = await db_session.get(Consultation, uuid.UUID(cid_padre))
+    assert padre is not None
+
+    cid_hija, _, token_hija = await _create_test_case(client, db_session, doctor=doc_hija)
+    hija = await db_session.get(Consultation, uuid.UUID(cid_hija))
+    assert hija is not None
+    hija.parent_consultation_id = padre.id
+    await db_session.flush()
+
+    await anon_client.post(
+        f"{PREFIX}/consultations/{cid_hija}/messages",
+        headers={"X-Consultation-Token": token_hija},
+        json={"body": "Pregunta para el especialista"},
+    )
+
+    # El médico de la consulta PADRE lee y escribe en el hilo de la hija
+    lectura = await anon_client.get(
+        f"{PREFIX}/consultations/{cid_hija}/messages", headers=auth_headers(doc_padre.id)
+    )
+    assert lectura.status_code == 200
+    assert lectura.json()["items"][0]["body"] == "Pregunta para el especialista"
+
+    # Y ese hilo aparece en su buzón, aunque la hija esté asignada a otro médico
+    inbox = await anon_client.get(f"{PREFIX}/inbox", headers=auth_headers(doc_padre.id))
+    assert cid_hija in [h["consultation_id"] for h in inbox.json()]
+
+
+# =====================================================================
+# 17. Guardas del router (401 / 403 / multipart) y SSE del buzón
+# =====================================================================
+
+
+@pytest.fixture
+def staff_sin_permisos_de_mensajeria() -> Iterator[Principal]:
+    """Staff (admin) SIN `messages.read`/`messages.write`: las rutas deben dar 403.
+
+    Se inyecta el `Principal` porque todos los roles sembrados traen los dos permisos (ver la
+    migración de RBAC), así que con un usuario real no se puede llegar a este estado — y la
+    guarda del router es justo lo que protege al módulo si un día se siembra otro rol.
+    """
+    principal = Principal(
+        id=uuid.uuid4(),
+        role="admin",
+        active=True,
+        verified=True,
+        roles=frozenset({"admin"}),
+        permissions=frozenset(),
+    )
+    app.dependency_overrides[get_optional_principal] = lambda: principal
+    yield principal
+    app.dependency_overrides.pop(get_optional_principal, None)
+
+
+async def test_sin_credenciales_todas_las_rutas_del_hilo_dan_401(
+    anon_client: AsyncClient,
+) -> None:
+    """Sin sesión ni token de sala no se entra al hilo (ni para leer metadatos)."""
+    cid = uuid.uuid4()
+    assert (await anon_client.get(f"{PREFIX}/consultations/{cid}/messages")).status_code == 401
+    assert (
+        await anon_client.post(f"{PREFIX}/consultations/{cid}/messages", json={"body": "Hola"})
+    ).status_code == 401
+    assert (
+        await anon_client.post(f"{PREFIX}/consultations/{cid}/messages/read")
+    ).status_code == 401
+    assert (
+        await anon_client.post(
+            f"{PREFIX}/consultations/{cid}/attachments",
+            files={"file": ("informe.pdf", PDF_BYTES, "application/pdf")},
+        )
+    ).status_code == 401
+    assert (
+        await anon_client.get(f"{PREFIX}/consultations/{cid}/attachments/{uuid.uuid4()}")
+    ).status_code == 401
+
+
+async def test_staff_sin_permiso_de_mensajeria_recibe_403(
+    anon_client: AsyncClient, staff_sin_permisos_de_mensajeria: Principal
+) -> None:
+    """Un miembro del staff sin `messages.*` no pasa, aunque tenga sesión válida."""
+    cid = uuid.uuid4()
+    assert (await anon_client.get(f"{PREFIX}/consultations/{cid}/messages")).status_code == 403
+    assert (
+        await anon_client.post(f"{PREFIX}/consultations/{cid}/messages", json={"body": "Hola"})
+    ).status_code == 403
+    assert (
+        await anon_client.post(f"{PREFIX}/consultations/{cid}/messages/read")
+    ).status_code == 403
+    assert (
+        await anon_client.post(
+            f"{PREFIX}/consultations/{cid}/attachments",
+            files={"file": ("informe.pdf", PDF_BYTES, "application/pdf")},
+        )
+    ).status_code == 403
+    assert (
+        await anon_client.get(f"{PREFIX}/consultations/{cid}/attachments/{uuid.uuid4()}")
+    ).status_code == 403
+
+
+async def test_subida_sin_multipart_valido_da_422(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """La subida exige `multipart/form-data` con una parte de archivo de verdad."""
+    doc = await add_doctor(db_session)
+    cid, _, _ = await _create_test_case(client, db_session, doctor=doc)
+    url = f"{PREFIX}/consultations/{cid}/attachments"
+    h = auth_headers(doc.id)
+
+    no_multipart = await anon_client.post(url, headers=h, json={"file": "informe.pdf"})
+    assert no_multipart.status_code == 422
+    assert "multipart" in no_multipart.json()["detail"]
+
+    vacio = await anon_client.post(
+        url,
+        headers={**h, "Content-Type": "multipart/form-data; boundary=frontera"},
+        content=b"",
+    )
+    assert vacio.status_code == 422
+
+    sin_archivo = await anon_client.post(
+        url,
+        headers={**h, "Content-Type": "multipart/form-data; boundary=frontera"},
+        content=(
+            b"--frontera\r\n"
+            b'Content-Disposition: form-data; name="campo"\r\n\r\n'
+            b"valor\r\n"
+            b"--frontera--\r\n"
+        ),
+    )
+    assert sin_archivo.status_code == 422
+    assert "archivo" in sin_archivo.json()["detail"]
+
+
+async def test_inbox_stream_anuncia_solo_los_hilos_que_cambiaron(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    factory_de_prueba: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R8.2: tras el primer evento, el stream nombra solo los hilos que cambiaron, y late."""
+    estable, nuevo = uuid.uuid4(), uuid.uuid4()
+    estados = [
+        (0, {estable: (None, 0)}),
+        (1, {estable: (None, 0), nuevo: (None, 1)}),
+    ]
+
+    async def senal(*_: object, **__: object) -> tuple[int, dict]:
+        return estados.pop(0) if estados else (1, {estable: (None, 0), nuevo: (None, 1)})
+
+    monkeypatch.setattr(messaging, "get_inbox_signal", senal)
+    monkeypatch.setattr(settings, "WAITING_ROOM_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(settings, "WAITING_ROOM_HEARTBEAT_SECONDS", 0)
+    monkeypatch.setattr(settings, "WAITING_ROOM_STREAM_MAX_SECONDS", 0.1)
+
+    resp = await client.get(f"{PREFIX}/inbox/stream")
+    assert resp.status_code == 200
+    assert ": ping" in resp.text  # latido
+
+    eventos = [linea for linea in resp.text.splitlines() if linea.startswith("data:")]
+    assert len(eventos) >= 2, resp.text
+    assert str(nuevo) in eventos[1]
+    assert str(estable) not in eventos[1]
+
+
+async def test_inbox_stream_se_cierra_si_falla_la_senal(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    factory_de_prueba: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Un fallo leyendo la señal cierra el stream sin filtrar el error al cliente."""
+
+    async def explota(*_: object, **__: object) -> tuple[int, dict]:
+        raise RuntimeError("la base se cayó")
+
+    monkeypatch.setattr(messaging, "get_inbox_signal", explota)
+    monkeypatch.setattr(settings, "WAITING_ROOM_STREAM_MAX_SECONDS", 0.1)
+
+    resp = await client.get(f"{PREFIX}/inbox/stream")
+    assert resp.status_code == 200
+    assert "la base se cayó" not in resp.text
+    assert "event: inbox" not in resp.text
+
+
+async def test_medico_que_intervino_en_el_caso_sigue_en_el_hilo(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Quien dejó un evento en el caso (lo atendió antes de reasignarlo) conserva el hilo."""
+    tratante = await add_doctor(db_session)
+    previo = await add_doctor(db_session)
+    cid, _, token = await _create_test_case(client, db_session, doctor=tratante)
+
+    db_session.add(
+        ConsultationEvent(
+            id=uuid.uuid4(),
+            consultation_id=uuid.UUID(cid),
+            event_type="claimed",
+            created_by=previo.id,
+        )
+    )
+    await db_session.flush()
+
+    await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/messages",
+        headers={"X-Consultation-Token": token},
+        json={"body": "Mensaje del paciente"},
+    )
+
+    lectura = await anon_client.get(
+        f"{PREFIX}/consultations/{cid}/messages", headers=auth_headers(previo.id)
+    )
+    assert lectura.status_code == 200
+    assert lectura.json()["items"][0]["body"] == "Mensaje del paciente"
+
+
+async def test_descarga_con_token_de_otra_sala_da_404(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """El token de otra sala no descarga el adjunto de esta, ni revela que existe."""
+    doc = await add_doctor(db_session)
+    cid, _, _ = await _create_test_case(client, db_session, doctor=doc)
+    _, _, token_de_otro = await _create_test_case(client, db_session, doctor=doc)
+
+    subido = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/attachments",
+        headers=auth_headers(doc.id),
+        files={"file": ("biopsia.pdf", PDF_BYTES, "application/pdf")},
+    )
+    att_id = subido.json()["id"]
+
+    resp = await anon_client.get(
+        f"{PREFIX}/consultations/{cid}/attachments/{att_id}",
+        headers={"X-Consultation-Token": token_de_otro},
+    )
+    assert resp.status_code == 404

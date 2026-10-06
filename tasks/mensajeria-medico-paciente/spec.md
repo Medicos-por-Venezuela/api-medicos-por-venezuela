@@ -147,6 +147,10 @@ Tabla `message_attachments` (nueva): `id` (uuid PK), `message_id` (uuid FK messa
   consulta; otro médico recibe 404 (no 403, para no revelar existencia).
 - CA2.2 La consulta debe estar en `in_progress`, `scheduled`, `referred_to_specialist` o cerrada
   hace menos de `MESSAGING_AFTER_CLOSE_HOURS` (72 por defecto, ver P5); si no, 409.
+  **Desviación (cliente, 2026-10-05):** `contacted_whatsapp` también admite mensajes — es un caso
+  abierto con médico asignado y es el paciente al que el médico tuvo que dar su número personal,
+  o sea el escenario que este módulo existe para reemplazar. `urgent_in_person` queda fuera (ahí
+  la vía es la atención presencial). El conjunto se aplica como lista blanca: lo que no esté, 409.
 - CA2.3 `body` de 0 a 2000 caracteres, sin etiquetas HTML (validador Pydantic), `extra="forbid"`. Requiere `body` o `attachment_ids`.
 - CA2.4 Permite adjuntar archivos en PDF o imágenes rasterizadas (JPG, PNG, WEBP) previamente subidos en `POST /consultations/{id}/attachments` (R15). Formato GIF estrictamente rechazado.
 - CA2.5 Responde 201 con `MessageResponse` (cuerpo y adjuntos visibles para el autor). Registra
@@ -174,7 +178,9 @@ Mismo endpoint que R2, sin permiso de staff: pertenencia (sesión) o token de co
 - CA4.3 El paciente **no** puede ver si el médico (profesional) está en línea. La interfaz y las respuestas hacia el paciente no revelan presencia del médico.
 - CA4.4 Rate limit `PUBLIC_WRITE_RATE_LIMIT` por IP y, además, máximo 30 mensajes por hilo y hora.
 - CA4.5 Ventana: consulta abierta o cerrada hace menos de `MESSAGING_AFTER_CLOSE_HOURS`; si no, 409
-  con mensaje «Esta consulta ya no admite mensajes».
+  con mensaje «Esta consulta ya no admite mensajes». Mismo conjunto de estados que CA2.2,
+  `contacted_whatsapp` incluido por la decisión del cliente del 2026-10-05 (el paciente tiene que
+  poder contestar donde el médico le responde), y `waiting` permitido solo al paciente.
 - CA4.6 Dispara el aviso al médico (R6).
 
 ### R5 — Marcar leído

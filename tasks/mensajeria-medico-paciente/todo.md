@@ -1,7 +1,12 @@
 # TODO: Mensajería médico ↔ paciente
 
 > Spec: [`spec.md`](./spec.md) · Plan: [`plan.md`](./plan.md)
-> Estado: **no iniciado**. Bloqueos: preguntas P1–P7 de `.knowledge/mensajeria.md`.
+> Estado: **Fase 1 (API y UI) implementada y corregida contra `spec.md`** — ver el checkpoint
+> de abajo. **Fase 2 (puente WhatsApp): no iniciada**, sigue bloqueada por P1 (tarifa) y P2
+> (Meta Business) de `.knowledge/mensajeria.md`. El **chat en tiempo real**
+> (`spec-chat-tiempo-real.md`: WebSocket, `call_sessions`, videollamada desde el chat,
+> `/me/threads`, `/typing`, `/presence/heartbeat`) queda **fuera del alcance vigente** por
+> decisión del cliente: el alcance es el buzón asíncrono de `spec.md`.
 
 ## Fase 0 — Revisión y acuerdo (sin costo)
 
@@ -20,8 +25,24 @@
 
 ### Checkpoint API Fase 1
 
-- [x] 0 failed, cobertura ≥95 %, ruff limpio, `migrate:status` sin pendientes
-- [ ] README (endpoints) y `.knowledge/mensajeria.md` actualizados con lo que quedó
+- [x] 0 failed y ruff limpio: **802 passed**, `ruff check` / `ruff format` sin hallazgos
+- [x] Cobertura ≥95 % **en los módulos nuevos** (no el total del repo, que era lo que se estaba
+      midiendo cuando esta casilla se marcó con los módulos en 85/85/74 %):
+      `routers/messages.py` **100 %**, `services/messaging.py` **99 %**,
+      `services/storage.py` **100 %** (total del repo: 98 %)
+- [x] `migrate:status` sin pendientes (la corrección de la spec no añadió migraciones)
+- [x] Verificación contra `spec.md` y corrección de los 12 incumplimientos encontrados: adjuntos
+      en bucket privado de Supabase Storage (CA15.3, ya no en `/tmp`), `/inbox` del admin
+      filtrado por pertenencia (CA7.1), `PUBLIC_WRITE_RATE_LIMIT` en las escrituras (CA4.4),
+      estados de escritura como lista blanca (CA2.2/CA4.5), carrera de `client_msg_id` sin 500,
+      `unread_count` en el cuerpo de la respuesta (CA3.4), tope del cuerpo en 2000 desde
+      `Settings` (CA2.3), tests de concurrencia de R5, umbral de presencia en `Settings`,
+      variables en los `.env` de ejemplo (R14)
+- [x] README actualizado con los 7 endpoints de mensajería y con la provisión del bucket privado
+- [x] `.knowledge/mensajeria.md` actualizado: decisión del cliente del 2026-10-05 sobre
+      `contacted_whatsapp` / `urgent_in_person`, estado real de la Fase 1 tras las correcciones,
+      lo que hay que provisionar a mano (bucket privado y credenciales) y el estado honesto de
+      P1–P7 (siguen sin respuesta: la Fase 1 se construyó sobre asunciones, no sobre acuerdos)
 - [ ] PR `feat/mensajeria-buzon` → `dev`; verificación local adjunta
 
 ## Fase 1 — UI (repo `medicos-por-venezuela`, `tasks/mensajeria-medico-paciente/todo.md`)
