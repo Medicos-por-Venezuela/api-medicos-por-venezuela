@@ -162,6 +162,14 @@ class Settings(BaseSettings):
     # del médico (CA7.1). El registro es EN MEMORIA DE PROCESO: válido para el despliegue
     # actual de un solo uvicorn; con varias réplicas cada una vería su propia mitad.
     MESSAGING_PATIENT_PRESENCE_TTL_SECONDS: int = 45
+    # Ventana de REENTRADA del aviso de videollamada (CA16.2b): dentro de ella, volver a entrar
+    # a la sala NO añade otro aviso al hilo — se reutiliza el que ya está. El valor no es
+    # arbitrario: es el mismo `STALE_CONSULTATION_MINUTES` con el que este repo ya decide
+    # cuánto dura una consulta viva antes de considerarla estancada. O sea, "la misma llamada"
+    # es "la misma sesión de atención"; pasado eso, llamar otra vez es una llamada nueva y
+    # merece su propio aviso. La sala y el `audit_log` no dependen de esto: se aseguran y se
+    # registran en cada intento.
+    MESSAGING_CALL_NOTICE_WINDOW_MINUTES: int = 30
     MESSAGING_MAX_ATTACHMENT_SIZE_BYTES: int = 10485760  # 10 MB
     MESSAGING_ALLOWED_ATTACHMENT_MIME_TYPES: str = (
         "application/pdf,image/jpeg,image/png,image/webp"
