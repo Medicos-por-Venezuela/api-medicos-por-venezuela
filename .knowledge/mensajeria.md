@@ -94,3 +94,38 @@ código (se ofreció 1–2 h de revisión sin costo). Se reportan horas por entr
   Fuera del alcance de las 40 h salvo que lo prioricen.
 - **P7 Correo al paciente** cuando no tiene email (anónimos): solo WhatsApp (Fase 2) o pedir email
   en el registro. Hoy `patients.email` es opcional.
+
+## Lo implementado en Fase 1 (2026-10-05)
+
+- **Backend (API)**:
+  - Migración `20261005_084800_mensajeria_hilos.sql`: campos en `messages`, tabla `message_attachments` cifrada, check constraints y permisos RBAC `messages.read` y `messages.write`.
+  - Modelos y schemas: `Message` y `MessageAttachment` ORM, schemas con `ClinicalAccessMixin` y fail-closed para admin.
+  - Servicio `services/messaging.py`: desacoplamiento de subida en 2 pasos, validación de adjuntos (PDF, JPG, PNG, WEBP), bloqueo estricto de GIF (422), presencia asimétrica en memoria y BD.
+  - Endpoints REST en `routers/messages.py`:
+    - `GET /inbox`: Buzón del médico con conteos y presencia asimétrica.
+    - `GET /inbox/stream`: Stream SSE con eventos `inbox` y actualización de conteos.
+    - `GET /consultations/{id}/messages`: Listado con grants clínicos y paginación.
+    - `POST /consultations/{id}/messages`: Envío de mensajes con soporte de adjuntos y client_msg_id idempotente.
+    - `POST /consultations/{id}/attachments`: Carga de adjuntos y análisis de magic bytes.
+    - `GET /consultations/{id}/attachments/{id}`: Descarga con header `X-Content-Type-Options: nosniff`.
+    - `POST /consultations/{id}/messages/read`: Marcado de lectura idempotente.
+  - Notificaciones en `services/notifications.py`:
+    - Evento `message_received` en `NOTIFICATION_EVENTS`.
+    - Correos al médico ("Tu paciente te escribió") y al paciente ("Tu médico te respondió").
+    - Cero texto clínico ni nombres de adjuntos en los correos.
+    - Anti-ráfaga (debounce) de 15 minutos en memoria y BD, reseteable al marcar leído.
+  - Stream de sala de espera (`routers/consultations.py`):
+    - Emite evento `message` hacia el paciente.
+    - Registra presencia de paciente (`patient_online`) para que el médico la observe en el buzón.
+    - Asimetría estricta: el paciente nunca recibe información de presencia del médico.
+
+- **Frontend (`medicos-por-venezuela`)**:
+  - Cliente API en `lib/messages.ts` con validación estricta que frena GIFs en el cliente sin disparar peticiones.
+  - Componentes reutilizables en `components/mensajes/`: `HiloMensajes`, `AdjuntoMensaje`, `ModalVisorImagen`, `EstadoEntrega`, `IndicadorPresenciaPaciente`.
+  - Integración en:
+    - `pages/panel-medico/consulta/[id].tsx`: Chat médico con presencia de paciente.
+    - `pages/panel-medico/mensajes.tsx`: Buzón unificado del médico con filtros y conteos.
+    - `pages/mi-caso.tsx`: Chat del paciente autenticado sin presencia de médico.
+    - `pages/sala-espera.tsx`: Chat del paciente anónimo con token y sin presencia de médico.
+  - Tests E2E Playwright en `e2e/mensajes-medico.spec.ts`, `mensajes-paciente.spec.ts`, `mensajes-admin.spec.ts`.
+

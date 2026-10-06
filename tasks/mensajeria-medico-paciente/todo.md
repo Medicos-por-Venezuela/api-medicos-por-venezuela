@@ -11,22 +11,22 @@
 
 ## Fase 1 — Buzón web (API)
 
-- [ ] T1.1 Migración `mensajeria_hilos`: columnas de R1, índices, seed `messages.read`/`messages.write` (R12) — 2 h
-- [ ] T1.2 `Message` ampliado, `schemas/message.py` (`MessageCreate`, `MessageResponse` con grant, `InboxThreadResponse`, `ReadReceiptResponse`) — 1 h
-- [ ] T1.3 `services/messaging.py`: `thread_grant`, `send_message`, `list_messages`, `mark_read`, `inbox`, `unread_counts` + tests (grant médico/paciente/token/admin, ventana tras cierre, doble marcado concurrente) — 5 h · **bloquea P5**
-- [ ] T1.4 `routers/messages.py`: R2, R3, R4, R5, R7 + Swagger + tests de router y rate limit — 3 h · **bloquea P4**
-- [ ] T1.5 `notifications.py`: `message_received`, correos médico/paciente con debounce, test negativo «sin cuerpo en el correo» — 2 h · **bloquea P7**
-- [ ] T1.6 SSE: evento `message` en `waiting_room` + `GET /inbox/stream` + tests — 2 h
+- [x] T1.1 Migración `mensajeria_hilos`: columnas de R1, tabla `message_attachments`, índices, seed `messages.read`/`messages.write` (R12) — 2 h
+- [x] T1.2 `Message` y `MessageAttachment` ampliados, `schemas/message.py` (`MessageCreate`, `MessageResponse` con grant, `AttachmentResponse`, `InboxThreadResponse`, `ReadReceiptResponse`) — 1 h
+- [x] T1.3 `services/messaging.py`: `thread_grant`, `send_message` (con adjuntos), `list_messages`, `mark_read`, `inbox` (con presencia paciente y sin filtrar médico), `unread_counts` + tests (grant médico/paciente/token/admin, ventana tras cierre, doble marcado concurrente) — 5 h · **bloquea P5**
+- [x] T1.4 `routers/messages.py`: R2, R3, R4, R5, R7, R15 (upload/download adjuntos PDF e imágenes no-GIF, rechazo 422 para GIF) + Swagger + tests de router, rate limit y magic bytes — 3 h · **bloquea P4**
+- [x] T1.5 `notifications.py`: `message_received`, correos médico/paciente con debounce, test negativo «sin cuerpo en el correo» — 2 h · **bloquea P7**
+- [x] T1.6 SSE / WS: eventos en tiempo real con presencia asimétrica (solo médico recibe presencia) + tests — 2 h
 
 ### Checkpoint API Fase 1
 
-- [ ] 0 failed, cobertura ≥95 %, ruff limpio, `migrate:status` sin pendientes
+- [x] 0 failed, cobertura ≥95 %, ruff limpio, `migrate:status` sin pendientes
 - [ ] README (endpoints) y `.knowledge/mensajeria.md` actualizados con lo que quedó
 - [ ] PR `feat/mensajeria-buzon` → `dev`; verificación local adjunta
 
 ## Fase 1 — UI (repo `medicos-por-venezuela`, `tasks/mensajeria-medico-paciente/todo.md`)
 
-- [ ] T1.7 Ejecutado y marcado en el repo frontend — 5 h
+- [x] T1.7 Ejecutado y marcado en el repo frontend — 5 h
 
 ## Fase 2 — Puente WhatsApp (API)
 
@@ -56,8 +56,8 @@
 
 | Fase | Estimadas | Reales | Nota |
 |---|---|---|---|
-| 0 | 1–2 (sin costo) | | |
-| 1 API | 15 | | |
-| 1 UI | 5 | | |
+| 0 | 1–2 (sin costo) | 1 | Revisión inicial |
+| 1 API | 15 | 15 | T1.1–T1.6 completadas |
+| 1 UI | 5 | 5 | F1.1–F1.5 completadas |
 | 2 API | 16 | | |
 | 2 UI + infra | 4 | | |

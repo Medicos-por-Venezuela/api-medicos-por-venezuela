@@ -119,6 +119,17 @@ class Settings(BaseSettings):
     # Vida máxima de un stream; el cliente reconecta. Acota conexiones colgadas.
     WAITING_ROOM_STREAM_MAX_SECONDS: float = 300.0
 
+    # --- Mensajería médico ↔ paciente ---
+    MESSAGING_AFTER_CLOSE_HOURS: int = 72
+    MESSAGING_MAIL_DEBOUNCE_MINUTES: int = 15
+    MESSAGING_PATIENT_HOURLY_LIMIT: int = 30
+    MESSAGING_MAX_BODY_CHARS: int = 4000
+    MESSAGING_MAX_ATTACHMENT_SIZE_BYTES: int = 10485760  # 10 MB
+    MESSAGING_ALLOWED_ATTACHMENT_MIME_TYPES: str = (
+        "application/pdf,image/jpeg,image/png,image/webp"
+    )
+    STORAGE_BUCKET_ATTACHMENTS: str = "chat-attachments"
+
     # --- Videoconsulta (Jitsi) ---
     # Instancia self-hosted (salas abiertas, sin moderador). NO se usa el público meet.jit.si por
     # defecto porque ahora exige login de moderador ("no moderators have yet arrived"). Override
@@ -285,6 +296,14 @@ class Settings(BaseSettings):
         obvio.
         """
         return [s for r in self.MAIL_INTERNAL_RECIPIENTS.split(",") if (s := r.strip())]
+
+    @property
+    def messaging_allowed_mime_types(self) -> frozenset[str]:
+        return frozenset(
+            m.strip().lower()
+            for m in self.MESSAGING_ALLOWED_ATTACHMENT_MIME_TYPES.split(",")
+            if m.strip()
+        )
 
 
 @lru_cache

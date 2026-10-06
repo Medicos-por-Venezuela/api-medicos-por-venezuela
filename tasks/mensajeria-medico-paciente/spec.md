@@ -37,13 +37,15 @@ en la consulta. El cliente lo describe como «la única cosa que necesito que re
 Fase 1 — buzón web:
 
 1. Como médico, en el detalle de una consulta mía veo el hilo de mensajes y escribo uno nuevo.
-2. Como médico, tengo un buzón con todos mis hilos, ordenado por último mensaje, con no leídos.
+2. Como médico, tengo un buzón con todos mis hilos, ordenado por último mensaje, con no leídos y estado de conexión del paciente («En línea» / «Desconectado»).
 3. Como médico, recibo un correo cuando un paciente me escribe (si no lo desactivé en preferencias)
    y, si tengo el panel abierto, el contador se actualiza sin recargar.
-4. Como paciente con cuenta, en `/mi-caso` leo lo que me escribió el médico y respondo.
-5. Como paciente sin cuenta, recibo un correo con un enlace (si dejé correo) y desde la sala de
+4. Como médico, puedo adjuntar documentos PDF e imágenes clínicas (excepto formato GIF) para compartir con el paciente.
+5. Como paciente con cuenta, en `/mi-caso` leo lo que me escribió el médico y respondo, sin ver el estado de conexión del médico.
+6. Como paciente sin cuenta, recibo un correo con un enlace (si dejé correo) y desde la sala de
    espera, con mi token, leo y respondo.
-6. Como administrador, en el caso veo cuántos mensajes hay y cuándo fue el último, no su contenido.
+7. Como paciente, puedo adjuntar documentos PDF e imágenes (exámenes, fotos clínicas; excepto GIF) en mis mensajes.
+8. Como administrador, en el caso veo cuántos mensajes y adjuntos hay y cuándo fue el último, no su contenido.
 
 Fase 2 — puente WhatsApp:
 
@@ -118,32 +120,38 @@ medicos-por-venezuela/                                → ver tasks/mensajeria-m
 
 Cada requisito nombra quién puede, con qué permiso o pertenencia, y qué devuelve.
 
-### R1 — Un hilo por consulta, en la tabla `messages` ampliada
+### R1 — Un hilo por consulta, en la tabla `messages` ampliada y `message_attachments`
 
 Columnas finales de `messages`: `id`, `consultation_id` (FK CASCADE, hilo), `sender_role`
 (`doctor | patient | system`), `sender_user_id` (FK `users`, nulo para paciente anónimo),
-`direction` (`doctor_to_patient | patient_to_doctor`), `channel` (`web | whatsapp`), `body`
-(cifrado, `EncryptedText`), `sent_at`, `delivered_at`, `read_at`, `delivery_status`
+`direction` (`doctor_to_patient | patient_to_doctor`), `channel` (`web | whatsapp`), `kind` (`text | attachment`), `body`
+(cifrado, `EncryptedText`, opcional si hay adjunto), `sent_at`, `delivered_at`, `read_at`, `delivery_status`
 (`sent | delivered | read | failed`), `wa_message_id` (texto, único cuando no es nulo),
 `error_code` (texto, nulo). Índices: `(consultation_id, sent_at, id)` y `(wa_message_id)` único parcial.
+
+Tabla `message_attachments` (nueva): `id` (uuid PK), `message_id` (uuid FK messages ON DELETE CASCADE),
+`consultation_id` (uuid FK consultations), `uploader_role` (`doctor | patient`), `uploader_user_id` (uuid FK users, nulo),
+`file_name` (`EncryptedText`), `mime_type` (`application/pdf`, `image/jpeg`, `image/png`, `image/webp`; **`image/gif` estrictamente prohibido**),
+`file_size_bytes` (máx. 10 MB), `storage_path` (bucket privado `chat-attachments`), `created_at`.
 
 - CA1.1 La migración es idempotente y transaccional; conserva las filas existentes (hoy ninguna).
 - CA1.2 RLS sigue deny-all; el CHECK de ciphertext sigue vigente.
 - CA1.3 El hilo vigente de un paciente derivado es el de la consulta hija
   (`waiting_room.current_in_chain`); el histórico se lee hacia abajo por la cadena.
 
-### R2 — El médico escribe
+### R2 — El médico escribe y adjunta archivos
 
-`POST /consultations/{id}/messages` con `{ "body": str }`, permiso `messages.write`.
+`POST /consultations/{id}/messages` con `{ "body"?: str, "attachment_ids"?: list[uuid] }`, permiso `messages.write`.
 
 - CA2.1 Solo el médico tratante (`assigned_doctor_id`) o quien lo fue en la cadena de esa
   consulta; otro médico recibe 404 (no 403, para no revelar existencia).
 - CA2.2 La consulta debe estar en `in_progress`, `scheduled`, `referred_to_specialist` o cerrada
   hace menos de `MESSAGING_AFTER_CLOSE_HOURS` (72 por defecto, ver P5); si no, 409.
-- CA2.3 `body` de 1 a 2000 caracteres, sin etiquetas HTML (validador Pydantic), `extra="forbid"`.
-- CA2.4 Responde 201 con `MessageResponse` (cuerpo visible para el autor). Registra
+- CA2.3 `body` de 0 a 2000 caracteres, sin etiquetas HTML (validador Pydantic), `extra="forbid"`. Requiere `body` o `attachment_ids`.
+- CA2.4 Permite adjuntar archivos en PDF o imágenes rasterizadas (JPG, PNG, WEBP) previamente subidos en `POST /consultations/{id}/attachments` (R15). Formato GIF estrictamente rechazado.
+- CA2.5 Responde 201 con `MessageResponse` (cuerpo y adjuntos visibles para el autor). Registra
   `audit_log` `message.sent` sin contenido.
-- CA2.5 Dispara el aviso al paciente (R6) y, en Fase 2, el envío por WhatsApp (R10).
+- CA2.6 Dispara el aviso al paciente (R6) y, en Fase 2, el envío por WhatsApp (R10).
 
 ### R3 — Leer el hilo
 
@@ -151,21 +159,23 @@ Columnas finales de `messages`: `id`, `consultation_id` (FK CASCADE, hilo), `sen
 
 - CA3.1 Grant: médico tratante actual o previo en la cadena (`messages.read` + pertenencia),
   paciente dueño (sesión con `owns_patient` o `X-Consultation-Token` válido de esa consulta).
-- CA3.2 Sin grant, el cuerpo sale `null` (fail-closed) y la respuesta no falla; el admin con
-  `consultations.read` recibe metadatos y cuerpos `null`.
+- CA3.2 Sin grant, el cuerpo y nombres de archivos salen `null` (fail-closed) y la respuesta no falla; el admin con
+  `consultations.read` recibe metadatos, conteos y cuerpos/adjuntos `null`.
 - CA3.3 Toda lectura concedida se audita con `READ_CLINICAL_DATA` (vía `messages`, una entrada por
   página, no por mensaje).
 - CA3.4 Incluye `unread_count` para el llamante (mensajes de la otra dirección sin `read_at`).
 
-### R4 — El paciente escribe
+### R4 — El paciente escribe y adjunta archivos
 
 Mismo endpoint que R2, sin permiso de staff: pertenencia (sesión) o token de consulta.
 
 - CA4.1 `sender_role = patient`, `sender_user_id` nulo si es anónimo.
-- CA4.2 Rate limit `PUBLIC_WRITE_RATE_LIMIT` por IP y, además, máximo 30 mensajes por hilo y hora.
-- CA4.3 Ventana: consulta abierta o cerrada hace menos de `MESSAGING_AFTER_CLOSE_HOURS`; si no, 409
+- CA4.2 El paciente puede enviar texto y/o adjuntos (PDF e imágenes JPG/PNG/WEBP, GIF prohibido).
+- CA4.3 El paciente **no** puede ver si el médico (profesional) está en línea. La interfaz y las respuestas hacia el paciente no revelan presencia del médico.
+- CA4.4 Rate limit `PUBLIC_WRITE_RATE_LIMIT` por IP y, además, máximo 30 mensajes por hilo y hora.
+- CA4.5 Ventana: consulta abierta o cerrada hace menos de `MESSAGING_AFTER_CLOSE_HOURS`; si no, 409
   con mensaje «Esta consulta ya no admite mensajes».
-- CA4.4 Dispara el aviso al médico (R6).
+- CA4.6 Dispara el aviso al médico (R6).
 
 ### R5 — Marcar leído
 
@@ -185,14 +195,15 @@ Mismo endpoint que R2, sin permiso de staff: pertenencia (sesión) o token de co
   anterior salió hace menos de `MESSAGING_MAIL_DEBOUNCE_MINUTES` (15) y sigue sin leer.
 - CA6.4 Todo por `mail.best_effort` + `BackgroundTasks`; un fallo nunca rompe el envío del mensaje.
 
-### R7 — Buzón del médico
+### R7 — Buzón del médico y presencia asimétrica
 
 `GET /inbox?limit=&offset=&only_unread=` permiso `messages.read`.
 
 - CA7.1 Un elemento por consulta con mensajes donde el llamante es o fue tratante: `consultation_id`,
   `code`, especialidad, nombre visible del paciente (el mismo que ya ve en el panel), `status`,
-  `last_message_at`, `last_direction`, `unread_count`. Sin cuerpos.
-- CA7.2 Orden `last_message_at desc, consultation_id`. Paginado (máx. 100).
+  `last_message_at`, `last_direction`, `unread_count`, `patient_online` (bool) y `patient_last_seen_at`. Sin cuerpos.
+- CA7.2 **Asimetría de presencia**: Solo el médico profesional puede ver si el paciente está en línea (`patient_online`). El paciente **nunca** puede ver si el médico está en línea ni su última hora de conexión.
+- CA7.3 Orden `last_message_at desc, consultation_id`. Paginado (máx. 100).
 
 ### R8 — Tiempo real
 
@@ -259,9 +270,19 @@ idempotente; secretos solo por `Settings`.
 `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_PHONE_NUMBER_ID`,
 `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_TEMPLATE_DOCTOR_REPLIED` (`medico_respondio`),
 `WHATSAPP_TEMPLATE_LANGUAGE` (`es`), `MESSAGING_AFTER_CLOSE_HOURS` (72),
-`MESSAGING_MAIL_DEBOUNCE_MINUTES` (15), `MESSAGING_PATIENT_HOURLY_LIMIT` (30). Todas en
+`MESSAGING_MAIL_DEBOUNCE_MINUTES` (15), `MESSAGING_PATIENT_HOURLY_LIMIT` (30),
+`MESSAGING_MAX_ATTACHMENT_SIZE_BYTES` (10485760 — 10 MB),
+`MESSAGING_ALLOWED_ATTACHMENT_MIME_TYPES` (`application/pdf,image/jpeg,image/png,image/webp`),
+`STORAGE_BUCKET_ATTACHMENTS` (`chat-attachments`). Todas en
 `.env.example` con comentario; en producción el arranque falla si `WHATSAPP_ACCESS_TOKEN` está y
 falta `WHATSAPP_APP_SECRET`.
+
+### R15 — Subida y descarga de archivos adjuntos (PDF e imágenes, GIF prohibido)
+
+- CA15.1 Formatos permitidos para médico y paciente: Documentos PDF (`application/pdf`, `.pdf`) e imágenes rasterizadas (`image/jpeg`, `.jpg`/`.jpeg`, `image/png`, `.png`, `image/webp`, `.webp`).
+- CA15.2 Prohibición estricta de GIF: `image/gif` y extensión `.gif` son rechazados con HTTP 422 en la API y bloqueados en el input de cliente.
+- CA15.3 `POST /consultations/{id}/attachments`: recibe archivo multipart de médico tratante o paciente dueño. Valida magic bytes, extensión y tamaño (máx. 10 MB). Guarda en bucket privado (`chat-attachments`) y registra fila en `message_attachments` con nombre cifrado (`EncryptedText`).
+- CA15.4 `GET /consultations/{id}/attachments/{id}`: descarga y visualización segura con cabecera `X-Content-Type-Options: nosniff`. Exige pertenencia a la consulta (`clinical_access`) y registra `READ_CLINICAL_DATA`. Sin grant: 404 (médico ajeno) o 401.
 
 ## Requisitos no funcionales
 
@@ -273,7 +294,8 @@ falta `WHATSAPP_APP_SECRET`.
 
 ## Fuera de alcance (esta iteración)
 
-- Chat en tiempo real con «escribiendo…», adjuntos, imágenes o audios.
+- Audios de voz, notas de voz o edición/borrado de mensajes (los adjuntos PDF e imágenes no-GIF sí forman parte del alcance de la mensajería).
+- Formato GIF (`image/gif`): estrictamente prohibido y bloqueado con HTTP 422 tanto para médicos como para pacientes.
 - Push real (Web Push / FCM): `lib/firebase.ts` del frontend está sin conectar y no forma parte
   de este encargo; el canal `push` de `message_received` se añade cuando exista.
 - Cita presencial como tipo de agenda (P6).

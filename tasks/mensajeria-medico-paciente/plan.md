@@ -54,6 +54,11 @@ consentimiento → webhook → enrutado → ventana/plantilla → UI → puesta 
 `lib/firebase.ts`. Si una tarea descubre que hace falta tocarlos, se vuelve a esta spec antes de
 generar.
 
+**D11. Adjuntos clínicos con acceso protegido y presencia asimétrica.** Subida y descarga de archivos
+(PDF e imágenes JPG/PNG/WEBP; GIF estrictamente bloqueado con 422) tanto para médico como para paciente,
+almacenados en bucket privado (`chat-attachments`) y servidos con grant clínico y auditoría (`READ_CLINICAL_DATA`).
+El paciente **no** puede ver el estado en línea del médico; solo el médico tratante visualiza si el paciente está en línea.
+
 ## Fases y estimación
 
 ### Fase 0 — Revisión y acuerdo (1–2 h, ofrecidas sin costo)
@@ -65,13 +70,13 @@ P1–P7 respondidas o marcadas como bloqueantes; horas por fase confirmadas al c
 
 | Tarea | Horas | Repo |
 |---|---|---|
-| 1.1 Migración `mensajeria_hilos` (columnas, índices, permisos) | 2 | API |
-| 1.2 `Message` ampliado + `schemas/message.py` | 1 | API |
-| 1.3 `services/messaging.py`: grants, enviar, listar, marcar leído, buzón, contadores + tests | 5 | API |
-| 1.4 `routers/messages.py` (R2–R5, R7) + tests de router y concurrencia | 3 | API |
+| 1.1 Migración `mensajeria_hilos` (columnas `messages`, tabla `message_attachments`, índices, permisos) | 2 | API |
+| 1.2 `Message` y `MessageAttachment` ampliados + `schemas/message.py` | 1 | API |
+| 1.3 `services/messaging.py`: grants, enviar, listar, marcar leído, buzón, contadores, adjuntos y presencia asimétrica + tests | 5 | API |
+| 1.4 `routers/messages.py` (R2–R5, R7, R15: upload/download adjuntos) + tests de router y concurrencia | 3 | API |
 | 1.5 Avisos: `message_received`, correos médico/paciente con debounce + tests | 2 | API |
 | 1.6 SSE: evento `message` en la sala + `/inbox/stream` + tests | 2 | API |
-| 1.7 UI: `lib/messages.ts`, bloque en el detalle, buzón, `/mi-caso`, sala de espera, preferencia | 5 | Front |
+| 1.7 UI: `lib/messages.ts`, bloque en el detalle, buzón con presencia del paciente, `/mi-caso` (sin presencia del médico), subida PDF/imágenes, sala de espera | 5 | Front |
 | **Total** | **20** | |
 
 Entregable verificable: el médico escribe en el detalle, el paciente lo ve en `/mi-caso` o en la
