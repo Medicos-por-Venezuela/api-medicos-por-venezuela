@@ -388,6 +388,12 @@ async def test_patient_register_requires_token_when_required_and_has_email(
 
 
 # --- 7. 503 si Mailtrap sin token / caído --------------------------------------
+#
+# ⚠️ Los dos fijan `EMAIL_VERIFICATION_DEBUG_CODE = False` y no lo heredan del `.env`: con el flag
+# encendido el endpoint NO devuelve 503, sino 200 con `debug_code` (es justo lo que ese modo
+# existe para hacer, ver sección 8). Sin fijarlo, un `.env` de desarrollo con el flag en `true`
+# —el de quien esté grabando una demo del registro, por ejemplo— tumba estos tests sin que el
+# código tenga nada que ver. Cada test monta el entorno que necesita para lo que afirma.
 
 
 async def test_send_returns_503_when_mail_disabled(
@@ -396,7 +402,9 @@ async def test_send_returns_503_when_mail_disabled(
     """Si Mailtrap no está configurado (sin token), el endpoint devuelve 503."""
     # Asegura que no hay token
     original_token = settings.MAILTRAP_API_TOKEN
+    original_debug = settings.EMAIL_VERIFICATION_DEBUG_CODE
     settings.MAILTRAP_API_TOKEN = ""
+    settings.EMAIL_VERIFICATION_DEBUG_CODE = False
     try:
         resp = await anon_client.post(
             f"{PREFIX}/email-verification/send",
@@ -406,6 +414,7 @@ async def test_send_returns_503_when_mail_disabled(
         assert "no disponible" in resp.json()["detail"].lower()
     finally:
         settings.MAILTRAP_API_TOKEN = original_token
+        settings.EMAIL_VERIFICATION_DEBUG_CODE = original_debug
 
 
 async def test_send_returns_503_when_mailtrap_fails(
@@ -413,7 +422,9 @@ async def test_send_returns_503_when_mailtrap_fails(
 ) -> None:
     """Si Mailtrap falla (excepción), el endpoint devuelve 503."""
     original_token = settings.MAILTRAP_API_TOKEN
+    original_debug = settings.EMAIL_VERIFICATION_DEBUG_CODE
     settings.MAILTRAP_API_TOKEN = "fake-token"
+    settings.EMAIL_VERIFICATION_DEBUG_CODE = False
     try:
         with patch(
             "src.services.registration_mail.send_mail",
@@ -426,6 +437,7 @@ async def test_send_returns_503_when_mailtrap_fails(
             assert resp.status_code == 503
     finally:
         settings.MAILTRAP_API_TOKEN = original_token
+        settings.EMAIL_VERIFICATION_DEBUG_CODE = original_debug
 
 
 # --- 8. debug_code solo en dev/e2e ---------------------------------------------
