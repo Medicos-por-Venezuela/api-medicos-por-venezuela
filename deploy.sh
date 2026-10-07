@@ -8,7 +8,7 @@
 # Orden pensado para expand/contract SIN downtime:
 #   1) git pull   2) build imagen nueva   3) migrar desde un contenedor efímero
 #   (la app VIEJA sigue sirviendo; tras un rename, la vista de compat la cubre)
-#   4) swap de la app a la imagen nueva   5) health check
+#   4) swap de la app a la imagen nueva   5) health check   6) limpieza de imágenes
 #
 # Notas del entorno: docker sin sudo (usuario en grupo docker); se usa `docker build`
 # y no `docker compose --build` porque el buildx del host es < 0.17.
@@ -43,7 +43,7 @@ cd "$(dirname "$0")"
 
 # --- Pre-check: variables que la app exige para arrancar ---
 # Sin estas, uvicorn levanta y se muere en el lifespan (src/main.py las valida), así que el
-# deploy fallaría recién en el health check del paso 5/5 — después de construir la imagen y de
+# deploy fallaría recién en el health check del paso 5/6 — después de construir la imagen y de
 # aplicar migraciones a producción. Mejor caerse aquí, antes de tocar nada.
 # `grep -q` sobre el archivo y no `source`: no se cargan los secretos en este shell ni se
 # imprimen nunca (ver .claude/rules/security.md).
@@ -69,19 +69,19 @@ if [ "$ASSUME_YES" -ne 1 ]; then
   [ "$ok" = "y" ] || [ "$ok" = "Y" ] || { echo "Abortado. Hacé el backup y reintentá."; exit 1; }
 fi
 
-echo "==> 1/5 git pull ($BRANCH)"
+echo "==> 1/6 git pull ($BRANCH)"
 git pull origin "$BRANCH"
 
-echo "==> 2/5 build de la imagen"
+echo "==> 2/6 build de la imagen"
 docker build -t "$IMAGE" .
 
-echo "==> 3/5 migraciones (contenedor efímero desde la imagen nueva)"
+echo "==> 3/6 migraciones (contenedor efímero desde la imagen nueva)"
 docker compose -f "$COMPOSE" run --rm api python artisan migrate
 
-echo "==> 4/5 swap de la app a la imagen nueva"
+echo "==> 4/6 swap de la app a la imagen nueva"
 docker compose -f "$COMPOSE" up -d
 
-echo "==> 5/5 health check"
+echo "==> 5/6 health check"
 for i in $(seq 1 15); do
   code="$(curl -s -o /dev/null -w '%{http_code}' "$HEALTH_URL" || true)"
   [ "$code" = "200" ] && break
@@ -105,3 +105,19 @@ else
   echo "   Logs: docker compose -f $COMPOSE logs --tail=50 api" >&2
   exit 1
 fi
+
+# --- Limpieza de imágenes viejas ---
+# Cada build deja la imagen anterior sin etiqueta. A ~260MB por deploy, el disco de 8GB
+# de la instancia se llena en unos 15 deploys: el 2026-10-07 llegó al 94% con 37 imágenes
+# acumuladas y dejó de aceptar conexiones SSH.
+#
+# Solo corre si el health dio 200: si el deploy falló, la imagen anterior es con la que se
+# vuelve atrás y no hay que tocarla.
+#
+# El filtro 'until' conserva las imágenes de los últimos 7 días, que son las candidatas
+# reales a un rollback. Un prune sin filtro borraría también la del deploy anterior y
+# dejaría sin forma rápida de volver.
+echo "==> 6/6 limpieza de imágenes viejas (conserva las de los últimos 7 días)"
+docker image prune -f --filter "until=168h" | tail -n 1
+docker builder prune -f --filter "unused-for=168h" >/dev/null 2>&1 || true
+echo "   disco: $(df -h / | awk 'NR==2 {print $3" usado de "$2" ("$5"), "$4" libres"}')"
