@@ -73,9 +73,20 @@ jobs:
 
       - name: Desplegar
         id: desplegar
+        # La rama entra por `env:` y no interpolada en el script: un `${{ }}` dentro de
+        # un `run` se pega en el shell ANTES de ejecutarlo, así que un nombre de rama
+        # con comillas y punto y coma ejecutaría lo que quisiera en el runner. Por
+        # `env:` llega como variable y el shell nunca la reinterpreta.
+        env:
+          RAMA: ${{ inputs.rama }}
         run: |
           set -euo pipefail
-          RAMA="${{ inputs.rama }}"
+          # Solo lo que puede ser un nombre de rama. El valor termina dentro de un
+          # comando que corre en el servidor de producción; no es sitio para confiar.
+          case "$RAMA" in
+            *[!A-Za-z0-9._/-]*|''|-*|*..*)
+              echo "::error::Nombre de rama no permitido: $RAMA"; exit 1 ;;
+          esac
           echo "Desplegando rama: $RAMA"
           ID=$(aws ssm send-command \
             --instance-ids i-07eb07fd0c2fac30e \
@@ -124,14 +135,19 @@ jobs:
 
       - name: Resumen
         if: always()
+        env:
+          RAMA: ${{ inputs.rama }}
+          RESPALDO: ${{ inputs.respaldo_previo }}
+          RESULTADO: ${{ job.status }}
+          ACTOR: ${{ github.actor }}
         run: |
           {
             echo "### Despliegue del backend"
             echo ""
             echo "| Dato | Valor |"
             echo "|---|---|"
-            echo "| Rama | \`${{ inputs.rama }}\` |"
-            echo "| Lanzado por | @${{ github.actor }} |"
-            echo "| Respaldo previo | ${{ inputs.respaldo_previo }} |"
-            echo "| Resultado | ${{ job.status }} |"
+            echo "| Rama | \`$RAMA\` |"
+            echo "| Lanzado por | @$ACTOR |"
+            echo "| Respaldo previo | $RESPALDO |"
+            echo "| Resultado | $RESULTADO |"
           } >> "$GITHUB_STEP_SUMMARY"
