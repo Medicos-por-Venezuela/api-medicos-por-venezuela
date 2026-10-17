@@ -795,16 +795,30 @@ async def test_messaging_email_dispatch_and_debounce(
     assert len(sent_mails) == 2
     assert sent_mails[1]["subject"] == "Tu paciente te escribió"
 
-    # 5. Médico responde al paciente -> Correo enviado al paciente
+    # 5. Médico responde al paciente -> el aviso se DIFIERE: el paciente acaba de escribir, así
+    #    que está en línea y el mensaje le aparece por SSE (tasks/avisos-chat-presencia, CA3.1).
     resp4 = await anon_client.post(
         f"{PREFIX}/consultations/{cid}/messages",
         headers=auth_headers(doc.id),
         json={"body": "Con gusto, tómese el medicamento."},
     )
     assert resp4.status_code == 201
+    assert len(sent_mails) == 2  # no sale todavía
+    consulta = await db_session.get(Consultation, uuid.UUID(cid))
+    assert consulta is not None
+    assert consulta.patient_notice_pending_at is not None
+
+    # 6. El paciente no lo lee: pasada la espera, el barrido sí manda el correo, con el NOMBRE
+    #    del médico en el asunto (CA1.1) y sin una palabra del cuerpo (CA1.3).
+    consulta.patient_notice_pending_at = datetime.now(UTC) - timedelta(
+        seconds=settings.MESSAGING_MAIL_ONLINE_DELAY_SECONDS + 1
+    )
+    await db_session.flush()
+    assert await notifications.send_pending_message_notices(db_session) == 1
     assert len(sent_mails) == 3
     assert sent_mails[2]["to"] == "paciente@example.com"
-    assert sent_mails[2]["subject"] == "Tu médico te respondió"
+    assert sent_mails[2]["subject"].endswith("te respondió")
+    assert doc.full_name in sent_mails[2]["subject"]
     assert "tómese el medicamento" not in sent_mails[2]["text"]  # Cero texto clínico
 
 
