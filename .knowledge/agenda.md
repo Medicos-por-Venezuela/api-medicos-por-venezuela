@@ -112,3 +112,25 @@ Ejemplo (crontab en la EC2, cada 5 min):
 Alternativa: GitHub Actions `schedule` (cron) con el token en secrets. La ventana por defecto (30
 min) tolera un cron de hasta ~5 min sin perder recordatorios. Sin `MAILTRAP_API_TOKEN` el envío es
 no-op (solo loguea), útil en local/staging.
+
+### El MISMO cron tiene que llamar también al barrido del chat
+
+Desde `tasks/avisos-chat-presencia/` hay un segundo endpoint con el mismo patrón y el mismo
+permiso. Manda los avisos de «mensaje nuevo» que se aplazaron porque el paciente estaba EN LÍNEA
+(lo vio por SSE) y que, pasados `MESSAGING_MAIL_ONLINE_DELAY_SECONDS` (90 s por defecto), siguen
+sin leerse:
+
+```cron
+*/1 * * * * curl -fsS -X POST \
+  -H "Authorization: Bearer $MPV_CRON_TOKEN" \
+  "https://api.medicosporvenezuela.org/api/v1/consultations/messages/send-pending-notices" \
+  >/dev/null 2>&1
+```
+
+**Cada minuto, no cada cinco:** aquí la espera son 90 s, no 30 min, y un cron de 5 min convertiría
+«te escribo y te avisamos en minuto y medio si no lo ves» en «te avisamos cuando toque».
+
+**Si no se configura**, lo que se pierde es el correo de un paciente que estaba mirando la pantalla
+donde el mensaje ya apareció: un aviso redundante. No se pierde ningún aviso de un paciente
+desconectado — ésos salen en el acto, sin pasar por aquí. Cada diferido deja un `MAIL:deferred` en
+los logs, así que el silencio es medible.

@@ -41,46 +41,19 @@ from src.models.specialty import Specialty
 from src.schemas.clinical import ClinicalGrant, summary_grant, treating_grant
 from src.schemas.message import InboxThreadResponse, MessageCreate
 from src.services import consultations as consultations_service
-from src.services import notifications, storage
+from src.services import notifications, presence, storage
 from src.services.audit import log_action
 from src.services.clinical_access import audit_clinical_read, practices_medicine
 
 logger = logging.getLogger("mpv.messaging")
 
-# Presencia del paciente EN MEMORIA DE PROCESO. Correcto para el despliegue actual (un solo
-# uvicorn, ver `.claude/rules/commands.md`): con varias réplicas cada una vería solo a los
-# pacientes que le tocaron, así que el buzón diría "Desconectado" de alguien que está escribiendo
-# contra otra réplica. El respaldo persistente es `consultations.patient_last_seen_at`, que sí es
-# compartido; compartir además el registro en vivo (Redis) es v2 y está fuera de alcance.
-_ACTIVE_PATIENTS: dict[uuid.UUID, datetime] = {}
-
-
-def record_patient_presence(consultation_id: uuid.UUID) -> None:
-    """Registra actividad reciente del paciente para esta consulta."""
-    _ACTIVE_PATIENTS[consultation_id] = datetime.now(UTC)
-
-
-def is_patient_online(consultation_id: uuid.UUID, last_seen_at: datetime | None = None) -> bool:
-    """Indica si el paciente está en línea.
-
-    Umbral: `MESSAGING_PATIENT_PRESENCE_TTL_SECONDS` desde la última señal, sea del registro
-    en memoria o de `consultations.patient_last_seen_at`.
-    """
-    now = datetime.now(UTC)
-    ttl = settings.MESSAGING_PATIENT_PRESENCE_TTL_SECONDS
-    active_ts = _ACTIVE_PATIENTS.get(consultation_id)
-    if active_ts:
-        if (now - active_ts).total_seconds() <= ttl:
-            return True
-        _ACTIVE_PATIENTS.pop(consultation_id, None)
-
-    if last_seen_at:
-        if last_seen_at.tzinfo is None:
-            last_seen_at = last_seen_at.replace(tzinfo=UTC)
-        if (now - last_seen_at).total_seconds() <= ttl:
-            return True
-
-    return False
+# La presencia del paciente se mudó a `services/presence.py`: la consultan los dos lados del
+# aviso (este módulo la registra, `notifications` la lee para diferir el correo) y tenerla aquí
+# cerraba un ciclo de imports. Se reexporta para los llamantes que ya la buscan en `messaging`,
+# que es donde vive el resto del dominio del chat.
+_ACTIVE_PATIENTS = presence._ACTIVE_PATIENTS
+is_patient_online = presence.is_patient_online
+record_patient_presence = presence.record_patient_presence
 
 
 # Qué `event_type` significa «fui el médico tratante de este caso» — y por qué solo ese.
@@ -304,8 +277,7 @@ async def upload_attachment(
         uploader_role = "patient"
         uploader_user_id = principal.id if (principal and not principal.is_staff) else None
         grant = summary_grant("patient_owner")
-        record_patient_presence(consultation.id)
-        consultation.patient_last_seen_at = datetime.now(UTC)
+        presence.touch_patient_presence(consultation)
 
     check_can_write_in_consultation(consultation, is_doctor=(uploader_role == "doctor"))
 
@@ -377,7 +349,7 @@ async def get_attachment_for_download(
             raise NotFoundError("Consulta no encontrada.")
     elif await is_patient_owner(session, consultation, principal, consultation_token_str):
         grant = summary_grant("patient_owner")
-        record_patient_presence(consultation.id)
+        presence.touch_patient_presence(consultation)
     else:
         raise NotFoundError("Consulta no encontrada.")
 
@@ -443,8 +415,7 @@ async def send_message(
         direction = "patient_to_doctor"
         sender_user_id = principal.id if (principal and not principal.is_staff) else None
         grant = summary_grant("patient_owner")
-        record_patient_presence(consultation.id)
-        consultation.patient_last_seen_at = datetime.now(UTC)
+        presence.touch_patient_presence(consultation)
 
     check_can_write_in_consultation(consultation, is_doctor=is_doctor)
 
@@ -735,7 +706,7 @@ async def list_messages(
             raise NotFoundError("Consulta no encontrada.")
     elif await is_patient_owner(session, consultation, principal, consultation_token_str):
         grant = summary_grant("patient_owner")
-        record_patient_presence(consultation.id)
+        presence.touch_patient_presence(consultation)
     else:
         raise NotFoundError("Consulta no encontrada.")
 
@@ -828,7 +799,7 @@ async def mark_as_read(
             raise NotFoundError("Consulta no encontrada.")
     elif await is_patient_owner(session, consultation, principal, consultation_token_str):
         opposing_direction = "doctor_to_patient"
-        record_patient_presence(consultation.id)
+        presence.touch_patient_presence(consultation)
     else:
         raise NotFoundError("Consulta no encontrada.")
 
@@ -843,10 +814,12 @@ async def mark_as_read(
     )
     result = await session.execute(stmt)
     marked = result.rowcount
-    await session.commit()
 
-    reader_role = "doctor" if is_doctor else "patient"
-    notifications.clear_mail_debounce(consultation.id, reader_role)
+    # El freno de los avisos se levanta DENTRO de esta transacción, no después del commit: un
+    # mensaje nuevo tras una lectura es información nueva y merece su correo. Si el paciente es
+    # quien lee, además cancela el aviso diferido — ya vio el mensaje, el correo sobra.
+    notifications.clear_notice_state(consultation, "doctor" if is_doctor else "patient")
+    await session.commit()
 
     return marked
 

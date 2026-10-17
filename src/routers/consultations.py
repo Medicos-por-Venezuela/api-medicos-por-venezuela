@@ -63,6 +63,7 @@ from src.schemas.consultation import (
     DeriveRequest,
     PanelConsultationItem,
     PanelWaitingItem,
+    PendingNoticesRunResponse,
     QueueGroupResponse,
     ReferToQueueRequest,
     ReminderRunResponse,
@@ -78,6 +79,7 @@ from src.services import (
     clinical_access,
     messaging,
     notifications,
+    presence,
     queue_access,
     registration_mail,
     waiting_room,
@@ -193,14 +195,20 @@ async def _queue_appointment_email(
 async def _queue_new_patient_alert(
     background_tasks: BackgroundTasks, db: AsyncSession, consultation: Consultation
 ) -> None:
-    """Encola el aviso a operación de que entró un paciente a la cola.
+    """Encola los dos correos del alta: el aviso a operación (A) y la confirmación al paciente (F).
 
     Los args se resuelven AQUÍ, con la sesión todavía viva: el BackgroundTask corre tras cerrar
-    la request y allí ya no se puede consultar la base. `None` = este caso no se avisa (de
-    consultorio, agendado, o sin buzones configurados); no es un fallo."""
+    la request y allí ya no se puede consultar la base. `None` = ese correo no se manda (de
+    consultorio, agendado, sin buzones configurados o sin correo del paciente); no es un fallo."""
     args = await registration_mail.new_patient_mail_args(db, consultation)
     if args:
         background_tasks.add_task(registration_mail.send_new_patient_alert, **args)
+    # Y la confirmación al PACIENTE (correo F): mismo evento, otra dirección. Sus exclusiones no
+    # son las mismas que las de A —A se calla sin buzones de operación, F se calla sin correo del
+    # paciente— así que cada uno resuelve las suyas y los dos pueden salir, o solo uno, o ninguno.
+    welcome = await registration_mail.new_patient_welcome_mail_args(db, consultation)
+    if welcome:
+        background_tasks.add_task(registration_mail.send_new_patient_welcome, **welcome)
 
 
 async def _queue_derivation_email(
@@ -508,6 +516,31 @@ async def send_due_reminders(
     cada 1–5 min. Ver .knowledge/agenda.md."""
     sent = await notifications.send_due_reminders(db, window_minutes)
     return ReminderRunResponse(sent=sent, window_minutes=window_minutes)
+
+
+@router.post(
+    "/messages/send-pending-notices",
+    response_model=PendingNoticesRunResponse,
+    summary="Enviar los avisos de chat diferidos que siguen sin leerse (cron externo)",
+    responses={403: {"description": "Falta el permiso queue.manage."}},
+)
+async def send_pending_message_notices(
+    db: AsyncSession = Depends(get_db),
+    _: Principal = Depends(require_permission("queue.manage")),
+) -> PendingNoticesRunResponse:
+    """Manda por correo los avisos de mensaje nuevo que se aplazaron porque el paciente estaba
+    EN LÍNEA y que, pasados `MESSAGING_MAIL_ONLINE_DELAY_SECONDS`, siguen sin leerse.
+
+    Lo llama el **mismo CRON externo** que `/agenda/send-due-reminders`, cada 1–5 min. Si no se
+    configura, los pacientes que estaban conectados no reciben el correo: lo vieron por SSE, así
+    que se pierde un aviso redundante, pero queda un `MAIL:deferred` por cada uno en los logs.
+
+    Idempotente y de un solo intento: el pendiente se limpia antes de enviar, así que dos
+    pasadas solapadas no mandan dos correos y un fallo de Mailtrap no se reintenta."""
+    sent = await notifications.send_pending_message_notices(db)
+    return PendingNoticesRunResponse(
+        sent=sent, delay_seconds=settings.MESSAGING_MAIL_ONLINE_DELAY_SECONDS
+    )
 
 
 @router.get(
@@ -1027,7 +1060,12 @@ async def waiting_room_stream(
     async with session_factory() as db:
         principal = await get_current_principal(credentials, db) if credentials else None
         await authorize_consultation_access(db, consultation_id, x_consultation_token, principal)
-        await waiting_room.current_in_chain(db, consultation_id)  # 404 antes de abrir el stream
+        # 404 antes de abrir el stream, y de paso el caso VIGENTE de la cadena: la presencia se
+        # anota contra él y no contra el id que pidió el paciente. Si lo derivaron, el médico que
+        # necesita saber que está esperando es el especialista de la consulta hija — con
+        # `consultation_id` su buzón lo veía "Desconectado" teniéndolo delante de la pantalla.
+        vigente = await waiting_room.current_in_chain(db, consultation_id)
+        presence_id = vigente.id
 
     async def fetch() -> WaitingRoomResponse:
         async with session_factory() as session:
@@ -1037,6 +1075,10 @@ async def waiting_room_stream(
         async with session_factory() as session:
             return await messaging.get_latest_patient_message_signal(session, consultation_id)
 
+    async def touch_presence() -> None:
+        async with session_factory() as session:
+            await presence.persist_patient_presence(session, presence_id)
+
     events = waiting_room.sse_events(
         fetch,
         requested_id=consultation_id,
@@ -1044,6 +1086,7 @@ async def waiting_room_stream(
         heartbeat_seconds=settings.WAITING_ROOM_HEARTBEAT_SECONDS,
         max_seconds=settings.WAITING_ROOM_STREAM_MAX_SECONDS,
         fetch_latest_message=fetch_latest_message,
+        touch_presence=touch_presence,
     )
     return StreamingResponse(
         events,
