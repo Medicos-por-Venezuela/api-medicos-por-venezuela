@@ -162,6 +162,18 @@ class Settings(BaseSettings):
     # del médico (CA7.1). El registro es EN MEMORIA DE PROCESO: válido para el despliegue
     # actual de un solo uvicorn; con varias réplicas cada una vería su propia mitad.
     MESSAGING_PATIENT_PRESENCE_TTL_SECONDS: int = 45
+    # Cada cuánto, como MÁXIMO, una señal de presencia se persiste en
+    # `consultations.patient_last_seen_at`. El registro en memoria se escribe siempre; esto
+    # throttlea solo la columna. Sin el throttle, el SSE de la sala escribiría la fila cada
+    # `WAITING_ROOM_POLL_SECONDS` (4 s) por paciente esperando — cien pacientes serían
+    # 25 UPDATE/s sobre una tabla con CDC hacia el Board. Con el TTL de "en línea" en 45 s,
+    # 30 s de granularidad no cambia ningún veredicto.
+    MESSAGING_PRESENCE_PERSIST_SECONDS: int = 30
+    # Cuánto se espera antes de mandarle por correo a un paciente que estaba EN LÍNEA cuando su
+    # médico escribió (CA3.3). El mensaje ya le apareció por SSE en ≤4 s; si lo lee dentro de
+    # esta ventana el correo no sale nunca. Lo manda el barrido
+    # `send_pending_message_notices`, que el cron externo llama junto a los recordatorios.
+    MESSAGING_MAIL_ONLINE_DELAY_SECONDS: int = 90
     # Ventana de REENTRADA del aviso de videollamada (CA16.2b): dentro de ella, volver a entrar
     # a la sala NO añade otro aviso al hilo — se reutiliza el que ya está. El valor no es
     # arbitrario: es el mismo `STALE_CONSULTATION_MINUTES` con el que este repo ya decide

@@ -35,6 +35,7 @@ __all__ = [
     "ScheduleFollowUpRequest",
     "ScheduleReferralRequest",
     "ReminderRunResponse",
+    "PendingNoticesRunResponse",
     "ChainItem",
     "ConsultationPanelResponse",
     "PanelConsultationItem",
@@ -257,6 +258,18 @@ class ReminderRunResponse(BaseModel):
 
     sent: int
     window_minutes: int
+
+
+class PendingNoticesRunResponse(BaseModel):
+    """Resultado de correr el barrido de avisos de chat diferidos (para el cron externo).
+
+    `sent` cuenta solo los que Mailtrap aceptó. Que una pasada devuelva `0` habiendo pendientes
+    es lo normal y no es un fallo: un pendiente vencido cuyo paciente ya leyó el hilo se
+    descarta sin enviar, que es justo para lo que existe el diferido.
+    """
+
+    sent: int
+    delay_seconds: int
 
 
 class ConsultationDetailPatient(BaseModel):

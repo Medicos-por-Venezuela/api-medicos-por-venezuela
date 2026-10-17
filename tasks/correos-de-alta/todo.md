@@ -153,3 +153,33 @@ REAL y sin `MAILTRAP_INBOX_ID`, que es exactamente el riesgo R1:
 | `POST /doctors` (SACS no valida) | `201` + `alta-medico` **y** `registro-medico`, mismo correlation_id |
 | `POST /doctors/{id}/approve` sin licencia | `422` (guard existente, correcto) |
 | `approve` x2 con ficha completa | `200`, `200` y **un solo** correo |
+
+## Rebanada 4 — Correo F: confirmación al paciente (ampliación 2026-10-16)
+
+> Spec: sección «Ampliación 2026-10-16 — Correo F». Sale de la auditoría de notificaciones
+> junto con `tasks/avisos-chat-presencia/`; aquélla cubre el chat, esto cubre el alta.
+
+- [x] **T17. Composición del correo F**
+  - Acceptance: `_build_new_patient_welcome(patient_name, specialty, code, waiting_url)`
+    devuelve asunto, texto y HTML con código, especialidad, botón a la sala, el aviso de que
+    puede tardar y de que no hay que volver a registrarse, y la advertencia de urgencias.
+  - Verify: `uv run pytest tests/test_registration_mail.py -k bienvenida -v`
+  - Files: `src/services/registration_mail.py`, `tests/test_registration_mail.py`
+
+- [x] **T18. Aserción negativa de PII sobre F**
+  - Acceptance: dado un paciente con cédula, alergias y descripción, ni el texto ni el HTML de
+    F contienen ninguno de los tres. Mismo test que protege A, extendido a F.
+  - Verify: `uv run pytest tests/test_registration_mail.py -k pii -v`
+  - Files: `tests/test_registration_mail.py`
+
+- [x] **T19. `new_patient_welcome_mail_args` con sus tres guardas**
+  - Acceptance: `None` si el paciente es de consultorio, si la consulta está agendada o si no
+    tiene `email`. Token de sala **fresco** (`build_waiting_room_url`), no el de la respuesta.
+  - Verify: `uv run pytest tests/test_registration_mail.py -k welcome_args -v`
+  - Files: `src/services/registration_mail.py`, `tests/test_registration_mail.py`
+
+- [x] **T20. Wiring en `POST /consultations`**
+  - Acceptance: un alta pública con correo encola **A y F**; sin correo solo A; de consultorio,
+    ninguno. El endpoint sigue devolviendo `201` con su `access_token`.
+  - Verify: `uv run pytest tests/test_consultations.py tests/test_registration_mail.py -v`
+  - Files: `src/routers/consultations.py`, `tests/test_registration_mail.py`

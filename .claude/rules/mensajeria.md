@@ -65,6 +65,22 @@ donde choquen, manda `security.md`. Contexto y acuerdos con el cliente: `.knowle
 - Correos por `services/mail.py` con `best_effort` y `BackgroundTasks`. Mailtrap es
   **producción** para este cliente (envía y recibe correos reales): no lo trates como sandbox y
   respeta `MAILTRAP_INBOX_ID` en local antes de cualquier prueba.
+- **El aviso al paciente nombra a su médico y distingue primer contacto de respuesta**
+  (`patient_message_received_email`). El primer mensaje del médico es, para el paciente, el aviso
+  de que su caso fue atendido: no le digas «te respondió» a algo que no preguntó.
+- **Dos frenos, y no son el mismo** (`tasks/avisos-chat-presencia/spec.md`): el **anti-ráfaga**
+  (`{patient,doctor}_notice_sent_at`) calla un segundo aviso mientras el primero sigue sin leer,
+  y el **diferido** (`patient_notice_pending_at`) aplaza el correo del paciente que está EN LÍNEA
+  —ya lo vio por SSE— y lo cancela si lo lee. Los dos viven en columnas de `consultations`, no en
+  memoria del proceso: **no reintroduzcas un `dict` de módulo** para esto, se perdía en cada
+  reinicio y no lo veía la otra réplica.
+- El diferido lo resuelve `POST /consultations/messages/send-pending-notices`, que el cron externo
+  tiene que llamar **cada minuto** (ver `.knowledge/agenda.md`). Sin cron solo se pierden avisos
+  redundantes; los de pacientes desconectados salen en el acto.
+- **Presencia: siempre por `services/presence.py`**, nunca escribiendo `patient_last_seen_at` a
+  mano. `touch_patient_presence` escribe las dos vías (memoria + columna) con throttle; una señal
+  que toque solo una de las dos es el bug que ya tuvimos. Y se registra contra el caso **vigente
+  de la cadena**, no contra el id que pidió el paciente.
 
 ## ⏱️ Tiempo real
 

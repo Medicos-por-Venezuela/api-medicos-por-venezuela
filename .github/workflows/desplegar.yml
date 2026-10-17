@@ -1,0 +1,153 @@
+name: Desplegar a producción
+
+# Disparo MANUAL a propósito, no automático al mergear.
+#
+# `deploy.sh` aplica migraciones a la base de Supabase de producción, que es la única
+# que existe. Con disparo automático, cualquier merge a main migraría datos clínicos
+# sin que nadie lo decidiera. Con disparo manual se conserva lo que importa —historial,
+# trazabilidad de quién desplegó y cuándo, y un solo clic— sin esa ventana de riesgo.
+on:
+  workflow_dispatch:
+    inputs:
+      rama:
+        description: "Rama a desplegar"
+        required: true
+        default: "main"
+        type: string
+      respaldo_previo:
+        description: "Hacer un respaldo de la base antes de desplegar"
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  # Dos despliegues simultáneos sobre el mismo servidor se pisan: el segundo
+  # haría el swap del contenedor mientras el primero migra.
+  group: despliegue-produccion
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # necesario para pedir el token OIDC a GitHub
+  contents: read
+
+jobs:
+  desplegar:
+    runs-on: ubuntu-latest
+    environment: produccion
+    steps:
+      - name: Credenciales de AWS por OIDC
+        # Sin claves de acceso guardadas en el repositorio: GitHub pide un token
+        # efímero y AWS lo cambia por credenciales de 1 hora. El rol solo permite
+        # ejecutar comandos en la instancia del API, nada más.
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::239109940716:role/GitHubActionsDeployRole
+          aws-region: us-east-1
+
+      - name: Respaldo de la base antes de desplegar
+        if: ${{ inputs.respaldo_previo }}
+        run: |
+          set -euo pipefail
+          echo "Lanzando respaldo previo..."
+          ID=$(aws ssm send-command \
+            --instance-ids i-07eb07fd0c2fac30e \
+            --document-name AWS-RunShellScript \
+            --comment "Respaldo previo al despliegue (GitHub Actions #${{ github.run_number }})" \
+            --parameters 'commands=["/usr/local/bin/mpv-respaldo.sh"]' \
+            --timeout-seconds 900 \
+            --query Command.CommandId --output text)
+          for _ in $(seq 1 40); do
+            EST=$(aws ssm get-command-invocation --command-id "$ID" \
+              --instance-id i-07eb07fd0c2fac30e --query Status --output text 2>/dev/null || echo Pending)
+            [ "$EST" = "Success" ] && break
+            if [ "$EST" = "Failed" ] || [ "$EST" = "TimedOut" ] || [ "$EST" = "Cancelled" ]; then
+              aws ssm get-command-invocation --command-id "$ID" \
+                --instance-id i-07eb07fd0c2fac30e --query StandardErrorContent --output text
+              echo "::error::El respaldo previo falló. No se despliega."
+              exit 1
+            fi
+            sleep 15
+          done
+          aws ssm get-command-invocation --command-id "$ID" \
+            --instance-id i-07eb07fd0c2fac30e --query StandardOutputContent --output text
+
+      - name: Desplegar
+        id: desplegar
+        # La rama entra por `env:` y no interpolada en el script: un `${{ }}` dentro de
+        # un `run` se pega en el shell ANTES de ejecutarlo, así que un nombre de rama
+        # con comillas y punto y coma ejecutaría lo que quisiera en el runner. Por
+        # `env:` llega como variable y el shell nunca la reinterpreta.
+        env:
+          RAMA: ${{ inputs.rama }}
+        run: |
+          set -euo pipefail
+          # Solo lo que puede ser un nombre de rama. El valor termina dentro de un
+          # comando que corre en el servidor de producción; no es sitio para confiar.
+          case "$RAMA" in
+            *[!A-Za-z0-9._/-]*|''|-*|*..*)
+              echo "::error::Nombre de rama no permitido: $RAMA"; exit 1 ;;
+          esac
+          echo "Desplegando rama: $RAMA"
+          ID=$(aws ssm send-command \
+            --instance-ids i-07eb07fd0c2fac30e \
+            --document-name AWS-RunShellScript \
+            --comment "Despliegue por ${{ github.actor }} (GitHub Actions #${{ github.run_number }})" \
+            --parameters "commands=[\"sudo -u ssm-user bash -c 'cd /home/ssm-user/api-medicos-por-venezuela && ./deploy.sh $RAMA -y'\"]" \
+            --timeout-seconds 1800 \
+            --query Command.CommandId --output text)
+          echo "Comando SSM: $ID"
+
+          for _ in $(seq 1 80); do
+            EST=$(aws ssm get-command-invocation --command-id "$ID" \
+              --instance-id i-07eb07fd0c2fac30e --query Status --output text 2>/dev/null || echo Pending)
+            case "$EST" in
+              Success) break ;;
+              Failed|TimedOut|Cancelled)
+                echo "--- salida ---"
+                aws ssm get-command-invocation --command-id "$ID" \
+                  --instance-id i-07eb07fd0c2fac30e --query StandardOutputContent --output text
+                echo "--- errores ---"
+                aws ssm get-command-invocation --command-id "$ID" \
+                  --instance-id i-07eb07fd0c2fac30e --query StandardErrorContent --output text
+                echo "::error::El despliegue falló con estado $EST"
+                exit 1 ;;
+            esac
+            sleep 15
+          done
+
+          aws ssm get-command-invocation --command-id "$ID" \
+            --instance-id i-07eb07fd0c2fac30e --query StandardOutputContent --output text
+
+      - name: Comprobar que la API responde desde internet
+        # El propio deploy.sh ya hace su health check, pero lo repetimos desde fuera:
+        # comprueba el camino real que usan los usuarios, no solo el del servidor.
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 10); do
+            CODIGO=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+              https://api.medicosporvenezuela.org/api/v1/health || true)
+            echo "intento $i: HTTP $CODIGO"
+            [ "$CODIGO" = "200" ] && exit 0
+            sleep 10
+          done
+          echo "::error::La API no responde 200 desde internet tras el despliegue"
+          exit 1
+
+      - name: Resumen
+        if: always()
+        env:
+          RAMA: ${{ inputs.rama }}
+          RESPALDO: ${{ inputs.respaldo_previo }}
+          RESULTADO: ${{ job.status }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          {
+            echo "### Despliegue del backend"
+            echo ""
+            echo "| Dato | Valor |"
+            echo "|---|---|"
+            echo "| Rama | \`$RAMA\` |"
+            echo "| Lanzado por | @$ACTOR |"
+            echo "| Respaldo previo | $RESPALDO |"
+            echo "| Resultado | $RESULTADO |"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -25,7 +25,7 @@ from src.models.consultation import Consultation
 from src.models.patient import Patient
 from src.models.profile import Profile
 from src.models.specialty import Specialty
-from src.services import mail_layout
+from src.services import mail_layout, presence
 from src.services.mail import best_effort, esc, send_mail
 
 logger = logging.getLogger("mpv.api")
@@ -544,58 +544,109 @@ def interconsultation_taken_email(
 # El correo solo avisa que hay un nuevo mensaje y da un enlace seguro para entrar a la
 # plataforma a responder.
 #
-# Anti-ráfaga (debounce): no se envía un segundo correo al mismo destinatario por el mismo
-# hilo si el anterior salió hace menos de 15 min y sigue sin leer.
+# Dos frenos, y no hay que confundirlos (tasks/avisos-chat-presencia/spec.md):
+#
+# - **Anti-ráfaga** (`should_debounce_mail`): el destinatario ya tiene un aviso sin leer de hace
+#   poco. No hace falta otro; el primero sigue siendo verdad.
+# - **Diferido** (`patient_notice_pending_at`): el paciente está EN LÍNEA, o sea mirando la
+#   pantalla donde el mensaje acaba de aparecer por SSE. El correo solo tiene sentido si no lo
+#   lee, así que se aplaza y lo resuelve `send_pending_message_notices`.
+#
+# Los dos estados viven en columnas de `consultations` y no en memoria del proceso. Hasta
+# 2026-10-16 el anti-ráfaga era un `dict` con un respaldo en base que usaba OTRO criterio
+# (memoria: "queda algo sin leer"; base: "quedan >= 2 sin leer"). Convergían por accidente
+# aritmético —el mensaje nuevo ya está committeado cuando se cuenta— y el primer cambio en el
+# orden del commit los habría separado sin que nada fallara de forma visible.
 
-_LAST_MAIL_NOTIFICATIONS: dict[tuple[uuid.UUID, str], datetime] = {}
+
+def _notice_sent_at(consultation: Consultation, direction: str) -> datetime | None:
+    """Cuándo salió el último aviso al destinatario de `direction` en este hilo."""
+    if direction == "patient_to_doctor":
+        return consultation.doctor_notice_sent_at  # lo recibe el médico
+    return consultation.patient_notice_sent_at
 
 
-def record_mail_debounce(consultation_id: uuid.UUID, recipient_role: str) -> None:
-    _LAST_MAIL_NOTIFICATIONS[(consultation_id, recipient_role)] = datetime.now(UTC)
+def _mark_notice_sent(consultation: Consultation, direction: str) -> None:
+    """Anota que acaba de salir un aviso, para que el anti-ráfaga lo vea."""
+    if direction == "patient_to_doctor":
+        consultation.doctor_notice_sent_at = datetime.now(UTC)
+    else:
+        consultation.patient_notice_sent_at = datetime.now(UTC)
 
 
-def clear_mail_debounce(consultation_id: uuid.UUID, recipient_role: str) -> None:
-    _LAST_MAIL_NOTIFICATIONS.pop((consultation_id, recipient_role), None)
+def clear_notice_state(consultation: Consultation, reader_role: str) -> None:
+    """El lector se puso al día: se levanta el freno de su lado.
+
+    Un mensaje nuevo DESPUÉS de una lectura es información nueva y merece su aviso, así que el
+    anti-ráfaga no debe sobrevivir a la lectura. Y si el paciente leyó, el aviso diferido ya no
+    tiene a quién avisar de nada: se cancela, que es el objetivo entero del diferido.
+
+    Lo llama `messaging.mark_as_read` **dentro** de su transacción. Antes era un `pop` de un
+    dict después del commit: si algo fallaba entre medias, la lectura quedaba persistida y el
+    freno puesto.
+    """
+    if reader_role == "doctor":
+        consultation.doctor_notice_sent_at = None
+        return
+    consultation.patient_notice_sent_at = None
+    consultation.patient_notice_pending_at = None
+
+
+async def _unread_count(session: AsyncSession, consultation_id: uuid.UUID, direction: str) -> int:
+    """Mensajes de `direction` que el destinatario aún no ha leído en este hilo."""
+    return (
+        await session.scalar(
+            select(func.count(Message.id)).where(
+                Message.consultation_id == consultation_id,
+                Message.direction == direction,
+                Message.read_at.is_(None),
+            )
+        )
+    ) or 0
 
 
 async def should_debounce_mail(
-    session: AsyncSession, consultation_id: uuid.UUID, direction: str
+    session: AsyncSession, consultation: Consultation, direction: str
 ) -> bool:
-    """Verifica si debe aplicarse anti-ráfaga (debounce) para este envío."""
-    recipient_role = "doctor" if direction == "patient_to_doctor" else "patient"
-    now = datetime.now(UTC)
-    debounce_limit = timedelta(minutes=settings.MESSAGING_MAIL_DEBOUNCE_MINUTES)
+    """¿Se frena este aviso porque el destinatario ya tiene uno reciente sin leer?
 
-    # 1. Comprobación en memoria
-    last_sent = _LAST_MAIL_NOTIFICATIONS.get((consultation_id, recipient_role))
-    if last_sent:
-        if (now - last_sent) < debounce_limit:
-            # Hay notificación reciente en memoria: revisar si aún hay no leídos
-            unread_count = await session.scalar(
-                select(func.count(Message.id)).where(
-                    Message.consultation_id == consultation_id,
-                    Message.direction == direction,
-                    Message.read_at.is_(None),
-                )
-            )
-            if unread_count and unread_count > 0:
-                return True
-        else:
-            _LAST_MAIL_NOTIFICATIONS.pop((consultation_id, recipient_role), None)
+    Una sola regla: salió un aviso hace menos de `MESSAGING_MAIL_DEBOUNCE_MINUTES` **y** queda
+    algo sin leer de esa dirección. Si no salió ninguno (columna en `null`, que es el caso del
+    primer mensaje de un hilo) no hay nada de lo que proteger y el correo pasa.
 
-    # 2. Comprobación en base de datos (resiliente tras reinicios)
-    recent_unread = await session.scalar(
+    Recibe el `Consultation` ya cargado: el caller lo tiene, y volver a pedirlo era una consulta
+    por correo sin ninguna ganancia.
+    """
+    last_sent = _notice_sent_at(consultation, direction)
+    if last_sent is None:
+        return False
+    if last_sent.tzinfo is None:
+        last_sent = last_sent.replace(tzinfo=UTC)
+    ventana = timedelta(minutes=settings.MESSAGING_MAIL_DEBOUNCE_MINUTES)
+    if datetime.now(UTC) - last_sent >= ventana:
+        return False
+    return await _unread_count(session, consultation.id, direction) > 0
+
+
+async def _is_first_doctor_contact(session: AsyncSession, consultation_id: uuid.UUID) -> bool:
+    """¿El paciente no ha escrito nunca en este hilo?
+
+    Decide entre «te escribió por tu caso» y «te respondió». No es un detalle de estilo: el
+    primer mensaje del médico es, para el paciente, el aviso de que SU CASO FUE ATENDIDO, y
+    recibir «tu médico te respondió» por algo que nunca preguntó se lee como un correo
+    equivocado — que es como se trata, y se borra.
+
+    Un COUNT y no un flag en la consulta: un flag habría que mantenerlo en los dos sentidos y
+    quedaría desincronizado con la cadena de derivación. El acceso es el mismo índice
+    `(consultation_id, direction)` que el anti-ráfaga consulta dos líneas más arriba.
+    """
+    escritos = await session.scalar(
         select(func.count(Message.id)).where(
             Message.consultation_id == consultation_id,
-            Message.direction == direction,
-            Message.read_at.is_(None),
-            Message.sent_at >= now - debounce_limit,
+            Message.direction == "patient_to_doctor",
         )
     )
-    if recent_unread and recent_unread >= 2:
-        return True
-
-    return False
+    return not escritos
 
 
 def doctor_message_received_email(
@@ -633,13 +684,40 @@ def doctor_message_received_email(
 
 
 def patient_message_received_email(
-    consultation_id: uuid.UUID, code: str | None, has_account: bool = False
+    consultation_id: uuid.UUID,
+    code: str | None,
+    has_account: bool = False,
+    doctor_name: str | None = None,
+    is_first_contact: bool = False,
 ) -> tuple[str, str, str]:
-    """(subject, text, html) para el paciente cuando el médico le responde.
+    """(subject, text, html) para el paciente cuando su médico le escribe.
 
-    SIN NINGÚN TEXTO CLÍNICO.
+    SIN NINGÚN TEXTO CLÍNICO, sin el cuerpo del mensaje y sin nombres de adjuntos. Lo único que
+    este correo hace es decir que hay algo nuevo y dar la puerta para entrar a leerlo.
+
+    **El nombre del médico va en el asunto** (`doctor_name`). No es decoración: este correo
+    compite en una bandeja con todo lo demás, y un asunto genérico de un remitente `no-reply@`
+    es indistinguible de publicidad. El nombre no es dato clínico ni PII del paciente — es quién
+    le está atendiendo, que es justo lo que necesita para decidir si abre. El correo de
+    videoconsulta ya lo hacía; este no, y era el mismo paciente.
+
+    No se antepone ningún tratamiento ("Dr."): `Profile.full_name` es un campo que el propio
+    médico escribe, y muchos ya lo incluyen. Añadirlo produciría "Dr. Dra. Ana Pérez".
+
+    **`is_first_contact` cambia el verbo**, y es el arreglo menos vistoso y más importante de
+    los dos: el primer mensaje del médico en un hilo es, para el paciente, el aviso de que su
+    caso fue atendido. Decirle "tu médico te respondió" por algo que nunca preguntó se lee como
+    un correo equivocado.
     """
-    subject = "Tu médico te respondió"
+    quien = doctor_name or "Tu médico"
+    quien_html = esc(quien)
+    if is_first_contact:
+        subject = f"{quien} te escribió por tu caso"
+        intro = "ha revisado tu caso y te ha enviado un mensaje en la plataforma."
+    else:
+        subject = f"{quien} te respondió"
+        intro = "te ha enviado un mensaje en la plataforma."
+
     codigo_text = f"Código de caso: {code}\n\n" if code else ""
     codigo_html = (
         f'<p style="color:{mail_layout.MUTED};font-size:14px;">'
@@ -653,15 +731,15 @@ def patient_message_received_email(
         url = build_waiting_room_url(consultation_id)
 
     text = (
-        "Tu médico te ha enviado un mensaje en la plataforma.\n\n"
+        f"{quien} {intro}\n\n"
         f"{codigo_text}"
         f"Ingresa para ver el mensaje y continuar con tu atención:\n{url}\n\n"
         "Si tu situación empeora o hay señales de alarma, busca atención presencial urgente.\n"
     )
     escaped_url = esc(url)
-    btn = mail_layout.button(escaped_url, "Ver respuesta de mi médico")
+    btn = mail_layout.button(escaped_url, "Ver el mensaje de mi médico")
     html = (
-        "<p>Tu médico te ha enviado un mensaje en la plataforma.</p>"
+        f"<p><strong>{quien_html}</strong> {intro}</p>"
         f"{codigo_html}"
         f'<p style="margin:26px 0;">{btn}</p>'
         f'<p style="color:{mail_layout.MUTED};font-size:13px;word-break:break-all;">'
@@ -674,21 +752,58 @@ def patient_message_received_email(
     return subject, text, html
 
 
+async def _patient_notice_args(
+    session: AsyncSession, consultation: Consultation, patient: Patient
+) -> dict:
+    """Args del aviso al paciente. Aparte porque lo arman DOS caminos: el envío inmediato y el
+    barrido de los diferidos, que corre minutos después y tiene que producir el mismo correo."""
+    subject, text, html = patient_message_received_email(
+        consultation.id,
+        consultation.code,
+        has_account=patient.user_id is not None,
+        doctor_name=await _doctor_name(session, consultation.assigned_doctor_id),
+        is_first_contact=await _is_first_doctor_contact(session, consultation.id),
+    )
+    return {
+        "to_email": patient.email,
+        "subject": subject,
+        "text": text,
+        "html": html,
+        "category": "mensaje",
+    }
+
+
 async def message_received_mail_args(
     session: AsyncSession, consultation_id: uuid.UUID, message_id: uuid.UUID, direction: str
 ) -> dict | None:
-    """Prepara los argumentos para enviar el correo de aviso de mensaje nuevo.
+    """Args del aviso de mensaje nuevo, o `None` si no toca enviarlo ahora.
 
-    Retorna None si no corresponde enviar (sin correo, opt-out, o debounce activo).
+    Cuatro motivos para no enviar, y ninguno es un fallo: el destinatario no tiene correo, lo
+    desactivó (solo el médico puede), ya tiene un aviso reciente sin leer (anti-ráfaga), o está
+    EN LÍNEA y el aviso se difiere (solo el paciente, ver `_defer_patient_notice`).
+
+    Marca el estado del aviso en la fila ANTES de que el correo salga, **y commitea**. Las dos
+    cosas son deliberadas:
+
+    - *Antes*, por la misma disciplina que `reminder_sent_at`: el correo es best-effort y corre
+      fuera de la request, así que esperar su resultado obligaría a reabrir una transacción que
+      ya no existe. Entre "un aviso que no salió y quedó marcado" y "dos avisos porque el
+      primero no se marcó", lo segundo es peor — el paciente no distingue un fallo de Mailtrap
+      de un sistema que lo inunda.
+    - *Commitea*, porque este es el último punto del request que toca la fila: `send_message` ya
+      cerró su transacción y lo que viene después es un `BackgroundTask`. Sin el commit, la
+      marca se queda en la sesión, `get_db` la cierra sin escribir y el anti-ráfaga y el
+      diferido no existirían — fallarían en silencio, dejando exactamente el comportamiento
+      anterior.
     """
-    if await should_debounce_mail(session, consultation_id, direction):
+    consultation = await session.get(Consultation, consultation_id)
+    if consultation is None:
+        return None
+
+    if await should_debounce_mail(session, consultation, direction):
         logger.info(
             "MAIL:debounce_skip consultation_id=%s direction=%s", consultation_id, direction
         )
-        return None
-
-    consultation = await session.get(Consultation, consultation_id)
-    if consultation is None:
         return None
 
     if direction == "patient_to_doctor":
@@ -699,7 +814,8 @@ async def message_received_mail_args(
             return None
         if not should_send(doctor.notification_prefs, "message_received", "email"):
             return None
-        record_mail_debounce(consultation_id, "doctor")
+        _mark_notice_sent(consultation, direction)
+        await session.commit()
         subject, text, html = doctor_message_received_email(consultation.id, consultation.code)
         return {
             "to_email": doctor.email,
@@ -713,20 +829,75 @@ async def message_received_mail_args(
         patient = await session.get(Patient, consultation.patient_id)
         if patient is None or not patient.email:
             return None
-        record_mail_debounce(consultation_id, "patient")
-        has_account = patient.user_id is not None
-        subject, text, html = patient_message_received_email(
-            consultation.id, consultation.code, has_account=has_account
-        )
-        return {
-            "to_email": patient.email,
-            "subject": subject,
-            "text": text,
-            "html": html,
-            "category": "mensaje",
-        }
+        # El paciente está mirando la pantalla donde el mensaje ya apareció por SSE: el correo
+        # se aplaza y solo sale si no lo lee. Al médico NO se le difiere nunca — su presencia no
+        # se registra, y no por olvido: la asimetría es deliberada (CA7.2 del spec de mensajería).
+        if presence.is_patient_online(consultation.id, consultation.patient_last_seen_at):
+            # El reloj lo fija el PRIMER mensaje sin entregar, no el último: si se reescribiera
+            # en cada mensaje, un médico que manda cinco frases seguidas a un paciente que tiene
+            # la pestaña abierta pero no está leyendo empujaría el aviso hacia adelante
+            # indefinidamente, y el correo no saldría nunca.
+            if consultation.patient_notice_pending_at is None:
+                consultation.patient_notice_pending_at = datetime.now(UTC)
+            await session.commit()
+            logger.info(
+                "MAIL:deferred consultation_id=%s reason=paciente_en_linea", consultation_id
+            )
+            return None
+        _mark_notice_sent(consultation, direction)
+        consultation.patient_notice_pending_at = None
+        args = await _patient_notice_args(session, consultation, patient)
+        await session.commit()
+        return args
 
     return None
+
+
+async def send_pending_message_notices(session: AsyncSession) -> int:
+    """Manda los avisos al paciente que se difirieron y siguen sin leerse. Devuelve cuántos
+    aceptó Mailtrap.
+
+    Para un CRON externo, el MISMO que ya llama a `send_due_reminders`. Un paciente que leyó el
+    mensaje dentro de la ventana no aparece aquí: `mark_as_read` le limpió el pendiente, que es
+    el objetivo entero del diferido.
+
+    **El pendiente se limpia ANTES de intentar el envío**, igual que `reminder_sent_at`. Al
+    revés, dos pasadas solapadas del cron mandarían dos correos — justo el defecto que este
+    barrido viene a quitar. Y por lo mismo: **un solo intento**. Si Mailtrap falla, no se
+    reintenta; el aviso diferido es el complementario, el canal fiable para alguien que estaba
+    en línea fue el SSE por el que ya lo recibió.
+    """
+    vencido = datetime.now(UTC) - timedelta(seconds=settings.MESSAGING_MAIL_ONLINE_DELAY_SECONDS)
+    rows = (
+        await session.execute(
+            select(Consultation, Patient)
+            .join(Patient, Consultation.patient_id == Patient.id)
+            .where(
+                Consultation.patient_notice_pending_at.isnot(None),
+                Consultation.patient_notice_pending_at <= vencido,
+            )
+        )
+    ).all()
+
+    pendientes: list[dict] = []
+    for consultation, patient in rows:
+        consultation.patient_notice_pending_at = None
+        if not patient.email:
+            continue
+        # Sigue sin leer: si el paciente abrió el hilo sin pasar por `/read` (no debería, pero
+        # el contador es la verdad), el correo ya no aporta nada.
+        if not await _unread_count(session, consultation.id, "doctor_to_patient"):
+            continue
+        _mark_notice_sent(consultation, "doctor_to_patient")
+        pendientes.append(await _patient_notice_args(session, consultation, patient))
+    await session.commit()
+
+    enviados = 0
+    for args in pendientes:
+        if await send_message_notification(**args):
+            enviados += 1
+    logger.info("MAIL:pending_notices enviados=%d de=%d", enviados, len(rows))
+    return enviados
 
 
 @best_effort
