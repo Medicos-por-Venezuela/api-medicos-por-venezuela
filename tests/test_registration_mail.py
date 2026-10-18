@@ -754,3 +754,166 @@ async def test_envio_interno_sin_buzones_devuelve_false() -> None:
         enviado = await registration_mail._send_internal("s", "t", "h", category="x")
     assert enviado is False
     assert enviados == []
+
+
+# --- Correo F: confirmación al paciente (ampliación 2026-10-16) ---------------
+
+
+def test_confirmacion_al_paciente_lleva_codigo_sala_y_que_puede_tardar() -> None:
+    """El correo tiene que cerrar el agujero que lo motivó: el enlace a la sala vive SOLO en la
+    pestaña del registro, y quien la cierra se queda sin forma de volver."""
+    subject, text, html = registration_mail._build_new_patient_welcome(
+        patient_name="María Pérez",
+        specialty="Pediatría",
+        code="CONS-2026-1",
+        waiting_url="https://mpv.test/sala-espera?cid=1&t=tok",
+    )
+    assert "registrado" in subject.lower()
+    for cuerpo in (text, html):
+        assert "CONS-2026-1" in cuerpo
+        assert "Pediatría" in cuerpo
+        assert "puede tardar" in cuerpo
+        assert "vuelvas a registrarte" in cuerpo
+        assert "atención presencial urgente" in cuerpo
+    assert "sala-espera?cid=1&amp;t=tok" in html or "sala-espera?cid=1&t=tok" in html
+
+
+def test_confirmacion_al_paciente_sin_especialidad_no_deja_frases_rotas() -> None:
+    """`specialty_id` es opcional en la consulta: sin nombre, el correo no puede decir
+    "está en la cola de None"."""
+    _, text, html = registration_mail._build_new_patient_welcome(
+        patient_name=None, specialty=None, code="CONS-2", waiting_url="https://mpv.test/x"
+    )
+    assert "None" not in text
+    assert "None" not in html
+    assert "está en la cola." in text
+
+
+def test_confirmacion_al_paciente_no_lleva_pii_clinica() -> None:
+    """FRONTERA DE PII, igual que el correo A: un correo sale de la plataforma y queda en
+    buzones y backups que no controlamos. Aserción NEGATIVA a propósito."""
+    _, text, html = registration_mail._build_new_patient_welcome(
+        patient_name="María Pérez",
+        specialty="Pediatría",
+        code="CONS-2026-1",
+        waiting_url="https://mpv.test/sala",
+    )
+    cuerpo = text + html
+    for prohibido in ("V-12345678", "penicilina", "dolor de cabeza", "Alergia"):
+        assert prohibido not in cuerpo
+
+
+def test_confirmacion_escapa_el_nombre_del_paciente() -> None:
+    """`full_name` sale de un formulario PÚBLICO y sin autenticar."""
+    _, _, html = registration_mail._build_new_patient_welcome(
+        patient_name='<img src=x onerror="alert(1)">',
+        specialty="Pediatría",
+        code="C-1",
+        waiting_url="https://mpv.test/sala",
+    )
+    assert "<img src=x" not in html
+    assert "&lt;img" in html
+
+
+async def test_welcome_args_sin_correo_no_confirma(db_session: AsyncSession) -> None:
+    """`patients.email` es opcional (los de consultorio casi nunca lo traen): sin correo no hay
+    a dónde escribir, y eso no es un fallo del alta."""
+    consultation = await _consulta_publica(db_session, email=None)
+    assert await registration_mail.new_patient_welcome_mail_args(db_session, consultation) is None
+
+
+async def test_welcome_args_paciente_de_consultorio_no_confirma(db_session: AsyncSession) -> None:
+    """Mismas exclusiones que el correo A: el de consultorio es privado de su médico."""
+    doctor_user = make_profile(role="doctor")
+    db_session.add(doctor_user)
+    await db_session.flush()
+    consultation = await _consulta_publica(
+        db_session, email="paciente@ejemplo.org", created_by_doctor_id=doctor_user.id
+    )
+    assert await registration_mail.new_patient_welcome_mail_args(db_session, consultation) is None
+
+
+async def test_welcome_args_consulta_agendada_no_confirma(db_session: AsyncSession) -> None:
+    """Una cita agendada ya tiene su correo por `notifications`."""
+    from datetime import UTC, datetime, timedelta
+
+    consultation = await _consulta_publica(db_session, email="paciente@ejemplo.org")
+    consultation.scheduled_at = datetime.now(UTC) + timedelta(days=1)
+    await db_session.flush()
+    assert await registration_mail.new_patient_welcome_mail_args(db_session, consultation) is None
+
+
+async def test_welcome_args_resuelve_valores_planos_con_token_fresco(
+    db_session: AsyncSession,
+) -> None:
+    """El enlace lleva un token NUEVO: el del registro caduca a las 24 h y este correo se abre
+    cuando se abre. Y nada de objetos ORM: el BackgroundTask corre con la sesión cerrada."""
+    consultation = await _consulta_publica(db_session, email="paciente@ejemplo.org")
+    args = await registration_mail.new_patient_welcome_mail_args(db_session, consultation)
+    assert args is not None
+    assert args["to_email"] == "paciente@ejemplo.org"
+    assert args["patient_name"] == "Paciente Correo"
+    assert args["specialty"]  # nombre resuelto, no el uuid
+    assert "/sala-espera?cid=" in args["waiting_url"]
+    assert "&t=" in args["waiting_url"]  # token emitido aquí
+    assert all(not hasattr(v, "__table__") for v in args.values())
+
+
+async def test_alta_publica_con_correo_manda_los_dos_avisos(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A y F salen del MISMO evento, uno a operación y otro al paciente."""
+    patient = Patient(
+        full_name="Paciente Con Correo",
+        phone_whatsapp="+584140000031",
+        affected_zone="Miranda",
+        consent=True,
+        email="paciente.alta@ejemplo.org",
+    )
+    db_session.add(patient)
+    await db_session.flush()
+    specialty = (await db_session.execute(select(Specialty).limit(1))).scalar_one()
+
+    with _con_buzones(), _capturar_correos() as enviados:
+        resp = await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": str(patient.id), "specialty_id": str(specialty.id)},
+        )
+    assert resp.status_code == 201, resp.text
+    destinos = {correo["to"] for correo in enviados}
+    assert destinos == {BUZONES[0], "paciente.alta@ejemplo.org"}
+
+    confirmacion = next(c for c in enviados if c["to"] == "paciente.alta@ejemplo.org")
+    assert confirmacion["category"] == "alta-paciente-confirmacion"
+    assert "puede tardar" in confirmacion["text"]
+    # El correo del paciente NO lleva su teléfono (eso es del aviso a operación, para contactarlo)
+    assert "+584140000031" not in confirmacion["text"]
+
+
+async def test_el_alta_sobrevive_a_un_fallo_de_la_confirmacion(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Best-effort: con el correo F reventando, el alta sigue devolviendo 201."""
+    patient = Patient(
+        full_name="Paciente Resiliente",
+        phone_whatsapp="+584140000032",
+        affected_zone="Zulia",
+        consent=True,
+        email="paciente.resiliente@ejemplo.org",
+    )
+    db_session.add(patient)
+    await db_session.flush()
+    specialty = (await db_session.execute(select(Specialty).limit(1))).scalar_one()
+
+    with (
+        _con_buzones(""),
+        patch(
+            "src.services.registration_mail._build_new_patient_welcome",
+            side_effect=RuntimeError("boom"),
+        ),
+    ):
+        resp = await client.post(
+            f"{PREFIX}/consultations",
+            json={"patient_id": str(patient.id), "specialty_id": str(specialty.id)},
+        )
+    assert resp.status_code == 201, resp.text

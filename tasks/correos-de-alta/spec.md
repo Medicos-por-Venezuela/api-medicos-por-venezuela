@@ -250,6 +250,61 @@ un campo "útil" al correo dentro de seis meses, y sin ese test nadie se entera.
    token de Mailtrap le escribiría a Oriana de verdad al primer registro de prueba. El precio
    es que hay que acordarse de ponerlo al desplegar, y por eso va en Success Criteria.
 
+## Ampliación 2026-10-16 — Correo F: confirmación al paciente
+
+> Sale de la auditoría de notificaciones del 2026-10-16, junto con
+> `tasks/avisos-chat-presencia/`. Aquélla cubre el chat; esto cubre el hueco del alta, que es
+> de este spec.
+
+**El hueco.** Los cinco correos de arriba resolvieron «que operación se entere» y «que el
+médico sepa en qué quedó su registro». Al paciente no le llega **ninguno**: el único correo que
+recibe al registrarse es el OTP de verificación (`verificacion-correo-registro`), que es un
+trámite, no una confirmación. Sale del formulario con su caso en cola y la bandeja vacía.
+
+Eso tiene una consecuencia que ya costó un correo nuevo una vez: el enlace a su sala de espera
+vive **solo** en la pestaña que acaba de abrir. Quien la cierra —o entra, no hay nadie todavía
+y se sale— no tiene forma de volver. Ése es literalmente el agujero que `notifications`
+documenta haber tapado después con el aviso de videoconsulta
+(«el correo de registro tampoco existía», `notifications.py:153-161`). El correo F lo tapa en
+el origen, en vez de esperar a que un médico tome el caso para dar la primera señal de vida.
+
+| # | Se dispara cuando | Destinatario | Contenido |
+|---|---|---|---|
+| **F** | Se crea una consulta de la **cola pública** (mismo evento que A) | **El paciente**, si tiene `patients.email` | Código del caso, especialidad, enlace a su sala de espera con token fresco, y la advertencia de urgencias |
+
+### Criterios de aceptación
+
+- **CA-F.1** Mismo disparador que A (`POST /consultations`) y mismas tres exclusiones: paciente
+  de consultorio, consulta agendada (ya tiene el suyo por `notifications`), y —específica de
+  F— paciente sin `email`, que es opcional en `patients`.
+- **CA-F.2** El enlace es `build_waiting_room_url(consultation.id)`, con **token fresco**. No se
+  reutiliza el que devuelve `POST /consultations`: F es un correo, y un correo se abre cuando
+  se abre.
+- **CA-F.3** Dice que **puede tardar** y que **no hace falta volver a registrarse**. Es el
+  mismo texto que el correo de derivación ya usa, y por el mismo motivo: sin él, la espera se
+  interpreta como un fallo y el paciente crea una segunda cuenta y un segundo caso.
+- **CA-F.4** Lleva la advertencia de urgencias, como todos los correos al paciente de este
+  sistema.
+- **CA-F.5** **Sin nada clínico.** Ni el motivo de consulta, ni alergias, ni la descripción.
+  Va la especialidad solicitada, que es lo mismo que A ya manda y que el paciente escribió él.
+  El test negativo de PII cubre también F.
+- **CA-F.6** Best-effort: si Mailtrap falla, el alta sigue devolviendo `201`.
+
+### Por qué en `registration_mail.py` y no en `notifications.py`
+
+Mismo criterio que los cinco anteriores (ver «Project Structure»): F es un correo de **ciclo de
+vida**, no opcionable. Un paciente anónimo no tiene `Profile` y por tanto no tiene
+`notification_prefs` que consultar — meterlo en el catálogo opt-out sería declarar una
+preferencia que nadie puede ejercer.
+
+### Success Criteria (añadidos)
+
+9. Un alta real de la cola pública **con correo** produce **dos** correos: el interno (A) y el
+   del paciente (F), con código, especialidad y enlace a su sala.
+10. Un alta **sin** correo produce solo A, y no falla.
+11. Un alta **de consultorio** no produce ni A ni F.
+12. El cuerpo de F no contiene motivo, alergias ni descripción del caso.
+
 ## Open Questions
 
 Ninguna.

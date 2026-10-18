@@ -1,6 +1,6 @@
 """Correos de alta: paciente que entra a la cola y médico que se registra o es aprobado.
 
-Cinco correos, dos direcciones:
+Seis correos, tres direcciones:
 
 | # | Cuándo | A quién |
 |---|---|---|
@@ -9,6 +9,10 @@ Cinco correos, dos direcciones:
 | C | Un médico se registra y el SACS/FPV SÍ lo valida | operación |
 | D | Un médico se registra y el SACS/FPV NO lo valida | el médico (le pide los papeles) |
 | E | Un médico queda habilitado (por el registro oficial o por un admin) | el médico |
+| F | Entra un paciente a la cola pública | **el paciente** (su código y su sala) |
+
+A y F salen del MISMO evento: uno hacia operación y otro hacia el paciente, igual que B/C y D/E
+salen del registro del médico.
 
 **Módulo aparte de `notifications.py` a propósito.** Ese fichero es el de las preferencias del
 médico: un catálogo opt-out donde el destinatario puede apagar lo que no quiere. Estos correos
@@ -47,6 +51,7 @@ from src.models.patient import Patient
 from src.models.professional_type import ProfessionalType
 from src.models.profile import Profile
 from src.models.specialty import Specialty
+from src.services import mail_layout, notifications
 from src.services.mail import best_effort, esc, send_mail
 
 logger = logging.getLogger("mpv.api")
@@ -191,6 +196,108 @@ async def send_new_patient_alert(**kwargs) -> bool:
     """Envía el aviso A a los buzones de operación. Best-effort."""
     subject, text, html = _build_new_patient(**kwargs)
     return await _send_internal(subject, text, html, category="alta-paciente")
+
+
+# --- F: confirmación al paciente que acaba de entrar a la cola ----------------
+#
+# El hueco que tapa: hasta 2026-10-16 el paciente salía del formulario con su caso en cola y la
+# bandeja vacía. El único correo que recibía era el OTP de verificación, que es un trámite.
+#
+# Eso ya costó un correo nuevo una vez. El enlace a su sala de espera vive SOLO en la pestaña
+# que acaba de abrir: quien la cierra —o entra, no hay nadie todavía y se sale— no tiene forma
+# de volver, y su médico entra a una sala vacía. Es literalmente el agujero que `notifications`
+# documenta haber tapado después con el aviso de videoconsulta ("el correo de registro tampoco
+# existía"). Este lo tapa en el origen, sin esperar a que un médico tome el caso.
+
+
+def _build_new_patient_welcome(
+    patient_name: str | None,
+    specialty: str | None,
+    code: str,
+    waiting_url: str,
+) -> tuple[str, str, str]:
+    """Confirmación al paciente: su caso está en cola y este es el enlace para seguirlo.
+
+    Dice que **puede tardar** y que **no hace falta volver a registrarse**, con las mismas
+    palabras que el correo de derivación y por el mismo motivo: sin esa frase la espera se lee
+    como un fallo, y el paciente crea una segunda cuenta y un segundo caso — que es lo que
+    pasaba y por lo que la cola tenía duplicados.
+
+    **Sin nada clínico.** Va la especialidad solicitada (la eligió él y ya viaja en el correo A)
+    y nunca el motivo, las alergias ni la descripción: un correo sale de la plataforma y queda en
+    buzones y backups que no controlamos. El test negativo de PII lo fija.
+    """
+    nombre = patient_name or "paciente"
+    cola = f" de {specialty}" if specialty else ""
+    cola_html = f" de <strong>{esc(specialty)}</strong>" if specialty else ""
+    subject = "Tu caso quedó registrado — Médicos por Venezuela"
+    text = (
+        f"Hola {nombre},\n\n"
+        f"Tu caso quedó registrado y está en la cola{cola}. No hace falta hacer nada más.\n\n"
+        f"Código de caso: {code}\n\n"
+        "Cuando un médico tome tu caso te llegará otro correo para entrar a la videoconsulta. "
+        "Hay muchos pacientes esperando, así que puede tardar: no hace falta que vuelvas a "
+        "registrarte.\n\n"
+        f"Puedes ver el estado de tu caso aquí:\n{waiting_url}\n\n"
+        "Si tu situación empeora o hay señales de alarma, busca atención presencial urgente.\n"
+    )
+    url = esc(waiting_url)
+    html = (
+        f"<p>Hola {esc(nombre)},</p>"
+        f"<p>Tu caso quedó registrado y está en la cola{cola_html}. No hace falta hacer nada "
+        "más.</p>"
+        f'<p style="color:{mail_layout.MUTED};font-size:14px;">'
+        f"<strong>Código de caso:</strong> {esc(code)}</p>"
+        "<p>Cuando un médico tome tu caso te llegará otro correo para entrar a la "
+        "videoconsulta. Hay muchos pacientes esperando, así que puede tardar: no hace falta que "
+        "vuelvas a registrarte.</p>"
+        f'<p style="margin:26px 0;">{mail_layout.button(url, "Ver el estado de mi caso")}</p>'
+        f'<p style="color:{mail_layout.MUTED};font-size:13px;word-break:break-all;">'
+        f'Si el botón no funciona, copia este enlace: <a href="{url}" '
+        f'style="color:{mail_layout.BLUE};">{url}</a></p>'
+        '<p style="background:#fff7ed;border-left:4px solid #f59e0b;padding:12px 14px;'
+        'margin:22px 0 0;font-size:14px;">Si tu situación empeora o hay señales de alarma, '
+        "busca atención presencial urgente.</p>"
+    )
+    return subject, text, html
+
+
+async def new_patient_welcome_mail_args(
+    session: AsyncSession, consultation: Consultation
+) -> dict | None:
+    """Args del correo F, o `None` si este caso no lleva confirmación al paciente.
+
+    Las mismas dos exclusiones del correo A —paciente de consultorio (es privado de su médico) y
+    consulta agendada (ya tiene el suyo por `notifications`)— más la propia de F: que el paciente
+    no tenga correo, que es opcional en `patients`.
+
+    El enlace lleva un token **fresco** (`build_waiting_room_url`). No se reutiliza el que
+    devuelve `POST /consultations`: este es un correo, y un correo se abre cuando se abre.
+    """
+    patient = await session.get(Patient, consultation.patient_id)
+    if patient is None or not patient.email:
+        return None
+    if patient.created_by_doctor_id is not None or consultation.scheduled_at is not None:
+        return None
+    specialty = None
+    if consultation.specialty_id is not None:
+        specialty = await session.scalar(
+            select(Specialty.name).where(Specialty.id == consultation.specialty_id)
+        )
+    return {
+        "to_email": patient.email,
+        "patient_name": patient.full_name,
+        "specialty": specialty,
+        "code": consultation.code,
+        "waiting_url": notifications.build_waiting_room_url(consultation.id),
+    }
+
+
+@best_effort
+async def send_new_patient_welcome(to_email: str, **kwargs) -> bool:
+    """Envía el correo F al paciente. Best-effort: un fallo no toca el alta."""
+    subject, text, html = _build_new_patient_welcome(**kwargs)
+    return await send_mail(to_email, subject, text, html, category="alta-paciente-confirmacion")
 
 
 # --- B / C: registro de médico, hacia operación -------------------------------

@@ -26,7 +26,6 @@ from src.models.patient import Patient
 from src.models.profile import Profile
 from src.models.specialty import Specialty
 from src.schemas.consultation import WaitingRoomResponse
-from src.services import messaging
 
 logger = logging.getLogger("mpv.api")
 
@@ -132,11 +131,15 @@ async def sse_events(
     fetch_latest_message: (
         Callable[[], Awaitable[tuple[uuid.UUID, str, datetime, int] | None]] | None
     ) = None,
+    touch_presence: Callable[[], Awaitable[None]] | None = None,
 ) -> AsyncIterator[str]:
     """Stream SSE del estado de la sala: evento `status` y evento `message` (R8.1).
 
     - Latido (`: ping`) si pasa `heartbeat_seconds` sin eventos.
     - Presencia: registra la presencia del paciente en cada ciclo (solo visible por el médico).
+      `touch_presence` se **inyecta**, igual que `fetch`: esta función no sabe qué es una sesión
+      y se prueba sin base ni reloj real. El registro en memoria es inmediato; la persistencia
+      va throttleada dentro del callback (ver `services/presence.py`).
     - Asimetría: NUNCA emite información de presencia del médico al paciente.
     - Emite `message` { message_id, direction, sent_at, unread_count } cuando hay un
       mensaje nuevo hacia el paciente.
@@ -148,7 +151,18 @@ async def sse_events(
     last_emit = started
     yield "retry: 5000\n\n"
     while True:
-        messaging.record_patient_presence(requested_id)
+        if touch_presence is not None:
+            # Best-effort y antes del fetch: un fallo al anotar presencia no puede tumbar el
+            # stream que el paciente está mirando. Sin callback (tests antiguos y cualquier
+            # llamante que no lo pase) el stream funciona igual, solo sin presencia.
+            try:
+                await touch_presence()
+            except Exception:  # noqa: BLE001 — la presencia nunca rompe la sala de espera
+                logger.warning(
+                    "SSE:waiting_room_presence_error consultation_id=%s",
+                    requested_id,
+                    exc_info=True,
+                )
         try:
             state = await fetch()
         except NotFoundError:

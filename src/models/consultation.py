@@ -103,6 +103,21 @@ class Consultation(Base):
     patient_last_seen_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # --- Estado de los avisos por correo del chat (tasks/avisos-chat-presencia) ---
+    # Anti-ráfaga: último aviso de "mensaje nuevo" que salió a cada lado de este hilo. Vivían en
+    # un dict del proceso, así que un reinicio borraba el freno y dos réplicas no se veían.
+    # `mark_as_read` los pone en null: un mensaje nuevo tras una lectura es información nueva.
+    patient_notice_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    doctor_notice_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Aviso al paciente DIFERIDO porque estaba en línea: el mensaje ya le apareció por SSE, el
+    # correo solo tiene sentido si no lo lee. Lo resuelve el barrido o lo cancela la lectura.
+    patient_notice_pending_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
